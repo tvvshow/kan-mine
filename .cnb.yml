@@ -1,0 +1,19 @@
+# cnb.cool pipeline — build & smoke-test the Pearl(PRL) self-built PoUW solver on GPU.
+# Iteration 1: dp4a (CUDA-core) path only; the tensor-core path is stubbed by build.sh
+# (CUTLASS + sm_80+ added in a later iteration). The gpu-info stage prints nvidia-smi
+# so we can confirm what GPU/arch the runner provides and adjust from the build log.
+main:
+  push:
+    - docker:
+        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      stages:
+        - name: deps
+          script: apt-get update -y && apt-get install -y --no-install-recommends g++ make git ca-certificates
+        - name: gpu-info
+          script:
+            - nvidia-smi || echo "NO GPU visible to this runner"
+            - nvcc --version | tail -2
+        - name: build
+          script: bash build.sh
+        - name: smoke-test
+          script: bash run_test.sh

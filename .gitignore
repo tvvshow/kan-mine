@@ -1,0 +1,8 @@
+build/
+*.o
+plainproof_gen
+cutlass/
+__pycache__/
+*.pyc
+*.b64
+*.log
