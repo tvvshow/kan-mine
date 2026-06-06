@@ -18,14 +18,20 @@ Blackwell (RTX 5090, sm_120) while being fully auditable.
 
 ## Build
 ```bash
-bash build.sh          # auto-detects GPU arch via nvidia-smi; outputs build/plainproof_gen
-bash run_test.sh       # smoke test: --mine 20 at golden nbits -> expect a win + proof
+bash build.sh          # GPU NOT required to compile; outputs build/plainproof_gen
+bash cpu_test.sh       # CPU-only correctness check: reference search -> PlainProof (no GPU)
+bash run_test.sh       # GPU smoke test: --mine 20 at golden nbits (needs a GPU)
 ```
-The tensor-core path is built only when `CC >= 80` and `CUTLASS_DIR/include` exists
-(default `./cutlass`; override with `CUTLASS_DIR=...`).
+CUDA compiles fine on a GPU-less host. `build.sh` picks the arch as
+`ARCH` env override → `nvidia-smi` detection (if a GPU is present) → a portable
+multi-arch fatbin (`sm_75..sm_90` SASS + Hopper PTX for Blackwell JIT). The
+tensor-core path is built only when `CUTLASS_DIR/include` exists **and** an
+explicit `sm_80+` `ARCH` is set (e.g. `ARCH=sm_90a`); otherwise a stub links.
 
 ## CI (cnb.cool)
-`.cnb.yml` runs build + smoke-test on a CUDA GPU runner on push to `main`.
+`.cnb.yml` builds and **correctness-verifies on CPU** on push to `main` — no GPU
+needed for that. The GPU kernel smoke test (`run_test.sh`) is added once a GPU
+runner is requested.
 
 ## Notes
 - int7 base [-64,64] + bounded noise keeps values in int8 [-128,126], so int8 MMA is

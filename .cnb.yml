@@ -1,19 +1,26 @@
-# cnb.cool pipeline — build & smoke-test the Pearl(PRL) self-built PoUW solver on GPU.
-# Iteration 1: dp4a (CUDA-core) path only; the tensor-core path is stubbed by build.sh
-# (CUTLASS + sm_80+ added in a later iteration). The gpu-info stage prints nvidia-smi
-# so we can confirm what GPU/arch the runner provides and adjust from the build log.
+# cnb.cool pipeline for the Pearl(PRL) self-built PoUW solver.
+#
+# The default cnb runner has NO GPU (one must be requested explicitly), but CUDA
+# code COMPILES without a GPU and the solver's reference path runs entirely on
+# CPU. So this pipeline fully builds AND correctness-verifies the solver on the
+# free GPU-less runner:
+#   build      -> portable multi-arch CUDA fatbin (sm_75..sm_90 SASS + PTX)
+#   cpu-verify -> reference jackpot search -> emits an oracle-shaped PlainProof
+# The GPU kernel smoke test (run_test.sh, --mine / dp4a) is added in a later
+# iteration once a GPU runner is wired up.
 main:
   push:
     - docker:
         image: nvidia/cuda:12.4.1-devel-ubuntu22.04
       stages:
         - name: deps
-          script: apt-get update -y && apt-get install -y --no-install-recommends g++ make git ca-certificates
-        - name: gpu-info
+          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates
+        - name: toolchain-info
           script:
-            - nvidia-smi || echo "NO GPU visible to this runner"
             - nvcc --version | tail -2
+            - g++ --version | head -1
+            - (command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi) || echo "no GPU on this runner (expected; build is GPU-independent)"
         - name: build
           script: bash build.sh
-        - name: smoke-test
-          script: bash run_test.sh
+        - name: cpu-verify
+          script: bash cpu_test.sh
