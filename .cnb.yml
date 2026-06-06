@@ -1,13 +1,23 @@
 # cnb.cool pipeline for the Pearl(PRL) self-built PoUW solver.
 #
-# The default cnb runner has NO GPU (one must be requested explicitly), but CUDA
-# code COMPILES without a GPU and the solver's reference path runs entirely on
-# CPU. So this pipeline fully builds AND correctness-verifies the solver on the
-# free GPU-less runner:
-#   build      -> portable multi-arch CUDA fatbin (sm_75..sm_90 SASS + PTX)
-#   cpu-verify -> reference jackpot search -> emits an oracle-shaped PlainProof
-# The GPU kernel smoke test (run_test.sh, --mine / dp4a) is added in a later
-# iteration once a GPU runner is wired up.
+# Two pipelines:
+#   main (push) -> FREE GPU-less runner. CUDA still COMPILES with no GPU, and the
+#                  solver's reference path runs entirely on CPU, so this fully
+#                  builds AND correctness-verifies the solver at zero GPU cost:
+#                    build      -> portable multi-arch CUDA fatbin (sm_75..sm_90 SASS + PTX)
+#                    cpu-verify -> reference jackpot search -> oracle-shaped PlainProof
+#   gpu  (push) -> GPU runner (metered!). Builds natively for the runner's arch and
+#                  runs the dp4a kernel smoke test. Deliberately on a SEPARATE branch
+#                  so it only spends GPU minutes when you push to `gpu` on purpose.
+#
+# cnb GPU-runner selection is by tag (confirmed from working cnb.cool repos):
+#   cnb:arch:amd64:gpu        -> default, H20  (Hopper, sm_90)  <-- our fatbin already has sm_90 SASS
+#   cnb:arch:amd64:gpu:L40    -> L40           (Ada,    sm_89)
+#   cnb:arch:amd64:gpu:L20    -> L20 48GB      (Ada,    sm_89)
+# NOTE: cnb offers no Blackwell/sm_120 (5090) runner, so cnb GPU validates CORRECTNESS
+# on a real GPU (proof is arch-independent); sm_120 perf still needs the 5090 box.
+# NOTE: the GPU tag only schedules if GPU is enabled/approved for this repo (the 申请 step).
+
 main:
   push:
     - docker:
@@ -24,3 +34,24 @@ main:
           script: bash build.sh
         - name: cpu-verify
           script: bash cpu_test.sh
+
+gpu:
+  push:
+    - docker:
+        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      runner:
+        tags: cnb:arch:amd64:gpu        # H20 (sm_90); change to :gpu:L40 / :gpu:L20 if that's what was granted
+      stages:
+        - name: deps
+          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates
+        - name: gpu-info
+          script: nvidia-smi
+        - name: build
+          # build.sh auto-detects the runner's GPU (nvidia-smi -> sm_90 on H20) and builds natively
+          script: bash build.sh
+        - name: cpu-verify
+          # cheap CPU sanity gate before spending the GPU smoke run
+          script: bash cpu_test.sh
+        - name: gpu-smoke
+          # dp4a kernel runs on the real GPU: --mine 20 at golden nbits -> win + PlainProof, rc 0
+          script: bash run_test.sh
