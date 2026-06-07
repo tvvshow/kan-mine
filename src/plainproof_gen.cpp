@@ -703,6 +703,7 @@ int main(int argc, char** argv) {
     bool use_gpu = false;
     bool use_tc = false;
     bool mine = false;
+    bool real_cfg = false;   // --cfg real -> REAL kryptex network config (m=n=131072,k=4096,r=256)
     uint64_t maxdraws = 10000000ULL;
     std::string header_hex_override;
     std::string target_hex;
@@ -723,18 +724,33 @@ int main(int argc, char** argv) {
         }
         else if (a == "--target" && i + 1 < argc) target_hex = argv[++i];
         else if (a == "--header" && i + 1 < argc) header_hex_override = argv[++i];
+        else if (a == "--cfg" && i + 1 < argc) real_cfg = (std::string(argv[++i]) == "real");
         else seed = strtoull(argv[i], nullptr, 10);
     }
 
-    const size_t m = 6144, n = 4096, k = 2240;
-    const size_t rank = 128;
-
+    // -----------------------------------------------------------------------
+    // Config selection. GOLDEN (default) = small CPU-winnable toy instance used
+    // for fast oracle cross-checks. REAL (--cfg real) = the live kryptex network
+    // config captured from lpminer --pearl-share-dump (m=n=131072,k=4096,r=256;
+    // patterns verified to reproduce the oracle's 52-byte mining_config.bin).
+    // The whole pipeline below (noise/jackpot/merkle/bincode) is dimension- and
+    // pattern-agnostic, so only these few values change between configs.
+    // -----------------------------------------------------------------------
+    size_t m, n, k, rank;
     Header header;
     Config config;
+    if (real_cfg) {
+        m = 131072; n = 131072; k = 4096; rank = 256;
+        config.rows_pattern = PeriodicPattern::from_list({0,8,32,40,64,72,96,104});
+        config.cols_pattern = PeriodicPattern::from_list(
+            {0,1,32,33,64,65,96,97,128,129,160,161,192,193,224,225});
+    } else {
+        m = 6144; n = 4096; k = 2240; rank = 128;
+        config.rows_pattern = PeriodicPattern::from_list({0,1,8,9,64,65,72,73});
+        config.cols_pattern = PeriodicPattern::from_list({0,1,8,9,64,65,72,73});
+    }
     config.common_dim = (uint32_t)k;
     config.rank = (uint16_t)rank;
-    config.rows_pattern = PeriodicPattern::from_list({0,1,8,9,64,65,72,73});
-    config.cols_pattern = PeriodicPattern::from_list({0,1,8,9,64,65,72,73});
 
     // header bytes: golden by default, or raw 76B from --header <152hex>
     vector<uint8_t> header_bytes = header.to_bytes();
@@ -860,7 +876,15 @@ int main(int argc, char** argv) {
     vector<size_t> win_rows, win_cols;
 
     // row_off/col_off (base offsets) and pattern arrays are draw-invariant.
-    int pat[8]={0,1,8,9,64,65,72,73};
+    // pat_rows / pat_cols = within-tile index offsets (PeriodicPattern.to_list()).
+    // GOLDEN has identical row/col patterns; REAL differs (h=8 rows, w=16 cols),
+    // so the two arrays are distinct and must NOT be conflated. The legacy dp4a /
+    // tc kernels below assume pat_rows==pat_cols and are GOLDEN-only; the
+    // real-config search uses the CPU path here (and, later, the fused kernel).
+    std::vector<uint32_t> _pr = config.rows_pattern.to_list();
+    std::vector<uint32_t> _pc = config.cols_pattern.to_list();
+    std::vector<int> pat_rows(_pr.begin(), _pr.end());
+    std::vector<int> pat_cols(_pc.begin(), _pc.end());
     int hh=(int)config.rows_pattern.size(), ww=(int)config.cols_pattern.size();
     std::vector<int> row_off(row_parts.size()), col_off(col_parts.size());
     for (size_t i=0;i<row_parts.size();i++) row_off[i]=(int)row_parts[i][0];
@@ -878,7 +902,7 @@ int main(int argc, char** argv) {
         gpu_mine_init((int)m,(int)n,(int)k,(int)rank,hh,ww,
                       row_off.data(),(int)row_parts.size(),
                       col_off.data(),(int)col_parts.size(),
-                      pat, pat);
+                      pat_rows.data(), pat_cols.data());
 
         // Reused host buffers (allocate once).
         std::vector<signed char> a_noised((size_t)m*k), b_noised_t((size_t)n*k);
@@ -999,7 +1023,7 @@ int main(int argc, char** argv) {
         int rt=-1, ct=-1;
         int ok = tc_jackpot_search(a_noised.data(), b_noised_t.data(),
                                    (int)m,(int)n,(int)k,(int)rank,
-                                   pat,hh,ww,
+                                   pat_rows.data(),hh,ww,
                                    row_off.data(),(int)row_parts.size(),
                                    col_off.data(),(int)col_parts.size(),
                                    a_noise_seed.data(), bound.b,
@@ -1021,7 +1045,7 @@ int main(int argc, char** argv) {
         int rt=-1, ct=-1;
         int ok = gpu_jackpot_search(a_noised.data(), b_noised_t.data(),
                                     (int)m,(int)n,(int)k,(int)rank,
-                                    pat,hh,ww,
+                                    pat_rows.data(),hh,ww,
                                     row_off.data(),(int)row_parts.size(),
                                     col_off.data(),(int)col_parts.size(),
                                     a_noise_seed.data(), bound.b,

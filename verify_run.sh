@@ -81,6 +81,16 @@ verify_one() {            # $1 = label ; rest = solver args
 verify_one CPU 12345
 verify_one GPU --mine 5000
 
+# --- REAL kryptex network config (m=n=131072,k=4096,r=256) -------------------
+# THE live config captured from lpminer --pearl-share-dump (oracle/). Its 52-byte
+# mining_config is reproduced bit-for-bit by our Config::to_bytes() with these
+# patterns. Fed the oracle's own easy header (nbits=207fffff) so the CPU search
+# wins tile 0 immediately and exercises the real-config jackpot fold. A VALID here
+# proves our REAL-config proof is officially correct end-to-end = the oracle the
+# fast tensor-core kernel (M2a Phase B) will be validated against.
+REAL_HDR="01000000f9661239d86cd892e31455d6ad6c1a55745ab7d16a63c82143d271f417ca49994f2738ce9c121c22c08598078e168bf4e1b8167b4e6f30fe911d555492a1afacf2e3246affff7f20"
+verify_one REAL --cfg real --header "$REAL_HDR"
+
 echo ""
 echo "============================================================"
 echo "=== SELF-VERIFY SUMMARY (official zk_pow::verify_plain_proof) ==="
@@ -91,4 +101,4 @@ if grep -q '=INVALID' /tmp/verdicts.txt || grep -q '=NOPROOF' /tmp/verdicts.txt;
   echo "RESULT: NOT-ALL-VALID  (a path failed official verification — real, free-fixable bug)"
   exit 1
 fi
-echo "RESULT: ALL-VALID  (both CPU and GPU --mine proofs pass the official verifier)"
+echo "RESULT: ALL-VALID  (golden CPU + golden GPU --mine + REAL-config proofs all pass the official verifier)"

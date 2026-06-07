@@ -158,8 +158,12 @@ def handle(client, addr, args, fh):
     uctx.check_hostname = False; uctx.verify_mode = ssl.CERT_NONE
     try:
         raw_up = socket.create_connection((args.upstream_host, args.upstream_port), timeout=30)
-        up = uctx.wrap_socket(raw_up, server_hostname=args.upstream_host)
-        log("[%s] upstream TLS up: %s -> %s:%d" % (ts(), up.version(), args.upstream_host, args.upstream_port), fh)
+        if args.upstream_plain:
+            up = raw_up
+            log("[%s] upstream PLAINTEXT tcp -> %s:%d" % (ts(), args.upstream_host, args.upstream_port), fh)
+        else:
+            up = uctx.wrap_socket(raw_up, server_hostname=args.upstream_host)
+            log("[%s] upstream TLS up: %s -> %s:%d" % (ts(), up.version(), args.upstream_host, args.upstream_port), fh)
     except Exception as e:
         log("[%s] FAILED upstream connect: %r" % (ts(), e), fh)
         try: client.close()
@@ -178,7 +182,8 @@ def main():
     ap.add_argument("--listen-host", default="127.0.0.1")
     ap.add_argument("--listen-port", type=int, default=8048)
     ap.add_argument("--upstream-host", default="prl.kryptex.network")
-    ap.add_argument("--upstream-port", type=int, default=8048)
+    ap.add_argument("--upstream-port", type=int, default=7048)
+    ap.add_argument("--upstream-plain", action="store_true", help="upstream is plaintext TCP (kryptex Pearl = stratum+tcp:7048), not TLS")
     ap.add_argument("--listen-tls", action="store_true", help="listen with TLS (self-signed); default is plaintext")
     ap.add_argument("--cert", default="proxy_cert.pem")
     ap.add_argument("--key", default="proxy_key.pem")
