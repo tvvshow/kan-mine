@@ -70,9 +70,6 @@ poolprobe:
         - name: deps
           script: apt-get update -y && apt-get install -y --no-install-recommends python3 ca-certificates
         - name: net-info
-          script:
-            - (command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L) || echo "no GPU visible"
-            - python3 --version
-            - getent hosts prl.kryptex.network || echo "DNS-FAIL: cannot resolve prl.kryptex.network"
+          script: nvidia-smi -L && python3 --version
         - name: pool-probe
           script: python3 pool_probe.py
