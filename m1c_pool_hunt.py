@@ -85,7 +85,7 @@ def reader(s):
 
 def main():
     if not os.path.exists(GEN):
-        log("FATAL: solver binary not found:", GEN); return
+        log("FATAL: solver binary not found:", GEN); sys.exit(2)
     log("[drv] M1c kryptex de-risk start; GEN=%s WORKER=%s MAXSEC=%d" % (GEN, WORKER, MAXSEC))
     ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
     s = ctx.wrap_socket(socket.create_connection((HOST, PORT), timeout=30), server_hostname=HOST)
@@ -102,7 +102,7 @@ def main():
         time.sleep(0.2)
     with lock:
         if not st["header"]:
-            log("[drv] no job within 25s; abort"); st["stop"] = True; s.close(); return
+            log("[drv] no job within 25s; abort"); st["stop"] = True; s.close(); sys.exit(3)
 
     start = time.time(); submit_id = 100
     while not st["stop"]:
