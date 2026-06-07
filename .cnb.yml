@@ -73,3 +73,24 @@ poolprobe:
           script: nvidia-smi -L && python3 --version
         - name: pool-probe
           script: python3 pool_probe.py
+
+# hunt (push to `hunt` branch) -> M1c REAL share hunt on the GPU runner.
+# Builds the solver natively (sm_89 on L40), then runs m1c_pool_hunt.py: mine the
+# latest kryptex job at share diff 2^20; on a win, submit + wait 30s for the pool's
+# verdict (the M1c ground truth), then stop. MAXSEC is large so cnb's OWN job cap is
+# the binding limit (lets us measure it); STOP_AFTER_WIN ends early on the first win.
+hunt:
+  push:
+    - docker:
+        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      runner:
+        tags: cnb:arch:amd64:gpu
+      stages:
+        - name: deps
+          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git python3 ca-certificates
+        - name: gpu-info
+          script: nvidia-smi -L
+        - name: build
+          script: bash build.sh
+        - name: hunt
+          script: OMP_NUM_THREADS=16 WORKER=m1ccnb GEN=./plainproof_gen GENDIR=build WIN_FILE=/tmp/m1c_win.json MAXSEC=7200 BATCH=1000000 STOP_AFTER_WIN=1 STOP_ON_ACK=1 python3 m1c_pool_hunt.py
