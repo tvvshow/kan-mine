@@ -94,3 +94,24 @@ hunt:
           script: bash build.sh
         - name: hunt
           script: OMP_NUM_THREADS=16 WORKER=m1ccnb GEN=$PWD/build/plainproof_gen GENDIR=$PWD/build WIN_FILE=/tmp/m1c_win.json MAXSEC=7200 BATCH=1000000 STOP_AFTER_WIN=1 STOP_ON_ACK=1 python3 m1c_pool_hunt.py
+
+# probe2 (push `probe2` branch) -> M1c submit-shape disambiguation. The hunt found a
+# real win but the pool was SILENT on the submit. This builds the solver (for a
+# well-formed proof) then sends 3 mining.submit variants (real-job / bogus-job_id /
+# garbage-proof), with and without mining.subscribe, and reports which the pool ACKs.
+# A bogus-job_id "unknown job" ack => our shape is recognized; all-silent => it isn't.
+probe2:
+  push:
+    - docker:
+        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      runner:
+        tags: cnb:arch:amd64:gpu
+      stages:
+        - name: deps
+          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git python3 ca-certificates
+        - name: build
+          script: bash build.sh
+        - name: probe2-nosub
+          script: WORKER=probe2n GEN=$PWD/build/plainproof_gen SUBSCRIBE=0 python3 pool_probe2.py
+        - name: probe2-sub
+          script: WORKER=probe2s GEN=$PWD/build/plainproof_gen SUBSCRIBE=1 python3 pool_probe2.py
