@@ -690,7 +690,7 @@ extern "C" void gpu_mine_free();
 extern "C" int tc_jackpot_search(
     const signed char* a_noised, const signed char* b_noised_t,
     int m,int n,int k,int rank,
-    const int* pat, int h,int w,
+    const int* pat_rows, const int* pat_cols, int h,int w,
     const int* row_off, int nrow_off, const int* col_off, int ncol_off,
     const unsigned char* a_noise_seed32, const unsigned char* bound_le32,
     unsigned int* out_hashes_host, unsigned int* dbg_j0_host,
@@ -1023,7 +1023,7 @@ int main(int argc, char** argv) {
         int rt=-1, ct=-1;
         int ok = tc_jackpot_search(a_noised.data(), b_noised_t.data(),
                                    (int)m,(int)n,(int)k,(int)rank,
-                                   pat_rows.data(),hh,ww,
+                                   pat_rows.data(),pat_cols.data(),hh,ww,
                                    row_off.data(),(int)row_parts.size(),
                                    col_off.data(),(int)col_parts.size(),
                                    a_noise_seed.data(), bound.b,

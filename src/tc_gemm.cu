@@ -1,26 +1,35 @@
-// tc_gemm.cu — M1b tensor-core compute path for Pearl jackpot search.
-// Dense int8 tensor-core GEMM (CUTLASS legacy Sm80 tensorop, compiled -arch=sm_120a),
-// chunked over k in rank-sized steps with beta=1 accumulation so C holds the
-// CUMULATIVE partial sum after each rank-chunk — exactly what the jackpot fold needs.
-// After each chunk, fold all tiles; after all chunks, keyed-blake3 + LE<=bound win check.
-// Bit-exact to the dp4a reference because int7 base + bounded noise fits int8 [-128,126].
+// tc_gemm.cu — M2a FUSED int8 tensor-core jackpot search for Pearl PoUW.
+//
+// WHY THIS REPLACES THE OLD CUTLASS PATH: the previous version ran a device-level
+// CUTLASS GEMM per rank-chunk into a full m*n int32 C matrix. At the REAL network
+// config (m=n=131072) that C is 131072^2*4 = 68 GB — impossible. lpminer/official
+// never materialize C; they accumulate each tile IN REGISTERS and fold the hash on
+// the fly. This kernel does the same with WMMA (Ampere/Ada/Blackwell int8 tensor
+// cores), so memory use is O(A)+O(Bt) = ~1 GB at real config, not O(m*n).
+//
+// MODEL (one WARP per tile, identical math to the dp4a reference jackpot_kernel.cu
+// and the CPU reference plainproof_gen.cpp):
+//   tile (i,j): rows R[u]=row_off[i]+pat_rows[u] (u<h), cols C[v]=col_off[j]+pat_cols[v] (v<w)
+//   acc[M=16 cols][N=16 rows] persists across ALL rank-chunks, so after chunk c it
+//   holds the CUMULATIVE dot P_c[col][row]=sum_{l<=(c+1)*rank} b_noised_t[C[col]][l]*a_noised[R[row]][l]
+//   (note O[col][row]==jackpot_tile[row][col]; dot is symmetric so the XOR is identical).
+//   After each chunk: x_c = XOR over the h*w REAL cells of (uint32)acc; jp[c]=rotl13(jp[c])^x_c.
+//   (real config has exactly dot_len/rank=16 chunks => each jp[c] written once => jp[c]=x_c.)
+//   After all chunks: out = keyed-blake3(jp[16], a_noise_seed); win if U256_LE(out) <= bound.
+//
+// WMMA tile is 16x16x16 s8. We map M<-w cols (pad to 16), N<-h rows (pad to 16),
+// K<-16 (rank/16 wmma steps per chunk). Padding lanes are zeroed and EXCLUDED from
+// the XOR (only m<w && n<h cells fold), so they never affect the result.
+//
+// Build: nvcc -arch=sm_80+ (no CUTLASS needed). int8 WMMA needs sm_72+.
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <cstdint>
 #include <cstdio>
-#include "cutlass/cutlass.h"
-#include "cutlass/gemm/device/gemm.h"
-#include "cutlass/layout/matrix.h"
-#include "cutlass/tensor_ref.h"
 
-using Gemm = cutlass::gemm::device::Gemm<
-    int8_t,  cutlass::layout::RowMajor,
-    int8_t,  cutlass::layout::ColumnMajor,
-    int32_t, cutlass::layout::RowMajor,
-    int32_t,
-    cutlass::arch::OpClassTensorOp,
-    cutlass::arch::Sm80>;
+using namespace nvcuda;
 
-// --- BLAKE3 single-block keyed (root XOF first 8 words) — identical to jackpot_kernel.cu ---
+// --- BLAKE3 single 64-byte block, keyed, root XOF, first 8 words (== jackpot_kernel.cu) ---
 static __device__ __forceinline__ uint32_t rotr32(uint32_t x,int n){ return (x>>n)|(x<<(32-n)); }
 static __device__ __forceinline__ uint32_t rotl32d(uint32_t x,int n){ return (x<<n)|(x>>(32-n)); }
 static __constant__ uint32_t IVc[8] = {
@@ -61,49 +70,98 @@ static __device__ __forceinline__ bool le_u256(const uint32_t a[8], const uint32
   return true;
 }
 
-// Fold one rank-chunk into the per-tile jackpot lanes.
-// One block per tile, h*w threads. Reads CUMULATIVE C (m x n int32, row-major).
-__global__ void tc_fold_kernel(
-    const int32_t* __restrict__ C, int n,
-    const int* __restrict__ row_off, const int* __restrict__ col_off,
-    const int* __restrict__ pat, int h, int w, int ncol_off,
-    int chunk_idx, uint32_t* __restrict__ jackpot /* ntiles*16 */)
-{
-  int tile = blockIdx.x;
-  int i = tile / ncol_off, j = tile % ncol_off;
-  int hw = h*w;
-  int cell = threadIdx.x;
-  __shared__ uint32_t sh[256];
-  if (cell < hw) {
-    int u = cell / w, vv = cell % w;
-    size_t a_idx = (size_t)(row_off[i] + pat[u]);
-    int    b_idx = col_off[j] + pat[vv];
-    sh[cell] = (uint32_t)C[a_idx*(size_t)n + b_idx];
-  }
-  __syncthreads();
-  if (cell == 0) {
-    uint32_t x = 0;
-    for (int t = 0; t < hw; t++) x ^= sh[t];
-    int tid = chunk_idx % 16;
-    size_t base = (size_t)tile*16 + tid;
-    jackpot[base] = rotl32d(jackpot[base], 13) ^ x;
-  }
-}
+#define WPB 4          // warps per block
+#define MAXR 256       // max rank supported (real=256, golden=128)
 
-// One thread per tile: keyed-blake3(jackpot[16]) then LE compare <= bound.
-__global__ void tc_hash_kernel(
-    const uint32_t* __restrict__ jackpot, int ntiles, int ncol_off,
+// One warp per tile. blockDim = WPB*32.
+__global__ void tc_fused_jackpot(
+    const signed char* __restrict__ A,  const signed char* __restrict__ Bt,
+    int m, int n, int k, int rank,
+    const int* __restrict__ pat_rows, const int* __restrict__ pat_cols, int h, int w,
+    const int* __restrict__ row_off, const int* __restrict__ col_off,
+    int nrow_off, int ncol_off,
     const uint32_t* __restrict__ key, const uint32_t* __restrict__ bound,
+    uint32_t* __restrict__ out_hashes,            // optional: ntiles*8, may be null
     int* __restrict__ win_flag, int* __restrict__ win_rt, int* __restrict__ win_ct)
 {
-  int tile = blockIdx.x*blockDim.x + threadIdx.x;
+  const int warp = threadIdx.x >> 5;          // 0..WPB-1
+  const int lane = threadIdx.x & 31;
+  const size_t tile = (size_t)blockIdx.x * WPB + warp;
+  const size_t ntiles = (size_t)nrow_off * ncol_off;
   if (tile >= ntiles) return;
-  uint32_t msg[16];
-  for (int i=0;i<16;i++) msg[i] = jackpot[(size_t)tile*16 + i];
-  uint32_t out[8];
-  jackpot_blake3(key, msg, out);
-  if (le_u256(out, bound)) {
-    if (atomicCAS(win_flag, 0, 1) == 0) { *win_rt = tile/ncol_off; *win_ct = tile%ncol_off; }
+  const int i = (int)(tile / ncol_off);       // row_off index
+  const int j = (int)(tile % ncol_off);       // col_off index
+
+  // per-warp shared staging: A-rows (N, padded 16) and B-cols (M, padded 16) for one chunk.
+  // 16-byte aligned: wmma::load_matrix_sync needs aligned base addresses for int8 frags.
+  __shared__ __align__(16) signed char a_sh[WPB][16][MAXR];  // a_sh[warp][row][kk]  rows 0..h-1 real
+  __shared__ __align__(16) signed char b_sh[WPB][16][MAXR];  // b_sh[warp][col][kk]  cols 0..w-1 real
+  __shared__ int32_t     o_sh[WPB][16][16];    // acc store, [M=col][N=row]
+  __shared__ uint32_t    jp_sh[WPB][16];
+
+  // zero the padding rows/cols once (they never get gathered, must contribute 0 / be excluded)
+  for (int idx = lane; idx < 16*MAXR; idx += 32) {
+    int row = idx / MAXR, kk = idx % MAXR;
+    if (row >= h) a_sh[warp][row][kk] = 0;
+    if (row >= w) b_sh[warp][row][kk] = 0;
+  }
+  if (lane < 16) jp_sh[warp][lane] = 0;
+  __syncwarp();
+
+  // resolve this tile's scattered row/col indices (h<=16, w<=16)
+  int Rr[16], Cc[16];
+  for (int u = 0; u < h; u++) Rr[u] = row_off[i] + pat_rows[u];
+  for (int v = 0; v < w; v++) Cc[v] = col_off[j] + pat_cols[v];
+
+  wmma::fragment<wmma::accumulator, 16,16,16, int32_t> acc;
+  wmma::fill_fragment(acc, 0);
+
+  const int nchunks = (k - (k % rank)) / rank;  // dot_len/rank
+  const int ksteps  = rank / 16;                // wmma K-steps per chunk
+
+  for (int c = 0; c < nchunks; c++) {
+    const int kbase = c * rank;
+    // gather this chunk's real A-rows and B-cols into shared (coalesced-ish per row)
+    for (int e = lane; e < h*rank; e += 32) {
+      int row = e / rank, kk = e % rank;
+      a_sh[warp][row][kk] = A[(size_t)Rr[row]*k + kbase + kk];
+    }
+    for (int e = lane; e < w*rank; e += 32) {
+      int col = e / rank, kk = e % rank;
+      b_sh[warp][col][kk] = Bt[(size_t)Cc[col]*k + kbase + kk];
+    }
+    __syncwarp();
+
+    // accumulate this chunk into acc (acc PERSISTS -> cumulative across chunks)
+    for (int ks = 0; ks < ksteps; ks++) {
+      wmma::fragment<wmma::matrix_a, 16,16,16, signed char, wmma::row_major> af; // M=col,K
+      wmma::fragment<wmma::matrix_b, 16,16,16, signed char, wmma::col_major> bf; // K,N=row
+      wmma::load_matrix_sync(af, &b_sh[warp][0][ks*16], MAXR); // O[M=col][.] from b-cols
+      wmma::load_matrix_sync(bf, &a_sh[warp][0][ks*16], MAXR); // [.][N=row]   from a-rows
+      wmma::mma_sync(acc, af, bf, acc);
+    }
+    // snapshot cumulative acc and XOR-fold the h*w real cells
+    wmma::store_matrix_sync(&o_sh[warp][0][0], acc, 16, wmma::mem_row_major);
+    __syncwarp();
+    uint32_t x = 0;
+    for (int idx = lane; idx < 256; idx += 32) {  // 8 cells/lane
+      int M = idx >> 4, N = idx & 15;             // M=col, N=row
+      if (M < w && N < h) x ^= (uint32_t)o_sh[warp][M][N];
+    }
+    for (int off = 16; off > 0; off >>= 1) x ^= __shfl_xor_sync(0xffffffffu, x, off);
+    if (lane == 0) { int tid = c % 16; jp_sh[warp][tid] = rotl32d(jp_sh[warp][tid], 13) ^ x; }
+    __syncwarp();
+  }
+
+  if (lane == 0) {
+    uint32_t jp[16];
+    for (int t = 0; t < 16; t++) jp[t] = jp_sh[warp][t];
+    uint32_t out[8];
+    jackpot_blake3(key, jp, out);
+    if (out_hashes) for (int t = 0; t < 8; t++) out_hashes[tile*8 + t] = out[t];
+    if (le_u256(out, bound)) {
+      if (atomicCAS(win_flag, 0, 1) == 0) { *win_rt = i; *win_ct = j; }
+    }
   }
 }
 
@@ -112,28 +170,28 @@ static inline void words_from_le32(const unsigned char* b, uint32_t w[8]){
     w[i]=(uint32_t)b[i*4]|((uint32_t)b[i*4+1]<<8)|((uint32_t)b[i*4+2]<<16)|((uint32_t)b[i*4+3]<<24);
 }
 
+// Drop-in replacement for the old tc_jackpot_search, now with SEPARATE row/col
+// patterns (real config: h=8 != w=16) and NO m*n C buffer.
 extern "C" int tc_jackpot_search(
     const signed char* a_noised, const signed char* b_noised_t,
     int m,int n,int k,int rank,
-    const int* pat, int h,int w,
+    const int* pat_rows, const int* pat_cols, int h,int w,
     const int* row_off, int nrow_off, const int* col_off, int ncol_off,
     const unsigned char* a_noise_seed32, const unsigned char* bound_le32,
-    unsigned int* /*out_hashes_host*/, unsigned int* /*dbg_j0_host*/,
+    unsigned int* out_hashes_host, unsigned int* /*dbg_j0_host*/,
     int* out_rt, int* out_ct)
 {
+  if (rank > MAXR) { fprintf(stderr,"tc: rank %d > MAXR %d\n", rank, MAXR); return -3; }
   size_t ntiles = (size_t)nrow_off * ncol_off;
-  int dot_len = k - (k % rank);
-  int nchunks = dot_len / rank;
-
-  int8_t  *dA=nullptr,*dBt=nullptr; int32_t *dC=nullptr;
-  cudaMalloc(&dA,(size_t)m*k); cudaMalloc(&dBt,(size_t)n*k); cudaMalloc(&dC,(size_t)m*n*sizeof(int32_t));
+  signed char *dA=nullptr,*dBt=nullptr;
+  if (cudaMalloc(&dA,(size_t)m*k)!=cudaSuccess || cudaMalloc(&dBt,(size_t)n*k)!=cudaSuccess) {
+    fprintf(stderr,"tc: cudaMalloc A/Bt failed\n"); return -1; }
   cudaMemcpy(dA,a_noised,(size_t)m*k,cudaMemcpyHostToDevice);
   cudaMemcpy(dBt,b_noised_t,(size_t)n*k,cudaMemcpyHostToDevice);
-  cudaMemset(dC,0,(size_t)m*n*sizeof(int32_t));
 
-  int *dpat=nullptr,*droff=nullptr,*dcoff=nullptr;
-  int npat=(h>w?h:w);
-  cudaMalloc(&dpat,npat*sizeof(int));   cudaMemcpy(dpat,pat,npat*sizeof(int),cudaMemcpyHostToDevice);
+  int *dpr=nullptr,*dpc=nullptr,*droff=nullptr,*dcoff=nullptr;
+  cudaMalloc(&dpr,h*sizeof(int)); cudaMemcpy(dpr,pat_rows,h*sizeof(int),cudaMemcpyHostToDevice);
+  cudaMalloc(&dpc,w*sizeof(int)); cudaMemcpy(dpc,pat_cols,w*sizeof(int),cudaMemcpyHostToDevice);
   cudaMalloc(&droff,nrow_off*sizeof(int)); cudaMemcpy(droff,row_off,nrow_off*sizeof(int),cudaMemcpyHostToDevice);
   cudaMalloc(&dcoff,ncol_off*sizeof(int)); cudaMemcpy(dcoff,col_off,ncol_off*sizeof(int),cudaMemcpyHostToDevice);
 
@@ -141,33 +199,29 @@ extern "C" int tc_jackpot_search(
   uint32_t *dkey=nullptr,*dbnd=nullptr; cudaMalloc(&dkey,32); cudaMalloc(&dbnd,32);
   cudaMemcpy(dkey,keyw,32,cudaMemcpyHostToDevice); cudaMemcpy(dbnd,bndw,32,cudaMemcpyHostToDevice);
 
-  uint32_t* djp=nullptr; cudaMalloc(&djp,ntiles*16*sizeof(uint32_t)); cudaMemset(djp,0,ntiles*16*sizeof(uint32_t));
+  uint32_t* dhash=nullptr; if (out_hashes_host) cudaMalloc(&dhash, ntiles*8*sizeof(uint32_t));
   int *dwf=nullptr,*drt=nullptr,*dct=nullptr; cudaMalloc(&dwf,4);cudaMalloc(&drt,4);cudaMalloc(&dct,4); cudaMemset(dwf,0,4);
 
+  int blocks = (int)((ntiles + WPB - 1) / WPB);
   cudaEvent_t e0,e1; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0);
-
-  Gemm op;
-  for (int c=0;c<nchunks;c++){
-    cutlass::TensorRef<int8_t,  cutlass::layout::RowMajor>    refA((int8_t*)dA + (size_t)c*rank, cutlass::layout::RowMajor(k));
-    cutlass::TensorRef<int8_t,  cutlass::layout::ColumnMajor> refB((int8_t*)dBt + (size_t)c*rank, cutlass::layout::ColumnMajor(k));
-    cutlass::TensorRef<int32_t, cutlass::layout::RowMajor>    refC(dC, cutlass::layout::RowMajor(n));
-    typename Gemm::Arguments args({m,n,rank}, refA, refB, refC, refC, {1,1});
-    cutlass::Status st = op(args);
-    if (st != cutlass::Status::kSuccess){ fprintf(stderr,"tc: gemm chunk %d status=%d\n",c,(int)st); return -2; }
-    tc_fold_kernel<<<(unsigned)ntiles, (unsigned)(h*w)>>>(dC,n,droff,dcoff,dpat,h,w,ncol_off,c,djp);
-  }
-  int threads=128, blocks=(int)((ntiles+threads-1)/threads);
-  tc_hash_kernel<<<blocks,threads>>>(djp,(int)ntiles,ncol_off,dkey,dbnd,dwf,drt,dct);
+  tc_fused_jackpot<<<blocks, WPB*32>>>(dA,dBt,m,n,k,rank,dpr,dpc,h,w,droff,dcoff,
+                                       nrow_off,ncol_off,dkey,dbnd,dhash,dwf,drt,dct);
   cudaError_t err=cudaDeviceSynchronize();
   cudaEventRecord(e1); cudaEventSynchronize(e1);
   float ms=0; cudaEventElapsedTime(&ms,e0,e1);
-  fprintf(stderr,"tc: %d chunks, %zu tiles, %.3f ms (compute+fold+hash)\n", nchunks, ntiles, ms);
-  if (err!=cudaSuccess){ fprintf(stderr,"tc: cuda err %s\n",cudaGetErrorString(err)); return -1; }
+  double mac = (double)ntiles*(double)h*(double)w*(double)(k-(k%rank));
+  fprintf(stderr,"tc(fused): %zu tiles, %.3f ms, %.2f TMAC/s\n", ntiles, ms, mac/(ms*1e-3)/1e12);
+  if (err!=cudaSuccess){ fprintf(stderr,"tc: cuda err %s\n",cudaGetErrorString(err)); }
 
-  int wf=0; cudaMemcpy(&wf,dwf,4,cudaMemcpyDeviceToHost);
-  if (wf){ cudaMemcpy(out_rt,drt,4,cudaMemcpyDeviceToHost); cudaMemcpy(out_ct,dct,4,cudaMemcpyDeviceToHost); }
-  cudaFree(dA);cudaFree(dBt);cudaFree(dC);cudaFree(dpat);cudaFree(droff);cudaFree(dcoff);
-  cudaFree(dkey);cudaFree(dbnd);cudaFree(djp);cudaFree(dwf);cudaFree(drt);cudaFree(dct);
+  int wf=0;
+  if (err==cudaSuccess){
+    cudaMemcpy(&wf,dwf,4,cudaMemcpyDeviceToHost);
+    if (wf){ cudaMemcpy(out_rt,drt,4,cudaMemcpyDeviceToHost); cudaMemcpy(out_ct,dct,4,cudaMemcpyDeviceToHost); }
+    if (out_hashes_host) cudaMemcpy(out_hashes_host,dhash,ntiles*8*sizeof(uint32_t),cudaMemcpyDeviceToHost);
+  }
+  cudaFree(dA);cudaFree(dBt);cudaFree(dpr);cudaFree(dpc);cudaFree(droff);cudaFree(dcoff);
+  cudaFree(dkey);cudaFree(dbnd);cudaFree(dwf);cudaFree(drt);cudaFree(dct);
+  if (dhash) cudaFree(dhash);
   cudaEventDestroy(e0); cudaEventDestroy(e1);
-  return wf;
+  return (err==cudaSuccess) ? wf : -1;
 }

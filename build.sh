@@ -57,20 +57,15 @@ echo "=== dp4a kernel (jackpot_kernel) ==="
 # shellcheck disable=SC2086
 nvcc -O3 ${GENCODE} -c "${ROOT}/src/jackpot_kernel.cu"
 
-# --- tensor-core path (optional; needs CUTLASS headers + explicit sm_80+ ARCH) ---
-CUTLASS_DIR="${CUTLASS_DIR:-${ROOT}/cutlass}"
-TC_OK=0
-case "${ARCH:-}" in sm_8*|sm_9*|sm_10*|sm_12*) TC_OK=1 ;; esac
-if [ "${TC_OK}" = "1" ] && [ -d "${CUTLASS_DIR}/include" ]; then
-  echo "=== tensor-core path (CUTLASS @ ${CUTLASS_DIR}, ${ARCH}) ==="
-  nvcc -O3 -arch="${ARCH}" -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -DNDEBUG \
-    -I"${CUTLASS_DIR}/include" -I"${CUTLASS_DIR}/tools/util/include" -c "${ROOT}/src/tc_gemm.cu"
-  TC=tc_gemm.o
-else
-  echo "=== tensor-core path STUBBED (need CUTLASS headers + sm_80+ ARCH override) ==="
-  g++ -O3 -std=c++17 -c "${ROOT}/src/tc_stub.cpp" -o tc_gemm.o
-  TC=tc_gemm.o
-fi
+# --- fused tensor-core path (M2a: WMMA int8, NO CUTLASS) ---------------------
+# tc_gemm.cu is a self-contained WMMA (16x16x16 s8) fused jackpot kernel. int8 WMMA
+# needs sm_72+, and every GENCODE target above (sm_75..sm_90 SASS + PTX) qualifies,
+# so we build it unconditionally with the SAME arch flags as the dp4a kernel — no
+# CUTLASS headers, no separate ARCH override, no stub.
+echo "=== fused tensor-core kernel (tc_gemm, WMMA int8) ==="
+# shellcheck disable=SC2086
+nvcc -O3 ${GENCODE} -std=c++17 -c "${ROOT}/src/tc_gemm.cu"
+TC=tc_gemm.o
 
 echo "=== link ==="
 g++ -O3 -fopenmp plainproof_gen.o blake3.o blake3_dispatch.o blake3_portable.o jackpot_kernel.o "${TC}" \

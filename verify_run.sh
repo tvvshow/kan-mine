@@ -91,6 +91,20 @@ verify_one GPU --mine 5000
 REAL_HDR="01000000f9661239d86cd892e31455d6ad6c1a55745ab7d16a63c82143d271f417ca49994f2738ce9c121c22c08598078e168bf4e1b8167b4e6f30fe911d555492a1afacf2e3246affff7f20"
 verify_one REAL --cfg real --header "$REAL_HDR"
 
+# --- M2a fused tensor-core kernel (WMMA int8) --------------------------------
+# The official verifier ALWAYS derives its bound from the header nbits, so a real
+# correctness test needs a MODERATE nbits (not the easy 207fffff whose bound
+# saturates to U256::MAX and accepts any jackpot). Golden uses nbits 1D2FFFFF
+# (bound ~2^247, ~1/512 tiles win). REAL_HDR_MOD = the oracle header with nbits
+# swapped to 1D2FFFFF so the real-config search wins at a bound the verifier
+# actually checks => only a CORRECT jackpot passes.
+#   TCGOLD : golden config, tensor-core path  -> validates the WMMA jackpot math.
+#   TCREAL : REAL config (h=8,w=16,rank=256)   -> validates real-config TC path,
+#            and the solver prints "tc(fused): ... TMAC/s" = the speed benchmark.
+REAL_HDR_MOD="01000000f9661239d86cd892e31455d6ad6c1a55745ab7d16a63c82143d271f417ca49994f2738ce9c121c22c08598078e168bf4e1b8167b4e6f30fe911d555492a1afacf2e3246affff2f1d"
+verify_one TCGOLD --tc
+verify_one TCREAL --cfg real --tc --header "$REAL_HDR_MOD"
+
 echo ""
 echo "============================================================"
 echo "=== SELF-VERIFY SUMMARY (official zk_pow::verify_plain_proof) ==="
