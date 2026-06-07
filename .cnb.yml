@@ -55,3 +55,24 @@ gpu:
         - name: gpu-smoke
           # dp4a kernel runs on the real GPU: --mine 20 at golden nbits -> win + PlainProof, rc 0
           script: bash run_test.sh
+
+# poolprobe (push to `poolprobe` branch) -> M1c pre-flight. Pure network, no mining.
+# Runs on the SAME GPU runner the hunt will use, so it tests the REAL egress path:
+# can this runner reach kryptex stratum, authorize our wallet, and pull a job?
+# Gates the full ~1.8h/share hunt — cheap (~30s) fail-fast before spending GPU.
+poolprobe:
+  push:
+    - docker:
+        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      runner:
+        tags: cnb:arch:amd64:gpu        # same tag that scheduled the L40 for the gpu pipeline
+      stages:
+        - name: deps
+          script: apt-get update -y && apt-get install -y --no-install-recommends python3 ca-certificates
+        - name: net-info
+          script:
+            - (command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L) || echo "no GPU visible"
+            - python3 --version
+            - getent hosts prl.kryptex.network || echo "DNS-FAIL: cannot resolve prl.kryptex.network"
+        - name: pool-probe
+          script: python3 pool_probe.py
