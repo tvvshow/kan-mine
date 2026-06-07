@@ -115,3 +115,26 @@ probe2:
           script: WORKER=probe2n GEN=$PWD/build/plainproof_gen SUBSCRIBE=0 python3 pool_probe2.py
         - name: probe2-sub
           script: WORKER=probe2s GEN=$PWD/build/plainproof_gen SUBSCRIBE=1 python3 pool_probe2.py
+
+# verify (push `verify` branch) -> M1c OFFLINE self-verify. Removes the LAST doubt about
+# our side before spending money on lpminer capture. Builds the OFFICIAL Rust verifier
+# (zk_pow::api::verify::verify_plain_proof, from vendored pearl-spec) and our solver, then
+# checks proofs from BOTH the CPU reference path AND the GPU `--mine` redraw loop the live
+# hunt used (whose winning-share assembly has never been officially verified). GPU runner
+# is required because `--mine` runs the dp4a CUDA kernel.
+#   ALL-VALID  => our proof is officially correct end to end => kryptex reject is THEIR
+#                 third-party submit contract, not us => greenlight paid lpminer capture.
+#   any INVALID => a real, free-fixable bug on our side, found before spending a cent.
+verify:
+  push:
+    - docker:
+        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      runner:
+        tags: cnb:arch:amd64:gpu
+      stages:
+        - name: deps
+          script: apt-get update -y && apt-get install -y --no-install-recommends curl gcc g++ make git ca-certificates
+        - name: gpu-info
+          script: nvidia-smi -L
+        - name: self-verify
+          script: bash verify_run.sh
