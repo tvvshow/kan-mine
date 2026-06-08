@@ -58,6 +58,25 @@ unified:
             - ./build/pearl-miner --help || true
             - ./build/zkprove selftest
 
+# netprobe (push `netprobe` branch) -> LIVE validation of the C++ stratum contract
+# on the GPU runner's egress path (the one the real hunt uses): build pearl-miner,
+# then `--pool --net-probe` connects to kryptex 7048, authorizes, awaits one job,
+# logs it and exits 0. No mining (cheap). Proves the rewritten C++ pool client
+# speaks the same wire as the proven Python driver, before any paid live run.
+netprobe:
+  push:
+    - docker:
+        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      runner:
+        tags: cnb:arch:amd64:gpu
+      stages:
+        - name: deps
+          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates libssl-dev
+        - name: build
+          script: bash build.sh
+        - name: net-probe
+          script: ./build/pearl-miner --pool --worker pmprobe --net-probe
+
 gpu:
   push:
     - docker:

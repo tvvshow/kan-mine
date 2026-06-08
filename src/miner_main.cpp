@@ -193,6 +193,7 @@ struct PoolOpts {
   uint64_t batch = 1000000;
   bool real_cfg = true;
   bool use_tc = true;
+  bool net_probe = false;   // connect+authorize+await one job, then exit (no mining)
 };
 
 struct PoolState {
@@ -297,6 +298,18 @@ static int run_pool(const PoolOpts& o) {
   }
   { std::lock_guard<std::mutex> lk(st.mu);
     if (!st.have_job) { log_ts("[drv] no job within 25s; abort"); st.stop = true; rd.join(); close(fd); return 3; } }
+
+  // --net-probe: prove the C++ stratum speaks the live contract (authorize + a
+  // real job) without spending any mining time, then exit cleanly.
+  if (o.net_probe) {
+    std::lock_guard<std::mutex> lk(st.mu);
+    log_ts("[probe] AUTHORIZED + JOB OK job_id=" + st.job_id + " height=" +
+           std::to_string(st.height) + " target=" + st.target +
+           " header=" + st.header.substr(0, 24) + "...");
+    log_ts("[probe] C++ stratum live contract validated -> exit 0");
+    st.stop = true; rd.join(); close(fd);
+    return 0;
+  }
 
   long long submit_id = 100;
   while (!st.stop.load()) {
@@ -586,6 +599,7 @@ int main(int argc, char** argv) {
     else if (a == "--worker") po.worker = next();
     else if (a == "--agent") po.agent = next();
     else if (a == "--hs") po.hs = atoll(next().c_str());
+    else if (a == "--net-probe") po.net_probe = true;
     // solo
     else if (a == "--node") {
       std::string hp = next();  // host:port
