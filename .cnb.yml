@@ -24,7 +24,7 @@ main:
         image: nvidia/cuda:12.4.1-devel-ubuntu22.04
       stages:
         - name: deps
-          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates
+          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates libssl-dev
         - name: toolchain-info
           script:
             - nvcc --version | tail -2
@@ -34,6 +34,29 @@ main:
           script: bash build.sh
         - name: cpu-verify
           script: bash cpu_test.sh
+
+# unified (push `unified` branch) -> FULL standalone-build verification at ZERO GPU
+# cost on the free GPU-less runner: installs Rust + libssl-dev, then `bash build.sh`
+# builds ALL THREE artifacts (plainproof_gen CLI, the unified pearl-miner with
+# pool+solo, the zkprove solo helper), runs the CPU correctness gate, zkprove's
+# byte-exact coinbase selftest, and a pearl-miner --help smoke. The "可独立编译" proof.
+unified:
+  push:
+    - docker:
+        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      stages:
+        - name: deps
+          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git curl ca-certificates libssl-dev pkg-config
+        - name: rust
+          script: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && . "$HOME/.cargo/env" && rustc --version && cargo --version
+        - name: build
+          script: . "$HOME/.cargo/env" && bash build.sh
+        - name: cpu-verify
+          script: bash cpu_test.sh
+        - name: miner-smoke
+          script:
+            - ./build/pearl-miner --help || true
+            - ./build/zkprove selftest
 
 gpu:
   push:

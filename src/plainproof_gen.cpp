@@ -33,6 +33,8 @@ extern "C" {
 #include "blake3_impl.h"
 }
 
+#include "prover.h"
+
 using std::vector;
 using std::array;
 using Digest = array<uint8_t, 32>;
@@ -581,6 +583,78 @@ static Digest compute_jackpot_hash(const uint32_t jackpot[16], const Digest& key
 
 static inline uint32_t rotl32(uint32_t x, uint32_t n) { return (x << n) | (x >> (32 - n)); }
 
+// CPU ground-truth recomputation for ONE candidate tile.  This is cheap even at
+// the live Kryptex dimensions (only h+w strips, not the full m*n search) and is
+// deliberately run before printing/submitting a mined proof.  It catches every
+// class of false positive that would otherwise become a pool reject: GPU math
+// bugs, row/col pattern mixups, target endian mistakes, and stale A/B/noise
+// state after the redraw loop.
+static Digest compute_tile_jackpot_hash_cpu(
+    const vector<int8_t>& A,
+    const vector<int8_t>& Bt,
+    size_t k,
+    size_t rank,
+    const vector<size_t>& a_rows,
+    const vector<size_t>& b_cols,
+    const vector<array<uint32_t,2>>& e_ar_t,
+    const vector<array<uint32_t,2>>& e_bl,
+    const Digest& seed_a_label,
+    const Digest& seed_b_label,
+    const Digest& a_noise_seed,
+    const Digest& b_noise_seed,
+    uint32_t jackpot_out[16])
+{
+    memset(jackpot_out, 0, 16 * sizeof(uint32_t));
+    const size_t tile_h = a_rows.size();
+    const size_t tile_w = b_cols.size();
+
+    vector<vector<int8_t>> na_rows(tile_h), nb_cols(tile_w);
+    for (size_t u = 0; u < tile_h; u++) {
+        vector<int8_t> e_al = uniform_row(seed_a_label, a_noise_seed, a_rows[u], rank);
+        na_rows[u] = matvec_sparse_perm(e_ar_t, e_al);
+    }
+    for (size_t v = 0; v < tile_w; v++) {
+        vector<int8_t> e_br = uniform_row(seed_b_label, b_noise_seed, b_cols[v], rank);
+        nb_cols[v] = matvec_sparse_perm(e_bl, e_br);
+    }
+
+    vector<vector<int32_t>> jackpot_tile(tile_h, vector<int32_t>(tile_w, 0));
+    for (size_t ll = rank; ll <= k; ll += rank) {
+        for (size_t u = 0; u < tile_h; u++) {
+            const size_t a_idx = a_rows[u];
+            const vector<int8_t>& na = na_rows[u];
+            for (size_t v = 0; v < tile_w; v++) {
+                const size_t b_idx = b_cols[v];
+                const vector<int8_t>& nb = nb_cols[v];
+                int32_t acc = jackpot_tile[u][v];
+                for (size_t l = ll - rank; l < ll; l++) {
+                    const int32_t a_no = (int32_t)A[a_idx*k + l] + (int32_t)na[l];
+                    const int32_t b_no = (int32_t)Bt[b_idx*k + l] + (int32_t)nb[l];
+                    acc += a_no * b_no;
+                }
+                jackpot_tile[u][v] = acc;
+            }
+        }
+
+        uint32_t xored = 0;
+        for (size_t u = 0; u < tile_h; u++)
+            for (size_t v = 0; v < tile_w; v++)
+                xored ^= (uint32_t)jackpot_tile[u][v];
+        const size_t tid = (ll / rank - 1) % 16;
+        jackpot_out[tid] = rotl32(jackpot_out[tid], 13) ^ xored;
+    }
+
+    return compute_jackpot_hash(jackpot_out, a_noise_seed);
+}
+
+static void fprint_u256_be(FILE* f, const U256& u) {
+    for (int i = 31; i >= 0; i--) fprintf(f, "%02x", u.b[i]);
+}
+
+static void fprint_digest_be_as_u256(FILE* f, const Digest& d) {
+    for (int i = 31; i >= 0; i--) fprintf(f, "%02x", d[(size_t)i]);
+}
+
 // ---------------------------------------------------------------------------
 // base64 STANDARD
 // ---------------------------------------------------------------------------
@@ -696,37 +770,20 @@ extern "C" int tc_jackpot_search(
     unsigned int* out_hashes_host, unsigned int* dbg_j0_host,
     int* out_rt, int* out_ct);
 
-int main(int argc, char** argv) {
-    uint64_t seed = 12345;
-    bool dump = false;
-    bool probe = false;
-    bool use_gpu = false;
-    bool use_tc = false;
-    bool mine = false;
-    bool real_cfg = false;   // --cfg real -> REAL kryptex network config (m=n=131072,k=4096,r=256)
-    uint64_t maxdraws = 10000000ULL;
-    std::string header_hex_override;
-    std::string target_hex;
-    for (int i = 1; i < argc; i++) {
-        std::string a = argv[i];
-        if (a == "--dump") dump = true;
-        else if (a == "--probe") probe = true;
-        else if (a == "--gpu") use_gpu = true;
-        else if (a == "--tc") use_tc = true;
-        else if (a == "--mine") {
-            mine = true; use_gpu = true;
-            // optional numeric maxdraws right after --mine
-            if (i + 1 < argc) {
-                char* end = nullptr;
-                unsigned long long v = strtoull(argv[i+1], &end, 10);
-                if (end && *end == '\0' && argv[i+1][0] != '\0') { maxdraws = (uint64_t)v; i++; }
-            }
-        }
-        else if (a == "--target" && i + 1 < argc) target_hex = argv[++i];
-        else if (a == "--header" && i + 1 < argc) header_hex_override = argv[++i];
-        else if (a == "--cfg" && i + 1 < argc) real_cfg = (std::string(argv[++i]) == "real");
-        else seed = strtoull(argv[i], nullptr, 10);
-    }
+int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop_flag) {
+    R.found = false;
+    // Unpack params into the locals the pipeline below already uses (faithful
+    // move of the former main() body; same names, same logic).
+    uint64_t seed = P.seed;
+    bool dump = P.dump;
+    bool probe = P.probe;
+    bool use_gpu = P.use_gpu || P.mine;   // --mine implies GPU (old CLI behavior)
+    bool use_tc = P.use_tc;
+    bool mine = P.mine;
+    bool real_cfg = P.real_cfg;            // REAL kryptex config (m=n=131072,k=4096,r=256)
+    uint64_t maxdraws = P.maxdraws;
+    std::string header_hex_override = P.header_hex;  // "" => golden default header
+    std::string target_hex = P.target_hex;
 
     // -----------------------------------------------------------------------
     // Config selection. GOLDEN (default) = small CPU-winnable toy instance used
@@ -899,10 +956,15 @@ int main(int argc, char** argv) {
         // job_key is keyed by header+config ONLY (constant). hash_a/hash_b and
         // the noise seeds depend on A/Bt, so recompute every draw.
         // -------------------------------------------------------------------
-        gpu_mine_init((int)m,(int)n,(int)k,(int)rank,hh,ww,
-                      row_off.data(),(int)row_parts.size(),
-                      col_off.data(),(int)col_parts.size(),
-                      pat_rows.data(), pat_cols.data());
+        // The dp4a path pre-allocates persistent GPU buffers here. The fused
+        // tensor-core path (tc_jackpot_search) manages its own device memory per
+        // call and is the ONLY real-config-correct GPU kernel (h!=w), so when
+        // --tc is set we skip dp4a init entirely.
+        if (!use_tc)
+            gpu_mine_init((int)m,(int)n,(int)k,(int)rank,hh,ww,
+                          row_off.data(),(int)row_parts.size(),
+                          col_off.data(),(int)col_parts.size(),
+                          pat_rows.data(), pat_cols.data());
 
         // Reused host buffers (allocate once).
         std::vector<signed char> a_noised((size_t)m*k), b_noised_t((size_t)n*k);
@@ -913,6 +975,13 @@ int main(int argc, char** argv) {
         Digest a_noise_seed_win; // key for the winning draw (for proof assembly path)
 
         for (draw = 0; draw < maxdraws; draw++) {
+            // Cooperative abort: pool/solo set this when a newer job arrives so we
+            // stop mining a stale job immediately instead of finishing maxdraws.
+            if (stop_flag && stop_flag->load(std::memory_order_relaxed)) {
+                fprintf(stderr, "MINE abort: stop requested at draw=%llu\n",
+                        (unsigned long long)draw);
+                break;
+            }
             bool do_breakdown = (draw == 5);
             double ms_rng=0, ms_hash=0, ms_noise=0, ms_build=0, ms_gpu=0;
             auto tic = clk::now();
@@ -984,8 +1053,23 @@ int main(int argc, char** argv) {
             unsigned bnd_words[8];
             for (int i=0;i<8;i++) bnd_words[i]=(unsigned)((uint32_t)bound.b[i*4]|((uint32_t)bound.b[i*4+1]<<8)|((uint32_t)bound.b[i*4+2]<<16)|((uint32_t)bound.b[i*4+3]<<24));
             int rt=-1, ct=-1; float kms=0;
-            int ok = gpu_mine_draw(a_noised.data(), b_noised_t.data(),
+            int ok;
+            if (use_tc) {
+                // REAL-config fused tensor-core search (supports h!=w). Reuses this
+                // draw's a_noised/b_noised_t/a_noise_seed/bound; tc_jackpot_search
+                // manages its own device buffers. rt/ct return as row_off/col_off
+                // indices, the SAME mapping gpu_mine_draw uses (row_parts[rt]/col_parts[ct]).
+                ok = tc_jackpot_search(a_noised.data(), b_noised_t.data(),
+                                       (int)m,(int)n,(int)k,(int)rank,
+                                       pat_rows.data(),pat_cols.data(),hh,ww,
+                                       row_off.data(),(int)row_parts.size(),
+                                       col_off.data(),(int)col_parts.size(),
+                                       a_noise_seed.data(), bound.b,
+                                       nullptr, nullptr, &rt, &ct);
+            } else {
+                ok = gpu_mine_draw(a_noised.data(), b_noised_t.data(),
                                    a_noise_seed.data(), bnd_words, &rt, &ct, &kms);
+            }
             if (do_breakdown) { lap(ms_gpu);
                 fprintf(stderr,
                   "BREAKDOWN draw5 (ms): RNG=%.2f blake3=%.2f noise=%.2f build=%.2f GPU=%.2f (kernel=%.2f)\n",
@@ -1012,7 +1096,7 @@ int main(int argc, char** argv) {
                 (unsigned long long)(found?draw+1:draw), el,
                 (double)(found?draw+1:draw)/(el>0?el:1),
                 (double)(found?draw+1:draw)/(el>0?el:1)*(double)row_parts.size()*(double)col_parts.size()/1e6, found?1:0);
-        gpu_mine_free();
+        if (!use_tc) gpu_mine_free();
         // a_noise_seed already holds the winning draw's seed (used by CPU proof
         // path only; GPU win maps directly via row_parts/col_parts).
         (void)a_noise_seed_win;
@@ -1128,6 +1212,28 @@ int main(int argc, char** argv) {
     for (size_t i=0;i<win_cols.size();i++) fprintf(stderr, "%zu%s", win_cols[i], i+1<win_cols.size()?", ":"");
     fprintf(stderr, "]\n");
 
+    // Final CPU ground-truth gate for any real mined win.  --probe intentionally
+    // emits a structurally-valid but non-winning proof, so it is excluded.
+    if (!probe) {
+        uint32_t post_jackpot[16];
+        Digest post_hash = compute_tile_jackpot_hash_cpu(
+            A, Bt, k, rank, win_rows, win_cols, e_ar_t, e_bl,
+            seed_a_label, seed_b_label, a_noise_seed, b_noise_seed, post_jackpot);
+        U256 post_v = U256::from_le(post_hash.data());
+        const bool post_ok = post_v.le(bound);
+        fprintf(stderr, "POSTCHECK jackpot=");
+        for (int i = 0; i < 16; i++) fprintf(stderr, "%08x%s", post_jackpot[i], i+1<16?",":"");
+        fprintf(stderr, " hash_u256_be=");
+        fprint_digest_be_as_u256(stderr, post_hash);
+        fprintf(stderr, " bound_be=");
+        fprint_u256_be(stderr, bound);
+        fprintf(stderr, " ok=%d\n", post_ok ? 1 : 0);
+        if (!post_ok) {
+            fprintf(stderr, "ERROR: GPU/driver reported a win, but CPU postcheck says it does not meet the active target; refusing to emit a pool-rejected proof.\n");
+            return 4;
+        }
+    }
+
     // Build Merkle proofs
     MerkleTree tree_a(a_padded.data(), a_padded.size(), job_key);
     MerkleTree tree_bt(bt_padded.data(), bt_padded.size(), job_key);
@@ -1146,7 +1252,10 @@ int main(int argc, char** argv) {
     write_matrix_proof(w, bt_proof, win_cols);
 
     std::string b64 = base64_encode(w.buf);
-    printf("%s\n", b64.c_str());
+    R.proof_b64 = b64;
+    R.found = true;
+    R.win_rows = win_rows;
+    R.win_cols = win_cols;
 
     // header hex for verifier
     {
@@ -1181,3 +1290,35 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+
+#ifndef PROVER_LIB
+// Standalone CLI: argv -> MineParams -> mine_plain_proof -> base64 proof on stdout.
+// Preserved verbatim from the historical interface (seed | --dump | --probe |
+// --gpu | --tc | --mine [N] | --target <64hex> | --header <152hex> | --cfg real).
+int main(int argc, char** argv) {
+    MineParams P;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--dump") P.dump = true;
+        else if (a == "--probe") P.probe = true;
+        else if (a == "--gpu") P.use_gpu = true;
+        else if (a == "--tc") P.use_tc = true;
+        else if (a == "--mine") {
+            P.mine = true; P.use_gpu = true;
+            if (i + 1 < argc) {
+                char* end = nullptr;
+                unsigned long long v = strtoull(argv[i+1], &end, 10);
+                if (end && *end == '\0' && argv[i+1][0] != '\0') { P.maxdraws = (uint64_t)v; i++; }
+            }
+        }
+        else if (a == "--target" && i + 1 < argc) P.target_hex = argv[++i];
+        else if (a == "--header" && i + 1 < argc) P.header_hex = argv[++i];
+        else if (a == "--cfg" && i + 1 < argc) P.real_cfg = (std::string(argv[++i]) == "real");
+        else P.seed = strtoull(argv[i], nullptr, 10);
+    }
+    MineResult R;
+    int rc = mine_plain_proof(P, R, nullptr);
+    if (rc == 0 && R.found) printf("%s\n", R.proof_b64.c_str());
+    return rc;
+}
+#endif  // PROVER_LIB

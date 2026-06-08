@@ -42,8 +42,8 @@ rustc --version || { echo "FATAL: Rust install failed"; exit 1; }
 cargo --version
 
 # ---------- build the OFFICIAL verifier ----------
-echo "=== build official verify_plain (zk-pow) ==="
-( cd "${ROOT}/zk-pow" && RUSTFLAGS="-C target-cpu=native" cargo build --release --bin verify_plain )
+echo "=== build official verify_plain + verify_share (zk-pow) ==="
+( cd "${ROOT}/zk-pow" && RUSTFLAGS="-C target-cpu=native" cargo build --release --bin verify_plain --bin verify_share )
 VP="${ROOT}/zk-pow/target/release/verify_plain"
 [ -x "${VP}" ] || { echo "FATAL: verify_plain build failed"; exit 1; }
 echo "official verifier: ${VP}"

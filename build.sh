@@ -50,8 +50,15 @@ BF="-DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512"
 gcc -O3 -I"${ROOT}/blake3" ${BF} -c \
   "${ROOT}/blake3/blake3.c" "${ROOT}/blake3/blake3_dispatch.c" "${ROOT}/blake3/blake3_portable.c"
 
-echo "=== host (plainproof_gen) ==="
-g++ -O3 -std=c++17 -fopenmp -I"${ROOT}/blake3" -c "${ROOT}/src/plainproof_gen.cpp"
+echo "=== host: prover core ==="
+# Two object files from the SAME proven pipeline source:
+#   plainproof_gen.o : keeps its own main() -> the standalone CLI
+#   prover_lib.o     : -DPROVER_LIB drops main() -> linked into pearl-miner
+g++ -O3 -std=c++17 -fopenmp -I"${ROOT}/blake3" -c "${ROOT}/src/plainproof_gen.cpp" -o plainproof_gen.o
+g++ -O3 -std=c++17 -fopenmp -I"${ROOT}/blake3" -DPROVER_LIB -c "${ROOT}/src/plainproof_gen.cpp" -o prover_lib.o
+
+echo "=== host: unified miner driver (pool + solo) ==="
+g++ -O3 -std=c++17 -I"${ROOT}/src" -I"${ROOT}/blake3" -c "${ROOT}/src/miner_main.cpp" -o miner_main.o
 
 echo "=== dp4a kernel (jackpot_kernel) ==="
 # shellcheck disable=SC2086
@@ -67,8 +74,37 @@ echo "=== fused tensor-core kernel (tc_gemm, WMMA int8) ==="
 nvcc -O3 ${GENCODE} -std=c++17 -c "${ROOT}/src/tc_gemm.cu"
 TC=tc_gemm.o
 
-echo "=== link ==="
+echo "=== link: plainproof_gen (CLI) ==="
 g++ -O3 -fopenmp plainproof_gen.o blake3.o blake3_dispatch.o blake3_portable.o jackpot_kernel.o "${TC}" \
   -L"${CUDA_HOME}/lib64" -lcudart -o plainproof_gen
 ls -la "${BUILD}/plainproof_gen"
-echo "BUILD OK -> ${BUILD}/plainproof_gen"
+
+echo "=== link: pearl-miner (unified pool + solo) ==="
+# OpenSSL for solo HTTPS RPC; pthread for the stratum/poller threads.
+g++ -O3 -fopenmp miner_main.o prover_lib.o blake3.o blake3_dispatch.o blake3_portable.o jackpot_kernel.o "${TC}" \
+  -L"${CUDA_HOME}/lib64" -lcudart -lssl -lcrypto -lpthread -o pearl-miner
+ls -la "${BUILD}/pearl-miner"
+
+# --- zkprove (Rust): SOLO-only PlainProof -> ZK proof -> block helper ---------
+# Needs cargo (Rust). The C++ binaries above do NOT need it; only `--solo` calls
+# zkprove at run time. Build it when cargo is present; otherwise warn and skip so
+# the pool-only build still succeeds on a Rust-less host (e.g. the cnb CUDA image).
+echo "=== zkprove (Rust solo helper) ==="
+if command -v cargo >/dev/null 2>&1; then
+  ( cd "${ROOT}/zk-pow" && cargo build --release --bin zkprove )
+  cp -f "${ROOT}/zk-pow/target/release/zkprove" "${BUILD}/zkprove" 2>/dev/null || \
+    cp -f "${ROOT}/zk-pow/target/release/zkprove.exe" "${BUILD}/zkprove" 2>/dev/null || true
+  if [ -x "${BUILD}/zkprove" ]; then
+    "${BUILD}/zkprove" selftest && echo "zkprove selftest OK"
+    ls -la "${BUILD}/zkprove"
+  fi
+else
+  echo "WARNING: cargo not found -> skipping zkprove build."
+  echo "         pool mode works without it; --solo needs zkprove (install Rust, re-run)."
+fi
+
+echo ""
+echo "BUILD OK:"
+echo "  ${BUILD}/plainproof_gen   (CLI proof generator)"
+echo "  ${BUILD}/pearl-miner      (unified: --pool / --solo)"
+[ -x "${BUILD}/zkprove" ] && echo "  ${BUILD}/zkprove          (solo ZK-proof + block assembly)"

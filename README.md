@@ -38,3 +38,19 @@ runner is requested.
   bit-exact to the int32 reference.
 - Perf gotcha on throttled containers: set `OMP_NUM_THREADS` to the real CPU quota
   (oversubscription can cost ~10-16×).
+
+
+## Kryptex/LuckyPool live mining contract
+
+Use the maintained live-pool path only:
+
+```bash
+GEN_EXTRA="--tc --cfg real" python3 m1c_pool_hunt.py
+```
+
+The captured lpminer-compatible contract is plaintext TCP `prl.kryptex.network:7048`,
+`mining.authorize` with `wallet="<addr>.<worker>"`, and `mining.submit` params
+`{"job_id": "...", "plain_proof": "<base64 bincode PlainProof>", "hs": <int>}`.
+`plainproof_gen` performs a CPU postcheck of each GPU-reported win against the active
+pool target before emitting the proof, and `m1c_pool_hunt.py` drops stale wins instead
+of submitting a proof mined for a previous job.
