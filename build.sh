@@ -107,4 +107,11 @@ echo ""
 echo "BUILD OK:"
 echo "  ${BUILD}/plainproof_gen   (CLI proof generator)"
 echo "  ${BUILD}/pearl-miner      (unified: --pool / --solo)"
-[ -x "${BUILD}/zkprove" ] && echo "  ${BUILD}/zkprove          (solo ZK-proof + block assembly)"
+if [ -x "${BUILD}/zkprove" ]; then
+  echo "  ${BUILD}/zkprove          (solo ZK-proof + block assembly)"
+fi
+# The pool binary is the deliverable; a Rust-less host legitimately has no zkprove.
+# Never let the zkprove-presence test become the script's exit status — as the last
+# command, a false `[ -x ]` would make build.sh exit 1 and fail the whole build
+# stage on every pool-only (Rust-less) pipeline. Exit 0 explicitly on success.
+exit 0
