@@ -312,6 +312,12 @@ static int run_pool(const PoolOpts& o) {
   }
 
   long long submit_id = 100;
+  // Stable-lifetime abort flag. The reader thread holds &stop_attempt via
+  // active_stop and may store(true) the instant a new job arrives — which can
+  // race just past mine_plain_proof() returning. A per-iteration local could be
+  // out of scope by then (UB); one flag for the whole run is always valid memory.
+  // Reset before each attempt.
+  std::atomic<bool> stop_attempt{false};
   while (!st.stop.load()) {
     // snapshot the current job
     std::string hdr, tgt, jid; long long height; uint64_t cur_gen;
@@ -330,7 +336,7 @@ static int run_pool(const PoolOpts& o) {
     P.mine = true;
     P.maxdraws = o.batch;
     MineResult R;
-    std::atomic<bool> stop_attempt{false};
+    stop_attempt.store(false);
     st.active_stop.store(&stop_attempt);
     log_ts("[drv] mining gen=" + std::to_string(cur_gen) + " job_id=" + jid +
            " height=" + std::to_string(height));
@@ -493,6 +499,9 @@ static int run_solo(const SoloOpts& o) {
   });
 
   int rc_final = 0;
+  // Stable-lifetime abort flag (the poller may store(true) just after
+  // mine_plain_proof() returns; a per-iteration local would be UB). Reset per round.
+  std::atomic<bool> stop_attempt{false};
   while (!shutdown.load()) {
     std::string tpl;
     if (!fetch_template(tpl)) { std::this_thread::sleep_for(std::chrono::seconds(3)); continue; }
@@ -523,7 +532,7 @@ static int run_solo(const SoloOpts& o) {
     P.mine = true;
     P.maxdraws = o.batch;
     MineResult R;
-    std::atomic<bool> stop_attempt{false};
+    stop_attempt.store(false);
     active_stop.store(&stop_attempt);
     int mrc = mine_plain_proof(P, R, &stop_attempt);
     active_stop.store(nullptr);
