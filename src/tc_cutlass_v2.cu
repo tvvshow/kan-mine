@@ -724,15 +724,19 @@ extern "C" int tc_search_launch(
   return 0;
 }
 
+extern "C" int g_miner_verbose;
+
 extern "C" int tc_search_wait(int* out_rt, int* out_ct)
 {
   DevBufs& B = g_bufs;
   cudaError_t err = cudaStreamSynchronize(g_search_stream);
-  float ms=0; cudaEventElapsedTime(&ms,g_se0,g_se1);
-  fprintf(stderr,
-          "tc(cutlass2): TB=%dx%dx%d W=64x64 s%d FUSED %zu tiles, %.3f ms, %.2f TH/s\n",
-          BM, BN, (int)TBShape::kK, kStages, g_inflight_tiles, ms,
-          g_inflight_work / (ms * 1e-3) / 1e12);
+  if (g_miner_verbose) {
+    float ms=0; cudaEventElapsedTime(&ms,g_se0,g_se1);
+    fprintf(stderr,
+            "tc(cutlass2): TB=%dx%dx%d W=64x64 s%d FUSED %zu tiles, %.3f ms, %.2f TH/s\n",
+            BM, BN, (int)TBShape::kK, kStages, g_inflight_tiles, ms,
+            g_inflight_work / (ms * 1e-3) / 1e12);
+  }
   if (err!=cudaSuccess){ fprintf(stderr,"tc_cutlass: err %s\n",cudaGetErrorString(err)); return -1; }
 
   int wf=0;

@@ -32,6 +32,7 @@
 extern "C" {
 #include "blake3.h"
 #include "blake3_impl.h"
+int g_miner_verbose = 1;  // default ON for standalone plainproof_gen CLI
 }
 // gpu_draw.h deliberately NOT included: gpu_produce_draw is unused here until
 // Week4 GPU-RNG lands, and pulling <cuda_runtime.h> into this TU breaks the
@@ -1216,10 +1217,11 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                 if (done % 100 == 0 || win_el >= 60.0) {
                     double el = std::chrono::duration<double>(t_now-t_start).count();
                     uint64_t win_draws = done - window_draw0;
-                    fprintf(stderr,
-                            "draw %llu, elapsed %.2fs, %.2f draws/sec, avg %.2f TH/s, window %.2f TH/s\n",
-                            (unsigned long long)done, el, (double)done/el,
-                            ths_for(done, el), ths_for(win_draws, win_el));
+                    if (g_miner_verbose)
+                        fprintf(stderr,
+                                "draw %llu, elapsed %.2fs, %.2f draws/sec, avg %.2f TH/s, window %.2f TH/s\n",
+                                (unsigned long long)done, el, (double)done/el,
+                                ths_for(done, el), ths_for(win_draws, win_el));
                     if (win_el >= 60.0) { t_window = t_now; window_draw0 = done; }
                 }
             }
@@ -1282,10 +1284,11 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
             if (done % 100 == 0 || win_el >= 60.0) {
                 double el = std::chrono::duration<double>(t_now-t_start).count();
                 uint64_t win_draws = done - window_draw0;
-                fprintf(stderr,
-                        "draw %llu, elapsed %.2fs, %.2f draws/sec, avg %.2f TH/s, window %.2f TH/s\n",
-                        (unsigned long long)done, el, (double)done/el,
-                        ths_for(done, el), ths_for(win_draws, win_el));
+                if (g_miner_verbose)
+                    fprintf(stderr,
+                            "draw %llu, elapsed %.2fs, %.2f draws/sec, avg %.2f TH/s, window %.2f TH/s\n",
+                            (unsigned long long)done, el, (double)done/el,
+                            ths_for(done, el), ths_for(win_draws, win_el));
                 if (win_el >= 60.0) {
                     t_window = t_now;
                     window_draw0 = done;
