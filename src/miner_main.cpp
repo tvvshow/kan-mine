@@ -65,6 +65,11 @@ static double now_s() {
 static void log_ts(const std::string& m) {
   fprintf(stderr, "[%.1f] %s\n", now_s(), m.c_str());
 }
+static std::string fmt2(double v) {
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%.2f", v);
+  return std::string(buf);
+}
 
 // ---- minimal JSON field extraction (sufficient for stratum lines + small
 // zkprove/RPC objects; the heavy template JSON is parsed by zkprove in Rust) ----
@@ -192,7 +197,8 @@ struct PoolOpts {
   long long hs = 8000000;
   uint64_t batch = 1000000;
   bool real_cfg = true;
-  bool use_tc = true;
+  bool use_tc = true;       // fused tensor-core kernel (the only GPU path)
+  bool breakdown = false;
   bool net_probe = false;   // connect+authorize+await one job, then exit (no mining)
 };
 
@@ -318,6 +324,9 @@ static int run_pool(const PoolOpts& o) {
   // out of scope by then (UB); one flag for the whole run is always valid memory.
   // Reset before each attempt.
   std::atomic<bool> stop_attempt{false};
+  uint64_t hr_draws_60s = 0;
+  double hr_work_per_draw = 0.0;
+  double hr_t0 = now_s();
   while (!st.stop.load()) {
     // snapshot the current job
     std::string hdr, tgt, jid; long long height; uint64_t cur_gen;
@@ -333,8 +342,10 @@ static int run_pool(const PoolOpts& o) {
     P.target_hex = tgt;
     P.real_cfg = o.real_cfg;
     P.use_tc = o.use_tc;
+    P.breakdown = o.breakdown;
     P.mine = true;
     P.maxdraws = o.batch;
+    P.seed = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
     MineResult R;
     stop_attempt.store(false);
     st.active_stop.store(&stop_attempt);
@@ -343,6 +354,23 @@ static int run_pool(const PoolOpts& o) {
     double bt = now_s();
     int rc = mine_plain_proof(P, R, &stop_attempt);
     st.active_stop.store(nullptr);
+    if (R.draws > 0 && R.elapsed_s > 0.0 && R.work_per_draw > 0.0) {
+      double ths = (double)R.draws * R.work_per_draw / R.elapsed_s / 1e12;
+      log_ts("[drv] hashrate avg=" + fmt2(ths) +
+             " TH/s (SRBMiner-MULTI/lpminer-compatible, " +
+             std::to_string(R.draws) + " draws/" + fmt2(R.elapsed_s) + "s)");
+      hr_draws_60s += R.draws;
+      hr_work_per_draw = R.work_per_draw;
+      double hr_dt = now_s() - hr_t0;
+      if (hr_dt >= 60.0) {
+        double ths60 = (double)hr_draws_60s * hr_work_per_draw / hr_dt / 1e12;
+        log_ts("[drv] hashrate 60s=" + fmt2(ths60) +
+               " TH/s (SRBMiner-MULTI display window, " +
+               std::to_string(hr_draws_60s) + " draws/" + fmt2(hr_dt) + "s)");
+        hr_draws_60s = 0;
+        hr_t0 = now_s();
+      }
+    }
 
     // is this win still for the current job?
     bool fresh;
@@ -395,7 +423,8 @@ struct SoloOpts {
   std::string zkprove = "./zkprove";
   uint64_t batch = 1000000;
   bool real_cfg = true;
-  bool use_tc = true;
+  bool use_tc = true;       // fused tensor-core kernel (the only GPU path)
+  bool breakdown = false;
   int poll_s = 10;
 };
 
@@ -502,6 +531,9 @@ static int run_solo(const SoloOpts& o) {
   // Stable-lifetime abort flag (the poller may store(true) just after
   // mine_plain_proof() returns; a per-iteration local would be UB). Reset per round.
   std::atomic<bool> stop_attempt{false};
+  uint64_t hr_draws_60s = 0;
+  double hr_work_per_draw = 0.0;
+  double hr_t0 = now_s();
   while (!shutdown.load()) {
     std::string tpl;
     if (!fetch_template(tpl)) { std::this_thread::sleep_for(std::chrono::seconds(3)); continue; }
@@ -529,13 +561,32 @@ static int run_solo(const SoloOpts& o) {
     P.target_hex = target_hex;
     P.real_cfg = o.real_cfg;
     P.use_tc = o.use_tc;
+    P.breakdown = o.breakdown;
     P.mine = true;
     P.maxdraws = o.batch;
+    P.seed = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
     MineResult R;
     stop_attempt.store(false);
     active_stop.store(&stop_attempt);
     int mrc = mine_plain_proof(P, R, &stop_attempt);
     active_stop.store(nullptr);
+    if (R.draws > 0 && R.elapsed_s > 0.0 && R.work_per_draw > 0.0) {
+      double ths = (double)R.draws * R.work_per_draw / R.elapsed_s / 1e12;
+      log_ts("[solo] hashrate avg=" + fmt2(ths) +
+             " TH/s (SRBMiner-MULTI/lpminer-compatible, " +
+             std::to_string(R.draws) + " draws/" + fmt2(R.elapsed_s) + "s)");
+      hr_draws_60s += R.draws;
+      hr_work_per_draw = R.work_per_draw;
+      double hr_dt = now_s() - hr_t0;
+      if (hr_dt >= 60.0) {
+        double ths60 = (double)hr_draws_60s * hr_work_per_draw / hr_dt / 1e12;
+        log_ts("[solo] hashrate 60s=" + fmt2(ths60) +
+               " TH/s (SRBMiner-MULTI display window, " +
+               std::to_string(hr_draws_60s) + " draws/" + fmt2(hr_dt) + "s)");
+        hr_draws_60s = 0;
+        hr_t0 = now_s();
+      }
+    }
 
     if (mrc != 0 || !R.found) {
       log_ts("[solo] no win this round (rc=" + std::to_string(mrc) + ") -> refetch template");
@@ -578,7 +629,7 @@ static void usage() {
     "pearl-miner — self-built Pearl(PRL) PoUW miner\n\n"
     "  pearl-miner --pool [opts]     mine to LuckyPool/kryptex stratum\n"
     "  pearl-miner --solo [opts]     mine directly against a pearld node\n\n"
-    "common:  --cfg real|golden (default real)  --gpu (dp4a)  --batch N\n"
+    "common:  --cfg real|golden (default real)  --tc (tensor-core, default)  --batch N  --breakdown\n"
     "pool:    --pool-host H  --pool-port P  --wallet ADDR  --worker W  --agent A  --hs N\n"
     "solo:    --node host:port  --rpcuser U  --rpcpass P  --addr <p2tr>  --zkprove PATH\n");
 }
@@ -588,7 +639,8 @@ int main(int argc, char** argv) {
   bool pool = false, solo = false;
   PoolOpts po; SoloOpts so;
   std::string cfg = "real";
-  bool use_gpu_dp4a = false;
+  bool use_tc = true;
+  bool breakdown = false;
   uint64_t batch = 1000000;
 
   for (int i = 1; i < argc; i++) {
@@ -599,7 +651,8 @@ int main(int argc, char** argv) {
     if (a == "--pool") pool = true;
     else if (a == "--solo") solo = true;
     else if (a == "--cfg") cfg = next("real");
-    else if (a == "--gpu") use_gpu_dp4a = true;
+    else if (a == "--tc") use_tc = true;   // accepted for back-compat; tensor-core is the default
+    else if (a == "--breakdown") breakdown = true;
     else if (a == "--batch") batch = strtoull(next("1000000").c_str(), nullptr, 10);
     // pool
     else if (a == "--pool-host") po.host = next();
@@ -625,14 +678,13 @@ int main(int argc, char** argv) {
   }
 
   bool real_cfg = (cfg == "real");
-  bool use_tc = !use_gpu_dp4a;  // default fused tensor-core; --gpu forces dp4a (golden only)
 
   if (pool == solo) { fprintf(stderr, "choose exactly one of --pool / --solo\n"); usage(); return 2; }
   if (pool) {
-    po.batch = batch; po.real_cfg = real_cfg; po.use_tc = use_tc;
+    po.batch = batch; po.real_cfg = real_cfg; po.use_tc = use_tc; po.breakdown = breakdown;
     return run_pool(po);
   } else {
-    so.batch = batch; so.real_cfg = real_cfg; so.use_tc = use_tc;
+    so.batch = batch; so.real_cfg = real_cfg; so.use_tc = use_tc; so.breakdown = breakdown;
     return run_solo(so);
   }
 }

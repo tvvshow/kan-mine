@@ -24,6 +24,7 @@
 #include <random>
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -32,6 +33,9 @@ extern "C" {
 #include "blake3.h"
 #include "blake3_impl.h"
 }
+// gpu_draw.h deliberately NOT included: gpu_produce_draw is unused here until
+// Week4 GPU-RNG lands, and pulling <cuda_runtime.h> into this TU breaks the
+// host-only build (CUDA-13 headers are C++-template-heavy).
 
 #include "prover.h"
 
@@ -742,24 +746,8 @@ static vector<uint8_t> parse_hex(const std::string& s) {
 }
 
 // ---------------------------------------------------------------------------
-extern "C" int gpu_jackpot_search(
-    const signed char* a_noised, const signed char* b_noised_t,
-    int m,int n,int k,int rank,
-    const int* pat, int h,int w,
-    const int* row_off, int nrow_off, const int* col_off, int ncol_off,
-    const unsigned char* a_noise_seed32, const unsigned char* bound_le32,
-    unsigned int* out_hashes_host, unsigned int* dbg_j0_host,
-    int* out_rt, int* out_ct);
-
-extern "C" void gpu_mine_init(
-    int m,int n,int k,int rank,int h,int w,
-    const int* row_off,int n_row,const int* col_off,int n_col,
-    const int* pat_rows,const int* pat_cols);
-extern "C" int gpu_mine_draw(
-    const signed char* a_noised, const signed char* b_noised_t,
-    const unsigned char* key32, const unsigned* bound_words,
-    int* win_rt,int* win_ct,float* kernel_ms);
-extern "C" void gpu_mine_free();
+// dp4a search (gpu_jackpot_search / gpu_mine_*) retired — tc_block.cu's
+// tc_jackpot_search is the one verified GPU kernel. See _archive/dead-kernels/.
 
 extern "C" int tc_jackpot_search(
     const signed char* a_noised, const signed char* b_noised_t,
@@ -770,6 +758,23 @@ extern "C" int tc_jackpot_search(
     unsigned int* out_hashes_host, unsigned int* dbg_j0_host,
     int* out_rt, int* out_ct);
 
+// GPU-resident draw pipeline (tc_cutlass_v2.cu + gpu_prep.cu). WEAK so builds
+// that link other kernels (tc_block, sweep harnesses) still resolve; the mine
+// loop only takes the GPU path when all three symbols are present.
+extern "C" int tc_alloc_bufs(int m,int n,int k,int h,int w,int nrow_off,int ncol_off,
+                             signed char** dA, signed char** dBt) __attribute__((weak));
+extern "C" int gpu_prep_phase1(
+    signed char* dA, signed char* dBt, int m,int n,int k,
+    uint64_t seed, uint64_t draw, const unsigned char* job_key32,
+    unsigned char* hash_a32, unsigned char* hash_b32,
+    double* ms_rng, double* ms_hash) __attribute__((weak));
+extern "C" int gpu_prep_phase2(
+    signed char* dA, signed char* dBt, int m,int n,int k,int rank,
+    const unsigned char* a_noise_seed32, const unsigned char* b_noise_seed32,
+    const unsigned char* label_a32, const unsigned char* label_b32,
+    const unsigned int* perm_a, const unsigned int* perm_b,
+    double* ms_noise) __attribute__((weak));
+
 int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop_flag) {
     R.found = false;
     // Unpack params into the locals the pipeline below already uses (faithful
@@ -777,10 +782,10 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
     uint64_t seed = P.seed;
     bool dump = P.dump;
     bool probe = P.probe;
-    bool use_gpu = P.use_gpu || P.mine;   // --mine implies GPU (old CLI behavior)
     bool use_tc = P.use_tc;
     bool mine = P.mine;
     bool real_cfg = P.real_cfg;            // REAL kryptex config (m=n=131072,k=4096,r=256)
+    bool breakdown = P.breakdown;
     uint64_t maxdraws = P.maxdraws;
     std::string header_hex_override = P.header_hex;  // "" => golden default header
     std::string target_hex = P.target_hex;
@@ -829,49 +834,63 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
     }
     Digest job_key = blake3_digest(jk_input, nullptr);
 
-    // RNG: signal in [-64, 64] inclusive (65 values). Reproducible.
-    std::mt19937_64 rng(seed);
-    std::uniform_int_distribution<int> dist(-64, 64);
-
-    // Generate A (m x k) row-major, and B (k x n). We store A as flat int8,
-    // B transposed (Bt: n x k) as the column-major commitment form.
-    // For mining we need a_noised[a_idx][l] and b_noised_t[b_idx][l].
-    // a_matrix[i][j], b_matrix[i][j] (k x n).
+    // A/B buffers are shared by the single-shot path and by the redraw loop.
+    // In mine mode do NOT run the historical one-shot A/B/hash/noise setup here:
+    // each draw immediately regenerates fresh A/B and seeds below. Running this
+    // setup before entering the loop cost ~20 seconds at the real config and made
+    // pool jobs stale before the first actual draw could even start.
     vector<int8_t> A(m * k);     // A[i*k + j]
     vector<int8_t> Bt(n * k);    // Bt[i*k + j] = b_matrix[j][i]  (transpose)
-    // Generate in the SAME order as Rust: A first (row-major), then B (row-major k x n).
-    for (size_t i = 0; i < m; i++)
-        for (size_t j = 0; j < k; j++)
-            A[i*k + j] = (int8_t)dist(rng);
-    // b_matrix k x n, row-major
-    vector<int8_t> B(k * n); // B[i*n + j]
-    for (size_t i = 0; i < k; i++)
-        for (size_t j = 0; j < n; j++)
-            B[i*n + j] = (int8_t)dist(rng);
-    // transpose -> Bt[i*k + j] = B[j*n + i]
-    for (size_t i = 0; i < n; i++)
-        for (size_t j = 0; j < k; j++)
-            Bt[i*k + j] = B[j*n + i];
-
-    // commitments
-    vector<uint8_t> a_padded = pad_to_chunk_boundary(A);
-    vector<uint8_t> bt_padded = pad_to_chunk_boundary(Bt);
-    Digest hash_a = blake3_digest(a_padded, &job_key);
-    Digest hash_b = blake3_digest(bt_padded, &job_key);
-
-    // b_noise_seed = blake3(job_key || hash_b); a_noise_seed = blake3(b_noise_seed || hash_a)
-    uint8_t seed_in[64];
-    memcpy(seed_in, job_key.data(), 32); memcpy(seed_in+32, hash_b.data(), 32);
-    Digest b_noise_seed = blake3_digest(seed_in, 64, nullptr);
-    memcpy(seed_in, b_noise_seed.data(), 32); memcpy(seed_in+32, hash_a.data(), 32);
-    Digest a_noise_seed = blake3_digest(seed_in, 64, nullptr);
+    auto chunk_padded_len = [](size_t len) -> size_t {
+        const size_t rem = len % BLAKE3_CHUNK_LEN;
+        return rem ? (len + (BLAKE3_CHUNK_LEN - rem)) : len;
+    };
+    vector<uint8_t> a_padded(chunk_padded_len(A.size()));
+    vector<uint8_t> bt_padded(chunk_padded_len(Bt.size()));
+    Digest hash_a{}, hash_b{}, b_noise_seed{}, a_noise_seed{};
 
     Digest seed_a_label; memcpy(seed_a_label.data(), SEED_LABEL_A, 32);
     Digest seed_b_label; memcpy(seed_b_label.data(), SEED_LABEL_B, 32);
 
-    // Permutation matrices are global (k pairs each), generate once.
-    vector<array<uint32_t,2>> e_ar_t = generate_permutation_matrix(seed_a_label, a_noise_seed, k, rank);
-    vector<array<uint32_t,2>> e_bl   = generate_permutation_matrix(seed_b_label, b_noise_seed, k, rank);
+    vector<array<uint32_t,2>> e_ar_t;
+    vector<array<uint32_t,2>> e_bl;
+
+    if (!mine) {
+        // RNG: signal in [-64, 64] inclusive (65 values). Reproducible.
+        std::mt19937_64 rng(seed);
+        std::uniform_int_distribution<int> dist(-64, 64);
+
+        // Generate A (m x k) row-major, and B (k x n), then transpose B into Bt.
+        // Generate in the SAME order as Rust: A first (row-major), then B
+        // (row-major k x n). This path is kept for CPU/oracle self-tests.
+        for (size_t i = 0; i < m; i++)
+            for (size_t j = 0; j < k; j++)
+                A[i*k + j] = (int8_t)dist(rng);
+        vector<int8_t> B(k * n); // B[i*n + j]
+        for (size_t i = 0; i < k; i++)
+            for (size_t j = 0; j < n; j++)
+                B[i*n + j] = (int8_t)dist(rng);
+        for (size_t i = 0; i < n; i++)
+            for (size_t j = 0; j < k; j++)
+                Bt[i*k + j] = B[j*n + i];
+
+        // commitments
+        a_padded = pad_to_chunk_boundary(A);
+        bt_padded = pad_to_chunk_boundary(Bt);
+        hash_a = blake3_digest(a_padded, &job_key);
+        hash_b = blake3_digest(bt_padded, &job_key);
+
+        // b_noise_seed = blake3(job_key || hash_b); a_noise_seed = blake3(b_noise_seed || hash_a)
+        uint8_t seed_in[64];
+        memcpy(seed_in, job_key.data(), 32); memcpy(seed_in+32, hash_b.data(), 32);
+        b_noise_seed = blake3_digest(seed_in, 64, nullptr);
+        memcpy(seed_in, b_noise_seed.data(), 32); memcpy(seed_in+32, hash_a.data(), 32);
+        a_noise_seed = blake3_digest(seed_in, 64, nullptr);
+
+        // Permutation matrices are global (k pairs each), generate once.
+        e_ar_t = generate_permutation_matrix(seed_a_label, a_noise_seed, k, rank);
+        e_bl   = generate_permutation_matrix(seed_b_label, b_noise_seed, k, rank);
+    }
 
     U256 bound;
     {
@@ -949,62 +968,81 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
 
     if (mine) {
         // -------------------------------------------------------------------
-        // Internal redraw loop. INVARIANTS hoisted above: header/config,
-        // job_key, bound, pattern, row_parts/col_parts, row_off/col_off, GPU
-        // buffers (allocated once below). PER DRAW: fresh A/Bt -> hash_a/hash_b
-        // -> noise seeds -> noise -> a_noised/b_noised_t -> GPU search.
-        // job_key is keyed by header+config ONLY (constant). hash_a/hash_b and
-        // the noise seeds depend on A/Bt, so recompute every draw.
+        // Internal redraw loop, CPU/GPU PIPELINED. INVARIANTS hoisted above:
+        // header/config, job_key, bound, pattern, row_parts/col_parts,
+        // row_off/col_off. PER DRAW: fresh A/Bt -> hash_a/hash_b -> noise seeds
+        // -> noise -> a_noised/b_noised_t -> GPU search. job_key is keyed by
+        // header+config ONLY (constant); hash_a/hash_b and the noise seeds
+        // depend on A/Bt, so they are recomputed every draw.
+        //
+        // OVERLAP: the ~1.4s CPU prep (RNG+blake3+noise+build) for draw N+1 runs
+        // on a producer thread WHILE the ~2.3s GPU search for draw N runs on this
+        // thread, hiding the CPU cost (~1.6x throughput). Only the GPU handoff
+        // (a_noised/b_noised_t/a_noise_seed) is double-buffered; A/Bt, the padded
+        // copies, the permutation matrices and the noise scratch are shared and
+        // touched by the single producer only, so there is no race with the GPU
+        // (which reads just the slot it was handed). On a win the producer has
+        // already advanced the shared scratch to draw N+1, so we re-run
+        // produce_draw(N) once (a pure function of (seed,draw) -> byte identical)
+        // to restore draw N's state for the POSTCHECK + Merkle proof below.
+        // tc_jackpot_search (tc_block.cu) manages its own device memory per call.
         // -------------------------------------------------------------------
-        // The dp4a path pre-allocates persistent GPU buffers here. The fused
-        // tensor-core path (tc_jackpot_search) manages its own device memory per
-        // call and is the ONLY real-config-correct GPU kernel (h!=w), so when
-        // --tc is set we skip dp4a init entirely.
-        if (!use_tc)
-            gpu_mine_init((int)m,(int)n,(int)k,(int)rank,hh,ww,
-                          row_off.data(),(int)row_parts.size(),
-                          col_off.data(),(int)col_parts.size(),
-                          pat_rows.data(), pat_cols.data());
 
-        // Reused host buffers (allocate once).
-        std::vector<signed char> a_noised((size_t)m*k), b_noised_t((size_t)n*k);
+        // Double-buffered GPU handoff (two slots). Everything else is shared
+        // scratch, allocated once and written only inside produce_draw.
+        std::vector<signed char> a_noised[2]   = { std::vector<signed char>((size_t)m*k), std::vector<signed char>((size_t)m*k) };
+        std::vector<signed char> b_noised_t[2] = { std::vector<signed char>((size_t)n*k), std::vector<signed char>((size_t)n*k) };
+        Digest a_noise_seed_slot[2] = {};
+        std::vector<int8_t> noise_a((size_t)m*k), noise_b((size_t)n*k);
 
         using clk = std::chrono::high_resolution_clock;
         auto t_start = clk::now();
+        auto t_window = t_start;
         uint64_t draw = 0;
-        Digest a_noise_seed_win; // key for the winning draw (for proof assembly path)
+        uint64_t window_draw0 = 0;
+        // Match SRBMiner-MULTI/lpminer/pool display units: TH/s.  One displayed
+        // PRL "hash" here is the same work unit used by the jackpot bound:
+        // tile_count * pattern_rows * pattern_cols * dot_len.  Do not report
+        // raw tile/s or tensor-MAC-specific labels in user-facing hashrate.
+        const double work_per_draw =
+            (double)row_parts.size() * (double)col_parts.size() *
+            (double)hh * (double)ww * (double)(k - (k % rank));
+        R.work_per_draw = work_per_draw;
+        auto ths_for = [&](uint64_t draws_done, double seconds) -> double {
+            return seconds > 0.0 ? (double)draws_done * work_per_draw / seconds / 1e12 : 0.0;
+        };
+        auto stopping = [&]() -> bool {
+            return stop_flag && stop_flag->load(std::memory_order_relaxed);
+        };
 
-        for (draw = 0; draw < maxdraws; draw++) {
-            // Cooperative abort: pool/solo set this when a newer job arrives so we
-            // stop mining a stale job immediately instead of finishing maxdraws.
-            if (stop_flag && stop_flag->load(std::memory_order_relaxed)) {
-                fprintf(stderr, "MINE abort: stop requested at draw=%llu\n",
-                        (unsigned long long)draw);
-                break;
-            }
-            bool do_breakdown = (draw == 5);
-            double ms_rng=0, ms_hash=0, ms_noise=0, ms_build=0, ms_gpu=0;
+        // ONE canonical production path (stages a-d) -> shared A/Bt/a_padded/
+        // bt_padded/e_ar_t/e_bl/hash_*/seeds AND the per-slot GPU handoff. Pure
+        // function of (seed,d): safe to re-run for the winning draw to restore
+        // shared state after the producer has moved on. Runs on the producer
+        // thread (overlapping the GPU) and, once, on this thread to re-derive.
+        auto produce_draw = [&](uint64_t d, int slot, bool tells) {
+            double ms_rng=0, ms_hash=0, ms_noise=0, ms_build=0;
             auto tic = clk::now();
             auto lap = [&](double& dst){ auto now=clk::now(); dst=std::chrono::duration<double,std::milli>(now-tic).count(); tic=now; };
 
-            // (a) RNG fill of A and Bt. Each row gets its OWN mt19937 seeded
-            // deterministically from (draw, row_index) so OpenMP is safe and
+            // (a) RNG fill of A and Bt. Each row gets its own splitmix64 stream
+            // seeded deterministically from (d, row_index) so OpenMP is safe and
             // order-independent. A used for hash_a == A used in GEMM/strip.
             #pragma omp parallel for schedule(static)
             for (long i = 0; i < (long)m; i++) {
-                std::mt19937_64 r((seed ^ 0x9E3779B97F4A7C15ULL) + draw*1000003ULL + (uint64_t)i);
-                std::uniform_int_distribution<int> d(-64,64);
-                for (size_t j=0;j<k;j++) A[(size_t)i*k+j]=(int8_t)d(r);
+                uint64_t st=(seed^0x9E3779B97F4A7C15ULL)+d*1000003ULL+(uint64_t)i*0x100000001B3ULL;
+                int8_t* rowp=&A[(size_t)i*k];
+                for(size_t j=0;j<k;j+=8){uint64_t z=(st+=0x9E3779B97F4A7C15ULL);z=(z^(z>>30))*0xBF58476D1CE4E5B9ULL;z=(z^(z>>27))*0x94D049BB133111EBULL;z=z^(z>>31);for(int b=0;b<8&&j+(size_t)b<k;b++)rowp[j+b]=(int8_t)((int)((((uint32_t)((z>>(8*b))&0xFF))*129u)>>8)-64);}
             }
             #pragma omp parallel for schedule(static)
             for (long i = 0; i < (long)n; i++) {
-                std::mt19937_64 r((seed ^ 0xD1B54A32D192ED03ULL) + draw*1000003ULL + (uint64_t)i);
-                std::uniform_int_distribution<int> d(-64,64);
-                for (size_t j=0;j<k;j++) Bt[(size_t)i*k+j]=(int8_t)d(r);
+                uint64_t st=(seed^0xD1B54A32D192ED03ULL)+d*1000003ULL+(uint64_t)i*0x100000001B3ULL;
+                int8_t* rowp=&Bt[(size_t)i*k];
+                for(size_t j=0;j<k;j+=8){uint64_t z=(st+=0x9E3779B97F4A7C15ULL);z=(z^(z>>30))*0xBF58476D1CE4E5B9ULL;z=(z^(z>>27))*0x94D049BB133111EBULL;z=z^(z>>31);for(int b=0;b<8&&j+(size_t)b<k;b++)rowp[j+b]=(int8_t)((int)((((uint32_t)((z>>(8*b))&0xFF))*129u)>>8)-64);}
             }
-            if (do_breakdown) lap(ms_rng);
+            if (tells) lap(ms_rng);
 
-            // (b) blake3 hash_a + hash_b (over padded A / padded Bt).
+            // (b) blake3 hash_a + hash_b (over padded A / padded Bt) + chained seeds.
             #pragma omp parallel for schedule(static)
             for (long i = 0; i < (long)m; i++)
                 for (size_t j=0;j<k;j++) a_padded[(size_t)i*k+j]=(uint8_t)A[(size_t)i*k+j];
@@ -1013,19 +1051,17 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                 for (size_t j=0;j<k;j++) bt_padded[(size_t)i*k+j]=(uint8_t)Bt[(size_t)i*k+j];
             hash_a = blake3_digest(a_padded, &job_key);
             hash_b = blake3_digest(bt_padded, &job_key);
-            // chained seeds
             { uint8_t si[64];
               memcpy(si, job_key.data(),32); memcpy(si+32, hash_b.data(),32);
               b_noise_seed = blake3_digest(si,64,nullptr);
               memcpy(si, b_noise_seed.data(),32); memcpy(si+32, hash_a.data(),32);
               a_noise_seed = blake3_digest(si,64,nullptr); }
-            if (do_breakdown) lap(ms_hash);
+            if (tells) lap(ms_hash);
 
             // (c) noise generation: permutation matrices (depend on seeds) +
             // per-row/per-col uniform noise rows -> noise_a[row]/noise_b[col].
             e_ar_t = generate_permutation_matrix(seed_a_label, a_noise_seed, k, rank);
             e_bl   = generate_permutation_matrix(seed_b_label, b_noise_seed, k, rank);
-            std::vector<int8_t> noise_a((size_t)m*k), noise_b((size_t)n*k);
             #pragma omp parallel for schedule(static)
             for (long row = 0; row < (long)m; row++) {
                 vector<int8_t> e_al = uniform_row(seed_a_label, a_noise_seed, (size_t)row, rank);
@@ -1038,68 +1074,184 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                 vector<int8_t> nb = matvec_sparse_perm(e_bl, e_br);
                 for (size_t l=0;l<k;l++) noise_b[(size_t)col*k+l]=nb[l];
             }
-            if (do_breakdown) lap(ms_noise);
+            if (tells) lap(ms_noise);
 
-            // (d) build a_noised + b_noised_t int8.
+            // (d) build a_noised[slot] + b_noised_t[slot] int8 + snapshot the seed.
             #pragma omp parallel for schedule(static)
             for (long row=0; row<(long)m; row++)
-                for(size_t l=0;l<k;l++) a_noised[(size_t)row*k+l]=(signed char)((int)A[(size_t)row*k+l]+(int)noise_a[(size_t)row*k+l]);
+                for(size_t l=0;l<k;l++) a_noised[slot][(size_t)row*k+l]=(signed char)((int)A[(size_t)row*k+l]+(int)noise_a[(size_t)row*k+l]);
             #pragma omp parallel for schedule(static)
             for (long col=0; col<(long)n; col++)
-                for(size_t l=0;l<k;l++) b_noised_t[(size_t)col*k+l]=(signed char)((int)Bt[(size_t)col*k+l]+(int)noise_b[(size_t)col*k+l]);
-            if (do_breakdown) lap(ms_build);
+                for(size_t l=0;l<k;l++) b_noised_t[slot][(size_t)col*k+l]=(signed char)((int)Bt[(size_t)col*k+l]+(int)noise_b[(size_t)col*k+l]);
+            a_noise_seed_slot[slot] = a_noise_seed;
+            if (tells) { lap(ms_build);
+                fprintf(stderr, "CPUPREP draw=%llu (ms): RNG=%.2f blake3=%.2f noise=%.2f build=%.2f\n",
+                        (unsigned long long)d, ms_rng, ms_hash, ms_noise, ms_build);
+            }
+        };
 
-            // (e) GPU upload + kernel + result download.
-            unsigned bnd_words[8];
-            for (int i=0;i<8;i++) bnd_words[i]=(unsigned)((uint32_t)bound.b[i*4]|((uint32_t)bound.b[i*4+1]<<8)|((uint32_t)bound.b[i*4+2]<<16)|((uint32_t)bound.b[i*4+3]<<24));
+        // -------- GPU-RESIDENT draw pipeline (Phase2, DESIGN_speedup.md) -----
+        // When the GPU prep kernels are linked in (tc_cutlass_v2 + gpu_prep),
+        // generate RNG + commitments + noise directly in the search kernel's
+        // persistent dA/dBt and skip BOTH the 1.5s CPU prep and the 1GB H2D.
+        // Host work per draw shrinks to 2 seed hashes + 2 permutation matrices
+        // (~1 ms). Correctness: on a win, produce_draw(draw) re-derives the
+        // whole draw on the CPU and POSTCHECK independently recomputes the
+        // winning tile -> any GPU/CPU divergence fails ok=1 and is refused.
+        // Requires power-of-two chunk counts (real config: 512MiB = 2^19) and
+        // rank 256; otherwise falls back to the CPU producer path below.
+        bool gpu_pipe = false;
+        signed char *g_dA = nullptr, *g_dBt = nullptr;
+        if (real_cfg && rank == 256 &&
+            tc_alloc_bufs && gpu_prep_phase1 && gpu_prep_phase2 &&
+            tc_alloc_bufs((int)m,(int)n,(int)k,hh,ww,
+                          (int)row_parts.size(),(int)col_parts.size(),
+                          &g_dA,&g_dBt) == 0) {
+            gpu_pipe = true;
+            fprintf(stderr, "MINE: GPU-resident draw pipeline ACTIVE (RNG+hash+noise on GPU, no per-draw H2D)\n");
+        }
+        if (gpu_pipe) {
+            std::vector<unsigned int> perm_fa((size_t)k*2), perm_fb((size_t)k*2);
+            for (draw = 0; draw < maxdraws; draw++) {
+                if (stopping()) { fprintf(stderr, "MINE abort: stop requested at draw=%llu\n", (unsigned long long)draw); break; }
+                double ms_rng=0, ms_hash=0, ms_noise=0;
+                if (gpu_prep_phase1(g_dA, g_dBt, (int)m,(int)n,(int)k, seed, draw,
+                                    job_key.data(), hash_a.data(), hash_b.data(),
+                                    &ms_rng, &ms_hash)) {
+                    fprintf(stderr, "MINE: gpu_prep_phase1 failed at draw=%llu\n", (unsigned long long)draw);
+                    return 2;
+                }
+                { uint8_t si[64];
+                  memcpy(si, job_key.data(),32); memcpy(si+32, hash_b.data(),32);
+                  b_noise_seed = blake3_digest(si,64,nullptr);
+                  memcpy(si, b_noise_seed.data(),32); memcpy(si+32, hash_a.data(),32);
+                  a_noise_seed = blake3_digest(si,64,nullptr); }
+                e_ar_t = generate_permutation_matrix(seed_a_label, a_noise_seed, k, rank);
+                e_bl   = generate_permutation_matrix(seed_b_label, b_noise_seed, k, rank);
+                for (size_t i=0;i<k;i++) { perm_fa[2*i]=e_ar_t[i][0]; perm_fa[2*i+1]=e_ar_t[i][1];
+                                           perm_fb[2*i]=e_bl[i][0];   perm_fb[2*i+1]=e_bl[i][1]; }
+                if (gpu_prep_phase2(g_dA, g_dBt, (int)m,(int)n,(int)k,(int)rank,
+                                    a_noise_seed.data(), b_noise_seed.data(),
+                                    seed_a_label.data(), seed_b_label.data(),
+                                    perm_fa.data(), perm_fb.data(), &ms_noise)) {
+                    fprintf(stderr, "MINE: gpu_prep_phase2 failed at draw=%llu\n", (unsigned long long)draw);
+                    return 2;
+                }
+                if (breakdown || draw == 5)
+                    fprintf(stderr, "GPUPREP draw=%llu (ms): rng=%.1f hash=%.1f noise=%.1f\n",
+                            (unsigned long long)draw, ms_rng, ms_hash, ms_noise);
+
+                int rt=-1, ct=-1;
+                int ok = tc_jackpot_search(nullptr, nullptr,   // data already in dA/dBt
+                                           (int)m,(int)n,(int)k,(int)rank,
+                                           pat_rows.data(),pat_cols.data(),hh,ww,
+                                           row_off.data(),(int)row_parts.size(),
+                                           col_off.data(),(int)col_parts.size(),
+                                           a_noise_seed.data(), bound.b,
+                                           nullptr, nullptr, &rt, &ct);
+                if (ok==1 && rt>=0 && ct>=0) {
+                    // Re-derive draw N fully on the CPU: restores A/Bt/padded/
+                    // seeds/perms for POSTCHECK + Merkle. POSTCHECK is the
+                    // GPU-vs-CPU equivalence gate for this whole pipeline.
+                    produce_draw(draw, 0, false);
+                    found=true; win_rows=row_parts[(size_t)rt]; win_cols=col_parts[(size_t)ct];
+                    fprintf(stderr, "MINE WIN draw=%llu tile rt=%d ct=%d\n",
+                            (unsigned long long)(draw+1), rt, ct);
+                    break;
+                }
+                if (ok < 0) { fprintf(stderr, "MINE: kernel error at draw=%llu\n", (unsigned long long)draw); return 2; }
+
+                uint64_t done = draw + 1;
+                auto t_now = clk::now();
+                double win_el = std::chrono::duration<double>(t_now-t_window).count();
+                if (done % 100 == 0 || win_el >= 60.0) {
+                    double el = std::chrono::duration<double>(t_now-t_start).count();
+                    uint64_t win_draws = done - window_draw0;
+                    fprintf(stderr,
+                            "draw %llu, elapsed %.2fs, %.2f draws/sec, avg %.2f TH/s, window %.2f TH/s\n",
+                            (unsigned long long)done, el, (double)done/el,
+                            ths_for(done, el), ths_for(win_draws, win_el));
+                    if (win_el >= 60.0) { t_window = t_now; window_draw0 = done; }
+                }
+            }
+        } else {
+        // Prime the pipeline: produce draw 0 into slot 0 (synchronous).
+        int cur = 0;
+        bool primed = (maxdraws > 0) && !stopping();
+        if (primed) produce_draw(0, cur, breakdown);
+
+        for (draw = 0; primed && draw < maxdraws; draw++) {
+            // Cooperative abort: pool/solo set stop_flag when a newer job arrives.
+            // We finish the in-flight GPU draw (uninterruptible) then break.
+            if (stopping()) { fprintf(stderr, "MINE abort: stop requested at draw=%llu\n", (unsigned long long)draw); break; }
+            bool do_breakdown = breakdown || (draw == 5);
+
+            // Kick the producer for the NEXT draw; it fills the other slot and the
+            // shared scratch while this thread runs the GPU on the current slot.
+            uint64_t nd = draw + 1;
+            int nslot = 1 - cur;
+            bool have_next = (nd < maxdraws) && !stopping();
+            std::thread prod;
+            if (have_next) prod = std::thread([&, nd, nslot, do_breakdown]{ produce_draw(nd, nslot, do_breakdown); });
+
+            // (e) fused tensor-core search on the CURRENT slot (draw N). rt/ct
+            // return as row_off/col_off indices mapping back via row_parts/col_parts.
+            auto tg = clk::now();
             int rt=-1, ct=-1; float kms=0;
-            int ok;
-            if (use_tc) {
-                // REAL-config fused tensor-core search (supports h!=w). Reuses this
-                // draw's a_noised/b_noised_t/a_noise_seed/bound; tc_jackpot_search
-                // manages its own device buffers. rt/ct return as row_off/col_off
-                // indices, the SAME mapping gpu_mine_draw uses (row_parts[rt]/col_parts[ct]).
-                ok = tc_jackpot_search(a_noised.data(), b_noised_t.data(),
+            int ok = tc_jackpot_search(a_noised[cur].data(), b_noised_t[cur].data(),
                                        (int)m,(int)n,(int)k,(int)rank,
                                        pat_rows.data(),pat_cols.data(),hh,ww,
                                        row_off.data(),(int)row_parts.size(),
                                        col_off.data(),(int)col_parts.size(),
-                                       a_noise_seed.data(), bound.b,
+                                       a_noise_seed_slot[cur].data(), bound.b,
                                        nullptr, nullptr, &rt, &ct);
-            } else {
-                ok = gpu_mine_draw(a_noised.data(), b_noised_t.data(),
-                                   a_noise_seed.data(), bnd_words, &rt, &ct, &kms);
-            }
-            if (do_breakdown) { lap(ms_gpu);
-                fprintf(stderr,
-                  "BREAKDOWN draw5 (ms): RNG=%.2f blake3=%.2f noise=%.2f build=%.2f GPU=%.2f (kernel=%.2f)\n",
-                  ms_rng, ms_hash, ms_noise, ms_build, ms_gpu, (double)kms);
-            }
+            double ms_gpu = std::chrono::duration<double,std::milli>(clk::now()-tg).count();
+
+            // Producer owns the shared scratch -> must complete before we either
+            // start the next iteration or re-derive draw N on a win.
+            if (prod.joinable()) prod.join();
+            if (do_breakdown)
+                fprintf(stderr, "BREAKDOWN draw=%llu GPU=%.2f ms (kernel=%.2f) [CPU(N+1) overlapped]\n",
+                        (unsigned long long)draw, ms_gpu, (double)kms);
 
             if (ok==1 && rt>=0 && ct>=0) {
+                // The producer already advanced shared A/Bt/e_ar_t/e_bl/seeds to
+                // draw nd; re-run draw N to restore byte-exact state for the
+                // POSTCHECK + Merkle proof assembly that follows the loop.
+                produce_draw(draw, cur, false);
                 found=true; win_rows=row_parts[(size_t)rt]; win_cols=col_parts[(size_t)ct];
-                a_noise_seed_win = a_noise_seed;
                 fprintf(stderr, "MINE WIN draw=%llu tile rt=%d ct=%d\n",
                         (unsigned long long)(draw+1), rt, ct);
                 break;
             }
 
-            if ((draw+1) % 100 == 0) {
-                double el = std::chrono::duration<double>(clk::now()-t_start).count();
-                fprintf(stderr, "draw %llu, elapsed %.2fs, %.2f draws/sec, %.2f MH/s\n",
-                        (unsigned long long)(draw+1), el, (double)(draw+1)/el,
-                        (double)(draw+1)/el*(double)row_parts.size()*(double)col_parts.size()/1e6);
+            cur = nslot;
+
+            uint64_t done = draw + 1;
+            auto t_now = clk::now();
+            double win_el = std::chrono::duration<double>(t_now-t_window).count();
+            if (done % 100 == 0 || win_el >= 60.0) {
+                double el = std::chrono::duration<double>(t_now-t_start).count();
+                uint64_t win_draws = done - window_draw0;
+                fprintf(stderr,
+                        "draw %llu, elapsed %.2fs, %.2f draws/sec, avg %.2f TH/s, window %.2f TH/s\n",
+                        (unsigned long long)done, el, (double)done/el,
+                        ths_for(done, el), ths_for(win_draws, win_el));
+                if (win_el >= 60.0) {
+                    t_window = t_now;
+                    window_draw0 = done;
+                }
             }
         }
+        } // end CPU-producer path (gpu_pipe else)
         double el = std::chrono::duration<double>(clk::now()-t_start).count();
-        fprintf(stderr, "MINE done: draws=%llu elapsed=%.2fs %.2f draws/sec %.2f MH/s found=%d\n",
-                (unsigned long long)(found?draw+1:draw), el,
-                (double)(found?draw+1:draw)/(el>0?el:1),
-                (double)(found?draw+1:draw)/(el>0?el:1)*(double)row_parts.size()*(double)col_parts.size()/1e6, found?1:0);
-        if (!use_tc) gpu_mine_free();
-        // a_noise_seed already holds the winning draw's seed (used by CPU proof
-        // path only; GPU win maps directly via row_parts/col_parts).
-        (void)a_noise_seed_win;
+        uint64_t draws_done = found ? (draw + 1) : draw;
+        R.draws = draws_done;
+        R.elapsed_s = el;
+        fprintf(stderr, "MINE done: draws=%llu elapsed=%.2fs %.2f draws/sec %.2f TH/s found=%d\n",
+                (unsigned long long)draws_done, el,
+                (double)draws_done/(el>0?el:1),
+                ths_for(draws_done, el), found?1:0);
     } else if (use_tc) {
         std::vector<signed char> a_noised((size_t)m*k), b_noised_t((size_t)n*k);
         for (size_t row=0; row<m; row++){ const auto& na=get_noise_a(row); for(size_t l=0;l<k;l++) a_noised[row*k+l]=(signed char)((int)A[row*k+l]+(int)na[l]); }
@@ -1117,28 +1269,6 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
             fprintf(stderr, "TC WIN tile rt=%d ct=%d\n", rt, ct);
         } else {
             fprintf(stderr, "TC search: no win (ok=%d)\n", ok);
-        }
-    } else if (use_gpu) {
-        std::vector<signed char> a_noised((size_t)m*k), b_noised_t((size_t)n*k);
-        for (size_t row=0; row<m; row++){ const auto& na=get_noise_a(row); for(size_t l=0;l<k;l++) a_noised[row*k+l]=(signed char)((int)A[row*k+l]+(int)na[l]); }
-        for (size_t col=0; col<n; col++){ const auto& nb=get_noise_b(col); for(size_t l=0;l<k;l++) b_noised_t[col*k+l]=(signed char)((int)Bt[col*k+l]+(int)nb[l]); }
-        // threads_partition emits ONE tile per valid base offset; row_parts[i][0] IS
-        // the i-th valid base offset and row_parts[i] == { row_parts[i][0] + pat[u] }.
-        // Pass all 768 row + 512 col base offsets so the kernel covers the FULL
-        // search space (nrow_off*ncol_off tiles) and wins map directly to row_parts[i]/col_parts[j].
-        int rt=-1, ct=-1;
-        int ok = gpu_jackpot_search(a_noised.data(), b_noised_t.data(),
-                                    (int)m,(int)n,(int)k,(int)rank,
-                                    pat_rows.data(),hh,ww,
-                                    row_off.data(),(int)row_parts.size(),
-                                    col_off.data(),(int)col_parts.size(),
-                                    a_noise_seed.data(), bound.b,
-                                    nullptr, nullptr, &rt, &ct);
-        if (ok==1 && rt>=0 && ct>=0) {
-            found=true; win_rows=row_parts[(size_t)rt]; win_cols=col_parts[(size_t)ct];
-            fprintf(stderr, "GPU WIN tile rt=%d ct=%d\n", rt, ct);
-        } else {
-            fprintf(stderr, "GPU search: no win (ok=%d)\n", ok);
         }
     } else if (probe) {
         // Probe: emit a structurally-valid proof for the FIRST tile without searching
@@ -1294,17 +1424,34 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
 #ifndef PROVER_LIB
 // Standalone CLI: argv -> MineParams -> mine_plain_proof -> base64 proof on stdout.
 // Preserved verbatim from the historical interface (seed | --dump | --probe |
-// --gpu | --tc | --mine [N] | --target <64hex> | --header <152hex> | --cfg real).
+// --tc | --mine [N] | --target <64hex> | --header <152hex> | --cfg real).
 int main(int argc, char** argv) {
     MineParams P;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
-        if (a == "--dump") P.dump = true;
+        if (a == "--help" || a == "-h") {
+            fprintf(stderr,
+                "plainproof_gen - Pearl(PRL) PlainProof generator/miner\n\n"
+                "usage:\n"
+                "  plainproof_gen [seed]\n"
+                "  plainproof_gen --mine [N] [--cfg golden|real] [--header 152hex] [--target 64hex]\n\n"
+                "options:\n"
+                "  --mine [N]        mine up to N draws and emit base64 PlainProof on success (fused tensor-core)\n"
+                "  --tc              force the tensor-core kernel for the single-shot self-test path\n"
+                "  --cfg real        use live pool dimensions (default is golden test config)\n"
+                "  --header HEX      76-byte block header as 152 hex chars\n"
+                "  --target HEX      32-byte pool target as 64 big-endian hex chars\n"
+                "  --breakdown       print per-draw timing breakdown to stderr\n"
+                "  --probe           emit a probe proof shape without jackpot search\n"
+                "  --dump            dump debug artifacts for oracle comparison\n");
+            return 0;
+        }
+        else if (a == "--dump") P.dump = true;
         else if (a == "--probe") P.probe = true;
-        else if (a == "--gpu") P.use_gpu = true;
+        else if (a == "--breakdown") P.breakdown = true;
         else if (a == "--tc") P.use_tc = true;
         else if (a == "--mine") {
-            P.mine = true; P.use_gpu = true;
+            P.mine = true;
             if (i + 1 < argc) {
                 char* end = nullptr;
                 unsigned long long v = strtoull(argv[i+1], &end, 10);
