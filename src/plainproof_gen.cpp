@@ -774,6 +774,18 @@ extern "C" int gpu_prep_phase2(
     const unsigned char* label_a32, const unsigned char* label_b32,
     const unsigned int* perm_a, const unsigned int* perm_b,
     double* ms_noise) __attribute__((weak));
+// Async split of tc_jackpot_search (tc_cutlass_v2.cu): launch queues
+// gather+search on a non-blocking stream and returns; wait blocks for the
+// result. Lets prep(N+1) run on its own stream UNDER search(N) — the search
+// only reads the gathered panels, never dA/dBt, so prep can overwrite them
+// once the gathers are done (event-ordered inside gpu_prep). WEAK: builds
+// linking tc_block fall back to the synchronous tc_jackpot_search.
+extern "C" int tc_search_launch(
+    int m,int n,int k,int rank,
+    const int* pat_rows, const int* pat_cols, int h,int w,
+    const int* row_off, int nrow_off, const int* col_off, int ncol_off,
+    const unsigned char* a_noise_seed32, const unsigned char* bound_le32) __attribute__((weak));
+extern "C" int tc_search_wait(int* out_rt, int* out_ct) __attribute__((weak));
 
 int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop_flag) {
     R.found = false;
@@ -1112,13 +1124,15 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         }
         if (gpu_pipe) {
             std::vector<unsigned int> perm_fa((size_t)k*2), perm_fb((size_t)k*2);
-            for (draw = 0; draw < maxdraws; draw++) {
-                if (stopping()) { fprintf(stderr, "MINE abort: stop requested at draw=%llu\n", (unsigned long long)draw); break; }
+            // GPU prep of one draw: phase1 (RNG+commitments) -> host seed chain +
+            // perms (~1ms) -> phase2 (noise). Leaves the noised draw in dA/dBt
+            // and the draw's a_noise_seed in the shared host var. rc 0/2.
+            auto gpu_prep_draw = [&](uint64_t d) -> int {
                 double ms_rng=0, ms_hash=0, ms_noise=0;
-                if (gpu_prep_phase1(g_dA, g_dBt, (int)m,(int)n,(int)k, seed, draw,
+                if (gpu_prep_phase1(g_dA, g_dBt, (int)m,(int)n,(int)k, seed, d,
                                     job_key.data(), hash_a.data(), hash_b.data(),
                                     &ms_rng, &ms_hash)) {
-                    fprintf(stderr, "MINE: gpu_prep_phase1 failed at draw=%llu\n", (unsigned long long)draw);
+                    fprintf(stderr, "MINE: gpu_prep_phase1 failed at draw=%llu\n", (unsigned long long)d);
                     return 2;
                 }
                 { uint8_t si[64];
@@ -1134,25 +1148,60 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                                     a_noise_seed.data(), b_noise_seed.data(),
                                     seed_a_label.data(), seed_b_label.data(),
                                     perm_fa.data(), perm_fb.data(), &ms_noise)) {
-                    fprintf(stderr, "MINE: gpu_prep_phase2 failed at draw=%llu\n", (unsigned long long)draw);
+                    fprintf(stderr, "MINE: gpu_prep_phase2 failed at draw=%llu\n", (unsigned long long)d);
                     return 2;
                 }
-                if (breakdown || draw == 5)
+                if (breakdown || d == 5)
                     fprintf(stderr, "GPUPREP draw=%llu (ms): rng=%.1f hash=%.1f noise=%.1f\n",
-                            (unsigned long long)draw, ms_rng, ms_hash, ms_noise);
+                            (unsigned long long)d, ms_rng, ms_hash, ms_noise);
+                return 0;
+            };
 
-                int rt=-1, ct=-1;
-                int ok = tc_jackpot_search(nullptr, nullptr,   // data already in dA/dBt
+            const bool async_split = (tc_search_launch && tc_search_wait);
+            if (async_split)
+                fprintf(stderr, "MINE: async search/prep overlap ACTIVE (prep N+1 under search N)\n");
+
+            // Prime: prep draw 0 (GPU idle, runs at full speed).
+            if (maxdraws > 0 && !stopping() && gpu_prep_draw(0)) return 2;
+            for (draw = 0; draw < maxdraws; draw++) {
+                if (stopping()) { fprintf(stderr, "MINE abort: stop requested at draw=%llu\n", (unsigned long long)draw); break; }
+
+                int rt=-1, ct=-1, ok;
+                if (async_split) {
+                    // Software pipeline: queue search(N) async; while it runs,
+                    // prep draw N+1 into dA/dBt on the prep stream (gathers of
+                    // N already copied what search needs into dAp/dBtp; event
+                    // ordering inside gpu_prep keeps writes behind the gathers).
+                    // a_noise_seed is captured into device mem at launch, so
+                    // the prep's overwrite of the host var is safe.
+                    if (tc_search_launch((int)m,(int)n,(int)k,(int)rank,
+                                         pat_rows.data(),pat_cols.data(),hh,ww,
+                                         row_off.data(),(int)row_parts.size(),
+                                         col_off.data(),(int)col_parts.size(),
+                                         a_noise_seed.data(), bound.b)) {
+                        fprintf(stderr, "MINE: kernel launch error at draw=%llu\n", (unsigned long long)draw); return 2;
+                    }
+                    uint64_t nd = draw + 1;
+                    if (nd < maxdraws && !stopping()) {
+                        if (gpu_prep_draw(nd)) { tc_search_wait(&rt,&ct); return 2; }
+                    }
+                    ok = tc_search_wait(&rt, &ct);
+                } else {
+                    ok = tc_jackpot_search(nullptr, nullptr,   // data already in dA/dBt
                                            (int)m,(int)n,(int)k,(int)rank,
                                            pat_rows.data(),pat_cols.data(),hh,ww,
                                            row_off.data(),(int)row_parts.size(),
                                            col_off.data(),(int)col_parts.size(),
                                            a_noise_seed.data(), bound.b,
                                            nullptr, nullptr, &rt, &ct);
+                    uint64_t nd = draw + 1;
+                    if (ok == 0 && nd < maxdraws && !stopping() && gpu_prep_draw(nd)) return 2;
+                }
                 if (ok==1 && rt>=0 && ct>=0) {
                     // Re-derive draw N fully on the CPU: restores A/Bt/padded/
-                    // seeds/perms for POSTCHECK + Merkle. POSTCHECK is the
-                    // GPU-vs-CPU equivalence gate for this whole pipeline.
+                    // seeds/perms for POSTCHECK + Merkle (the shared host vars
+                    // currently hold draw N+1 from the overlapped prep).
+                    // POSTCHECK is the GPU-vs-CPU equivalence gate.
                     produce_draw(draw, 0, false);
                     found=true; win_rows=row_parts[(size_t)rt]; win_cols=col_parts[(size_t)ct];
                     fprintf(stderr, "MINE WIN draw=%llu tile rt=%d ct=%d\n",

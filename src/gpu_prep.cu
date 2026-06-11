@@ -198,6 +198,30 @@ struct PrepBufs {
 };
 static PrepBufs g_prep;
 
+// All prep work runs on a private HIGH-PRIORITY non-blocking stream so it can
+// execute UNDER the in-flight search kernel (tc_cutlass_v2 launches async on
+// its own stream; prep writes dA/dBt while the search only reads the gathered
+// dAp/dBtp panels — no conflict). High priority lets prep blocks slot into SMs
+// as search waves retire instead of starving behind the 512k-block search grid.
+// Both phases still cudaStreamSynchronize THIS stream before returning, so the
+// host-visible contract (buffers ready on return) is unchanged.
+static cudaStream_t g_prep_stream = nullptr;
+static bool ensure_prep_stream() {
+  if (g_prep_stream) return true;
+  int lo = 0, hi = 0;
+  cudaDeviceGetStreamPriorityRange(&lo, &hi);   // hi = greatest priority
+  if (cudaStreamCreateWithPriority(&g_prep_stream, cudaStreamNonBlocking, hi)
+      == cudaSuccess) return true;
+  return cudaStreamCreateWithFlags(&g_prep_stream, cudaStreamNonBlocking)
+      == cudaSuccess;
+}
+
+// Recorded by tc_search_launch right after the gather kernels (the last
+// READERS of dA/dBt for draw N). Phase1 orders its dA/dBt writes behind it so
+// prep(N+1) can run under search(N) without clobbering the gathers' input.
+// WEAK: harnesses that link gpu_prep without tc_cutlass_v2 still build.
+extern "C" void* tc_gather_done_event() __attribute__((weak));
+
 static bool ensure_prep_bufs(size_t max_chunks, int k) {
   if (g_prep.ok) return true;
   if (cudaMalloc(&g_prep.cv0, max_chunks*8*4) ||
@@ -214,16 +238,16 @@ static bool ensure_prep_bufs(size_t max_chunks, int k) {
 // power-of-two chunk count (checked by caller).
 static int tree_hash(const uint8_t* dbuf, size_t nbytes, uint8_t out32[32]) {
   size_t nchunks = nbytes / 1024;
-  b3_chunk_kernel<<<(unsigned)((nchunks+255)/256), 256>>>(dbuf, nchunks, g_prep.cv0);
+  b3_chunk_kernel<<<(unsigned)((nchunks+255)/256), 256, 0, g_prep_stream>>>(dbuf, nchunks, g_prep.cv0);
   uint32_t *src = g_prep.cv0, *dst = g_prep.cv1;
   size_t ncv = nchunks;
   while (ncv > 1) {
     size_t npar = ncv/2;
-    b3_parent_kernel<<<(unsigned)((npar+255)/256), 256>>>(src, npar, dst, npar==1);
+    b3_parent_kernel<<<(unsigned)((npar+255)/256), 256, 0, g_prep_stream>>>(src, npar, dst, npar==1);
     uint32_t* t = src; src = dst; dst = t;
     ncv = npar;
   }
-  return cudaMemcpy(out32, src, 32, cudaMemcpyDeviceToHost) == cudaSuccess ? 0 : -1;
+  return cudaMemcpyAsync(out32, src, 32, cudaMemcpyDeviceToHost, g_prep_stream) == cudaSuccess ? 0 : -1;
 }
 
 // phase1: RNG fill + commitments. seed/draw/job_key in; hash_a/hash_b out.
@@ -239,28 +263,34 @@ extern "C" int gpu_prep_phase1(
   if ((ach & (ach-1)) || (bch & (bch-1))) return -2;   // need power-of-two chunks
   if (k % 8) return -2;
   if (!ensure_prep_bufs(ach > bch ? ach : bch, k)) return -1;
+  if (!ensure_prep_stream()) return -1;
+  // Don't write dA/dBt until search(N)'s gathers have read them.
+  if (tc_gather_done_event) {
+    cudaEvent_t ge = (cudaEvent_t)tc_gather_done_event();
+    if (ge) cudaStreamWaitEvent(g_prep_stream, ge, 0);
+  }
 
   uint32_t kw[8];
   for (int i=0;i<8;i++)
     kw[i]=(uint32_t)job_key32[i*4]|((uint32_t)job_key32[i*4+1]<<8)|
           ((uint32_t)job_key32[i*4+2]<<16)|((uint32_t)job_key32[i*4+3]<<24);
-  cudaMemcpyToSymbol(c_hkey, kw, 32);
+  cudaMemcpyToSymbolAsync(c_hkey, kw, 32, 0, cudaMemcpyHostToDevice, g_prep_stream);
 
   cudaEvent_t e0,e1,e2; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
-  cudaEventRecord(e0);
+  cudaEventRecord(e0, g_prep_stream);
   {
     size_t ng = (size_t)m*(k/8);
-    rng_fill_kernel<<<(unsigned)((ng+255)/256), 256>>>((int8_t*)dA, m, k,
+    rng_fill_kernel<<<(unsigned)((ng+255)/256), 256, 0, g_prep_stream>>>((int8_t*)dA, m, k,
         seed ^ 0x9E3779B97F4A7C15ULL, draw);
     ng = (size_t)n*(k/8);
-    rng_fill_kernel<<<(unsigned)((ng+255)/256), 256>>>((int8_t*)dBt, n, k,
+    rng_fill_kernel<<<(unsigned)((ng+255)/256), 256, 0, g_prep_stream>>>((int8_t*)dBt, n, k,
         seed ^ 0xD1B54A32D192ED03ULL, draw);
   }
-  cudaEventRecord(e1);
+  cudaEventRecord(e1, g_prep_stream);
   if (tree_hash((const uint8_t*)dA, abytes, hash_a32)) return -1;
   if (tree_hash((const uint8_t*)dBt, bbytes, hash_b32)) return -1;
-  cudaEventRecord(e2);
-  cudaEventSynchronize(e2);
+  cudaEventRecord(e2, g_prep_stream);
+  cudaStreamSynchronize(g_prep_stream);
   float f01=0,f12=0;
   cudaEventElapsedTime(&f01,e0,e1); cudaEventElapsedTime(&f12,e1,e2);
   if (ms_rng) *ms_rng=f01;
@@ -281,11 +311,12 @@ extern "C" int gpu_prep_phase2(
 {
   if (rank != 256) { fprintf(stderr,"gpu_prep2: rank must be 256 (got %d)\n",rank); return -2; }
   if (!g_prep.ok) return -1;
+  if (!ensure_prep_stream()) return -1;
 
   uint32_t* dpa = g_prep.dperm;
   uint32_t* dpb = g_prep.dperm + (size_t)k*2;
-  cudaMemcpy(dpa, perm_a, (size_t)k*2*4, cudaMemcpyHostToDevice);
-  cudaMemcpy(dpb, perm_b, (size_t)k*2*4, cudaMemcpyHostToDevice);
+  cudaMemcpyAsync(dpa, perm_a, (size_t)k*2*4, cudaMemcpyHostToDevice, g_prep_stream);
+  cudaMemcpyAsync(dpb, perm_b, (size_t)k*2*4, cudaMemcpyHostToDevice, g_prep_stream);
 
   uint32_t kwa[8], kwb[8], la[8], lb[8];
   for (int i=0;i<8;i++) {
@@ -300,15 +331,15 @@ extern "C" int gpu_prep_phase2(
   }
 
   cudaEvent_t e0,e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
-  cudaEventRecord(e0);
-  cudaMemcpyToSymbol(c_nzkey, kwa, 32);
-  cudaMemcpyToSymbol(c_nzlabel, la, 32);
-  noise_add_kernel<<<(unsigned)m, 256>>>((int8_t*)dA, m, k, dpa);
-  cudaMemcpyToSymbol(c_nzkey, kwb, 32);
-  cudaMemcpyToSymbol(c_nzlabel, lb, 32);
-  noise_add_kernel<<<(unsigned)n, 256>>>((int8_t*)dBt, n, k, dpb);
-  cudaEventRecord(e1);
-  cudaEventSynchronize(e1);
+  cudaEventRecord(e0, g_prep_stream);
+  cudaMemcpyToSymbolAsync(c_nzkey, kwa, 32, 0, cudaMemcpyHostToDevice, g_prep_stream);
+  cudaMemcpyToSymbolAsync(c_nzlabel, la, 32, 0, cudaMemcpyHostToDevice, g_prep_stream);
+  noise_add_kernel<<<(unsigned)m, 256, 0, g_prep_stream>>>((int8_t*)dA, m, k, dpa);
+  cudaMemcpyToSymbolAsync(c_nzkey, kwb, 32, 0, cudaMemcpyHostToDevice, g_prep_stream);
+  cudaMemcpyToSymbolAsync(c_nzlabel, lb, 32, 0, cudaMemcpyHostToDevice, g_prep_stream);
+  noise_add_kernel<<<(unsigned)n, 256, 0, g_prep_stream>>>((int8_t*)dBt, n, k, dpb);
+  cudaEventRecord(e1, g_prep_stream);
+  cudaStreamSynchronize(g_prep_stream);
   float f=0; cudaEventElapsedTime(&f,e0,e1);
   if (ms_noise) *ms_noise=f;
   cudaEventDestroy(e0); cudaEventDestroy(e1);

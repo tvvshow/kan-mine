@@ -496,7 +496,10 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
   extern __shared__ __align__(16) char smem_raw[];
   auto* mma_smem = reinterpret_cast<typename FoldMma::Base::SharedStorage*>(smem_raw);
   uint32_t* jp_sh = reinterpret_cast<uint32_t*>(smem_raw + sizeof(typename FoldMma::Base::SharedStorage));
-#define JPS(t,q) jp_sh[(t)*16+(q)]
+// stride 17 (not 16): the lane-distributed fold store writes 32 tiles' word c
+// in ONE instruction; tile stride 16 words would land on 2 banks (16-way
+// conflict), 17 spreads it to 8 banks (4-way). +1 KB smem, still under cap.
+#define JPS(t,q) jp_sh[(t)*17+(q)]
 
   const int thread_idx = threadIdx.x;
   const int warp_idx   = threadIdx.x >> 5;
@@ -532,7 +535,7 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
   const int M  = nrow_off * H;            // gathered A' rows
   const int N  = ncol_off * W;            // gathered Bt' rows (= B cols)
 
-  for (int t = thread_idx; t < NJT*16; t += blockDim.x) jp_sh[t] = 0;
+  for (int t = thread_idx; t < NJT*17; t += blockDim.x) jp_sh[t] = 0;
   __syncthreads();
 
   typename FoldMma::FragmentC accum;
@@ -547,13 +550,17 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
   typename FoldMma::IteratorB itB(paramsB, const_cast<int8_t*>(Btp), {kfold, N}, thread_idx,
                                   cutlass::MatrixCoord(0, bn_ * BN));
 
-  // warp-local fold: XOR 4 accum frags per 8x16 jackpot tile, single-inst
-  // redux.sync warp XOR-reduce (sm_80+), lane 0 rotl13-merges into the tile's
-  // transcript word. No barriers. (The previous 5x shfl_xor + 5x XOR chain was
-  // ~60k cycles/SM per mainloop — 92% of the GEMM itself; redux.sync cuts the
-  // reduce to ONE warp instruction per tile-word.)
+  // warp-local fold, LANE-DISTRIBUTED (ncu: the previous lane-0 serial RMW
+  // chain was the top stall source — 55.9% of issue gaps were "execution pipe
+  // oversubscribed", 31 lanes predicated off while lane 0 did 32 serial smem
+  // RMWs). A warp covers exactly 32 jackpot tiles (8 jr x 4 jc) and a warp has
+  // exactly 32 lanes, so: redux result of tile #it is claimed by lane #it into
+  // a register; after the 32-iteration loop ALL lanes do the rotl13-RMW of
+  // their own tile's transcript word in ONE parallel instruction. Removes the
+  // serial chain entirely; smem ops per fold: 64 lane-0 -> 2 warp-wide.
   auto fold = [&](typename FoldMma::FragmentC const& acc, int c) {
     const int32_t* f = reinterpret_cast<const int32_t*>(acc.data());
+    uint32_t myx = 0;                           // lane's claimed tile XOR
     #pragma unroll
     for (int jr = 0; jr < 8; ++jr) {            // 8-row bands within warp's 64 rows
       const int m = jr >> 1, half = jr & 1;
@@ -563,16 +570,16 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
         const int n0 = jc*2, n1 = n0 + 1;
         uint32_t x = (uint32_t)f[(m + n0*4)*4 + e0] ^ (uint32_t)f[(m + n0*4)*4 + e1]
                    ^ (uint32_t)f[(m + n1*4)*4 + e0] ^ (uint32_t)f[(m + n1*4)*4 + e1];
-        x = __reduce_xor_sync(0xffffffffu, x);
-        if (lane == 0) {
-          const int jtrib = warp_m*8 + jr;      // 0..RTOFF-1
-          const int jtcib = warp_n*4 + jc;      // 0..CTOFF-1
-          if (bi + jtrib < nrow_off && bj + jtcib < ncol_off) {
-            const int local_jt = jtrib*CTOFF + jtcib;
-            JPS(local_jt, c % 16) = rotl32d(JPS(local_jt, c % 16), 13) ^ x;
-          }
-        }
+        x = __reduce_xor_sync(0xffffffffu, x);  // broadcast to all lanes
+        if (lane == jr*4 + jc) myx = x;         // tile #it claimed by lane #it
       }
+    }
+    // lane L owns tile (jr=L/4, jc=L%4): one warp-wide transcript RMW.
+    const int jtrib = warp_m*8 + (lane >> 2);
+    const int jtcib = warp_n*4 + (lane & 3);
+    if (bi + jtrib < nrow_off && bj + jtcib < ncol_off) {
+      const int local_jt = jtrib*CTOFF + jtcib;
+      JPS(local_jt, c % 16) = rotl32d(JPS(local_jt, c % 16), 13) ^ myx;
     }
   };
 
@@ -640,6 +647,100 @@ extern "C" int tc_alloc_bufs(int m,int n,int k,int h,int w,int nrow_off,int ncol
   return 0;
 }
 
+// ---- async launch/wait split -------------------------------------------------
+// The search kernel only reads the GATHERED panels dAp/dBtp; gpu_prep writes
+// dA/dBt. So once the gather kernels of draw N are done, prep for draw N+1 can
+// overwrite dA/dBt UNDER the in-flight search — that's the whole overlap. The
+// host contract: tc_search_launch() returns immediately after queueing
+// gather+search on a private non-blocking stream; tc_search_wait() blocks for
+// the result. g_gather_evt (exposed via tc_gather_done_event) is recorded
+// after the gathers so gpu_prep's stream can order itself behind them.
+static cudaStream_t g_search_stream = nullptr;
+static cudaEvent_t  g_gather_evt = nullptr, g_se0 = nullptr, g_se1 = nullptr;
+static size_t g_inflight_tiles = 0;
+static double g_inflight_work = 0;
+
+static bool ensure_search_stream() {
+  if (g_search_stream) return true;
+  if (cudaStreamCreateWithFlags(&g_search_stream, cudaStreamNonBlocking) != cudaSuccess) return false;
+  cudaEventCreateWithFlags(&g_gather_evt, cudaEventDisableTiming);
+  cudaEventCreate(&g_se0); cudaEventCreate(&g_se1);
+  return true;
+}
+
+// gpu_prep.cu weak-links this; non-NULL only after the first launch.
+extern "C" void* tc_gather_done_event() { return (void*)g_gather_evt; }
+
+extern "C" int tc_search_launch(
+    int m,int n,int k,int rank,
+    const int* pat_rows, const int* pat_cols, int h,int w,
+    const int* row_off, int nrow_off, const int* col_off, int ncol_off,
+    const unsigned char* a_noise_seed32, const unsigned char* bound_le32)
+{
+  if (rank % FoldMma::Shape::kK) { fprintf(stderr,"tc_cutlass: rank %d not a multiple of %d\n", rank, (int)FoldMma::Shape::kK); return -3; }
+  if (h != H || w != W) {
+    fprintf(stderr,"tc_cutlass: this geometry needs h=%d w=%d (got h=%d w=%d)\n",H,W,h,w); return -2; }
+  if (!ensure_dev_bufs(m,n,k,h,w,nrow_off,ncol_off)) return -1;
+  if (!ensure_search_stream()) return -1;
+  DevBufs& B = g_bufs;
+  cudaStream_t s = g_search_stream;
+
+  g_inflight_tiles = (size_t)nrow_off * ncol_off;
+  g_inflight_work  = (double)g_inflight_tiles * h * w * (k - (k % rank));
+
+  // pageable-source async copies stage synchronously -> stack/temp sources OK
+  cudaMemcpyAsync(B.dpr,pat_rows,h*4,cudaMemcpyHostToDevice,s);
+  cudaMemcpyAsync(B.dpc,pat_cols,w*4,cudaMemcpyHostToDevice,s);
+  cudaMemcpyAsync(B.droff,row_off,nrow_off*4,cudaMemcpyHostToDevice,s);
+  cudaMemcpyAsync(B.dcoff,col_off,ncol_off*4,cudaMemcpyHostToDevice,s);
+  uint32_t kw[8],bw[8]; words_from_le32(a_noise_seed32,kw); words_from_le32(bound_le32,bw);
+  cudaMemcpyAsync(B.dk,kw,32,cudaMemcpyHostToDevice,s);
+  cudaMemcpyAsync(B.db,bw,32,cudaMemcpyHostToDevice,s);
+  cudaMemsetAsync(B.df,0,4,s);
+
+  gather_rows<<<nrow_off*h, 256, 0, s>>>(B.dA, B.dAp, k, B.droff, B.dpr, h, nrow_off);
+  gather_rows<<<ncol_off*w, 256, 0, s>>>(B.dBt, B.dBtp, k, B.dcoff, B.dpc, w, ncol_off);
+  cudaEventRecord(g_gather_evt, s);   // prep(N+1) may write dA/dBt after this
+
+  dim3 grid((ncol_off + CTOFF - 1)/CTOFF, (nrow_off + RTOFF - 1)/RTOFF);
+  size_t smem_bytes = sizeof(typename FoldMma::Base::SharedStorage) + (size_t)NJT*17*4;
+  static bool attr_set=false;
+  if (!attr_set) {
+    cudaError_t ae = cudaFuncSetAttribute(tc_cutlass_jackpot,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+    if (ae!=cudaSuccess) fprintf(stderr,"tc_cutlass: smem attr (%zu B) err %s\n", smem_bytes, cudaGetErrorString(ae));
+    attr_set=true;
+  }
+  cudaEventRecord(g_se0, s);
+  tc_cutlass_jackpot<<<grid, TPB, smem_bytes, s>>>(
+      (const int8_t*)B.dAp,(const int8_t*)B.dBtp,k,rank,nrow_off,ncol_off,B.dk,B.db,B.df,B.dr,B.dc);
+  cudaEventRecord(g_se1, s);
+  cudaError_t le = cudaGetLastError();
+  if (le!=cudaSuccess) {
+    fprintf(stderr,"tc_cutlass: LAUNCH err %s (tpb=%d, grid=%dx%d, smem=%zuB)\n",
+            cudaGetErrorString(le), TPB, grid.x, grid.y, smem_bytes);
+    return -1;
+  }
+  return 0;
+}
+
+extern "C" int tc_search_wait(int* out_rt, int* out_ct)
+{
+  DevBufs& B = g_bufs;
+  cudaError_t err = cudaStreamSynchronize(g_search_stream);
+  float ms=0; cudaEventElapsedTime(&ms,g_se0,g_se1);
+  fprintf(stderr,
+          "tc(cutlass2): TB=%dx%dx%d W=64x64 s%d FUSED %zu tiles, %.3f ms, %.2f TH/s\n",
+          BM, BN, (int)TBShape::kK, kStages, g_inflight_tiles, ms,
+          g_inflight_work / (ms * 1e-3) / 1e12);
+  if (err!=cudaSuccess){ fprintf(stderr,"tc_cutlass: err %s\n",cudaGetErrorString(err)); return -1; }
+
+  int wf=0;
+  cudaMemcpy(&wf,B.df,4,cudaMemcpyDeviceToHost);
+  if (wf){ cudaMemcpy(out_rt,B.dr,4,cudaMemcpyDeviceToHost); cudaMemcpy(out_ct,B.dc,4,cudaMemcpyDeviceToHost); }
+  return wf;
+}
+
 extern "C" int tc_jackpot_search(
     const signed char* a_noised, const signed char* b_noised_t,
     int m,int n,int k,int rank,
@@ -649,61 +750,15 @@ extern "C" int tc_jackpot_search(
     unsigned int* /*out_hashes_host*/, unsigned int* /*dbg*/,
     int* out_rt, int* out_ct)
 {
-  if (rank % FoldMma::Shape::kK) { fprintf(stderr,"tc_cutlass: rank %d not a multiple of %d\n", rank, (int)FoldMma::Shape::kK); return -3; }
-  // The register-fold geometry is specialized to the real config tile shape.
-  if (h != H || w != W) {
-    fprintf(stderr,"tc_cutlass: this geometry needs h=%d w=%d (got h=%d w=%d)\n",H,W,h,w); return -2; }
-
   if (!ensure_dev_bufs(m,n,k,h,w,nrow_off,ncol_off)) return -1;
   DevBufs& B = g_bufs;
-
-  size_t ntiles = (size_t)nrow_off * ncol_off;
   // a_noised==NULL => the noised matrices were generated GPU-side directly in
   // dA/dBt (gpu_prep.cu); skip the two 512MB H2D copies.
   if (a_noised)    cudaMemcpy(B.dA,a_noised,(size_t)m*k,cudaMemcpyHostToDevice);
   if (b_noised_t)  cudaMemcpy(B.dBt,b_noised_t,(size_t)n*k,cudaMemcpyHostToDevice);
-  cudaMemcpy(B.dpr,pat_rows,h*4,cudaMemcpyHostToDevice);
-  cudaMemcpy(B.dpc,pat_cols,w*4,cudaMemcpyHostToDevice);
-  cudaMemcpy(B.droff,row_off,nrow_off*4,cudaMemcpyHostToDevice);
-  cudaMemcpy(B.dcoff,col_off,ncol_off*4,cudaMemcpyHostToDevice);
-  uint32_t kw[8],bw[8]; words_from_le32(a_noise_seed32,kw); words_from_le32(bound_le32,bw);
-  cudaMemcpy(B.dk,kw,32,cudaMemcpyHostToDevice);
-  cudaMemcpy(B.db,bw,32,cudaMemcpyHostToDevice);
-  cudaMemset(B.df,0,4);
-
-  gather_rows<<<nrow_off*h, 256>>>(B.dA, B.dAp, k, B.droff, B.dpr, h, nrow_off);
-  gather_rows<<<ncol_off*w, 256>>>(B.dBt, B.dBtp, k, B.dcoff, B.dpc, w, ncol_off);
-
-  dim3 grid((ncol_off + CTOFF - 1)/CTOFF, (nrow_off + RTOFF - 1)/RTOFF);
-  size_t smem_bytes = sizeof(typename FoldMma::Base::SharedStorage) + (size_t)NJT*16*4;
-  static bool attr_set=false;
-  if (!attr_set) {
-    cudaError_t ae = cudaFuncSetAttribute(tc_cutlass_jackpot,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-    if (ae!=cudaSuccess) fprintf(stderr,"tc_cutlass: smem attr (%zu B) err %s\n", smem_bytes, cudaGetErrorString(ae));
-    attr_set=true;
-  }
-  cudaEvent_t e0,e1; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0);
-  tc_cutlass_jackpot<<<grid, TPB, smem_bytes>>>(
-      (const int8_t*)B.dAp,(const int8_t*)B.dBtp,k,rank,nrow_off,ncol_off,B.dk,B.db,B.df,B.dr,B.dc);
-  cudaError_t le = cudaGetLastError();
-  if (le!=cudaSuccess) fprintf(stderr,"tc_cutlass: LAUNCH err %s (tpb=%d, grid=%dx%d, smem=%zuB)\n",
-      cudaGetErrorString(le), TPB, grid.x, grid.y, smem_bytes);
-  cudaError_t err=cudaDeviceSynchronize();
-  cudaEventRecord(e1); cudaEventSynchronize(e1);
-  if (err==cudaSuccess) err=le;
-  float ms=0; cudaEventElapsedTime(&ms,e0,e1);
-  double work_hashes=(double)ntiles*h*w*(k-(k%rank));
-  fprintf(stderr,
-          "tc(cutlass2): TB=%dx%dx%d W=64x64 s%d FUSED %zu tiles, %.3f ms, %.2f TH/s\n",
-          BM, BN, (int)TBShape::kK, kStages, ntiles, ms, work_hashes / (ms * 1e-3) / 1e12);
-  if (err!=cudaSuccess) fprintf(stderr,"tc_cutlass: err %s\n",cudaGetErrorString(err));
-
-  int wf=0;
-  if (err==cudaSuccess){
-    cudaMemcpy(&wf,B.df,4,cudaMemcpyDeviceToHost);
-    if (wf){ cudaMemcpy(out_rt,B.dr,4,cudaMemcpyDeviceToHost); cudaMemcpy(out_ct,B.dc,4,cudaMemcpyDeviceToHost); }
-  }
-  cudaEventDestroy(e0); cudaEventDestroy(e1);
-  return (err==cudaSuccess) ? wf : -1;
+  int rc = tc_search_launch(m,n,k,rank,pat_rows,pat_cols,h,w,
+                            row_off,nrow_off,col_off,ncol_off,
+                            a_noise_seed32,bound_le32);
+  if (rc) return rc;
+  return tc_search_wait(out_rt, out_ct);
 }
