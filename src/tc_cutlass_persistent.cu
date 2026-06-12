@@ -79,25 +79,29 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
     typename FoldMma::IteratorB itB(paramsB, const_cast<int8_t*>(Btp), {kfold, N}, thread_idx,
                                     cutlass::MatrixCoord(0, bn_ * BN));
 
-    // Fold callback (same as v2)
+    // Fold callback (same as v2, generalized for any warp shape)
     auto fold = [&](typename FoldMma::FragmentC const& acc, int c) {
       const int32_t* f = reinterpret_cast<const int32_t*>(acc.data());
       uint32_t myx = 0;
       #pragma unroll
-      for (int jr = 0; jr < 8; ++jr) {
+      for (int jr = 0; jr < JR; ++jr) {
         const int m = jr >> 1, half = jr & 1;
         const int e0 = half*2, e1 = half*2 + 1;
         #pragma unroll
-        for (int jc = 0; jc < 4; ++jc) {
+        for (int jc = 0; jc < JC; ++jc) {
           const int n0 = jc*2, n1 = n0 + 1;
-          uint32_t x = (uint32_t)f[(m + n0*4)*4 + e0] ^ (uint32_t)f[(m + n0*4)*4 + e1]
-                     ^ (uint32_t)f[(m + n1*4)*4 + e0] ^ (uint32_t)f[(m + n1*4)*4 + e1];
+          uint32_t x = (uint32_t)f[(m + n0*ROW_ITERS)*4 + e0]
+                     ^ (uint32_t)f[(m + n0*ROW_ITERS)*4 + e1]
+                     ^ (uint32_t)f[(m + n1*ROW_ITERS)*4 + e0]
+                     ^ (uint32_t)f[(m + n1*ROW_ITERS)*4 + e1];
           x = __reduce_xor_sync(0xffffffffu, x);
-          if (lane == jr*4 + jc) myx = x;
+          if (lane == jr*JC + jc) myx = x;
         }
       }
-      const int jtrib = warp_m*8 + (lane >> 2);
-      const int jtcib = warp_n*4 + (lane & 3);
+      const int my_jr = lane / JC, my_jc = lane % JC;
+      if (my_jr >= JR) return;
+      const int jtrib = warp_m*JR + my_jr;
+      const int jtcib = warp_n*JC + my_jc;
       if (bi + jtrib < nrow_off && bj + jtcib < ncol_off) {
         const int local_jt = jtrib*CTOFF + jtcib;
         JPS(local_jt, c % 16) = rotl32d(JPS(local_jt, c % 16), 13) ^ myx;

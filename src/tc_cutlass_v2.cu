@@ -427,17 +427,23 @@ static_assert(sizeof(typename FoldMma::Base::SharedStorage) ==
               sizeof(typename Mma::Base::SharedStorage), "smem layout must match");
 
 // fold geometry is specialized to the real config jackpot tile (h=8, w=16)
-constexpr int BM    = TBShape::kM;     // 128
-constexpr int BN    = TBShape::kN;     // 256
+constexpr int BM    = TBShape::kM;     // 128 or 64
+constexpr int BN    = TBShape::kN;     // 256 or 128
 constexpr int H     = 8,  W = 16;
-constexpr int RTOFF = BM / H;          // jackpot-tile rows per block: 16
-constexpr int CTOFF = BN / W;          // jackpot-tile cols per block: 16
-constexpr int NJT   = RTOFF * CTOFF;   // 256
+constexpr int RTOFF = BM / H;          // jackpot-tile rows per block
+constexpr int CTOFF = BN / W;          // jackpot-tile cols per block
+constexpr int NJT   = RTOFF * CTOFF;
 constexpr int TPB   = 32 * Mma::WarpCount::kM * Mma::WarpCount::kN * Mma::WarpCount::kK;
 
-static_assert(Mma::WarpCount::kM == 2 && Mma::WarpCount::kN == 4 && Mma::WarpCount::kK == 1,
-              "fold mapping assumes a 2x4 warp grid (TB 128x256 / warp 64x64)");
-static_assert(TPB == 256, "kernel is written for 256 threads");
+// Compile-time fold parameters — derived from the warp shape, not hardcoded.
+// A warp covers WM x WN accumulators; each m16n8k32 mma produces a 16x8 sub-tile.
+constexpr int WM = WarpShape::kM;           // 64 or 32
+constexpr int WN = WarpShape::kN;           // 64 or 64
+constexpr int ROW_ITERS = WM / 16;          // 4 or 2  (mma sub-tile rows per warp)
+constexpr int JR = WM / H;                  // 8 or 4  (jackpot-tile row-bands per warp)
+constexpr int JC = WN / W;                  // 4 or 4  (jackpot-tile col-bands per warp)
+static_assert(JR * JC == 32 || JR * JC == 16,
+              "warp must cover 32 or 16 jackpot tiles (64x64 or 32x64)");
 
 // ---- blake3 jackpot hash + bound check (unchanged) --------------------------
 static __device__ __forceinline__ uint32_t rotr32(uint32_t x,int n){ return (x>>n)|(x<<(32-n)); }
@@ -560,30 +566,35 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
   // warp-local fold, LANE-DISTRIBUTED (ncu: the previous lane-0 serial RMW
   // chain was the top stall source — 55.9% of issue gaps were "execution pipe
   // oversubscribed", 31 lanes predicated off while lane 0 did 32 serial smem
-  // RMWs). A warp covers exactly 32 jackpot tiles (8 jr x 4 jc) and a warp has
-  // exactly 32 lanes, so: redux result of tile #it is claimed by lane #it into
-  // a register; after the 32-iteration loop ALL lanes do the rotl13-RMW of
-  // their own tile's transcript word in ONE parallel instruction. Removes the
-  // serial chain entirely; smem ops per fold: 64 lane-0 -> 2 warp-wide.
+  // RMWs). A warp covers exactly JR*JC jackpot tiles and a warp has exactly 32
+  // lanes. For baseline (64×64 warp, JR=8, JC=4) each lane owns 1 tile; for
+  // SMALL_TILE (32×64 warp, JR=4, JC=4) the first 16 lanes own 1 tile each and
+  // lanes 16-31 are idle. Redux result of tile #it is claimed by lane #it into
+  // a register; after the loop ALL active lanes do the rotl13-RMW of their own
+  // tile's transcript word in ONE parallel instruction.
   auto fold = [&](typename FoldMma::FragmentC const& acc, int c) {
     const int32_t* f = reinterpret_cast<const int32_t*>(acc.data());
     uint32_t myx = 0;                           // lane's claimed tile XOR
     #pragma unroll
-    for (int jr = 0; jr < 8; ++jr) {            // 8-row bands within warp's 64 rows
+    for (int jr = 0; jr < JR; ++jr) {           // JR row-bands within warp's WM rows
       const int m = jr >> 1, half = jr & 1;
       const int e0 = half*2, e1 = half*2 + 1;
       #pragma unroll
-      for (int jc = 0; jc < 4; ++jc) {          // 16-col bands within warp's 64 cols
+      for (int jc = 0; jc < JC; ++jc) {         // JC col-bands within warp's WN cols
         const int n0 = jc*2, n1 = n0 + 1;
-        uint32_t x = (uint32_t)f[(m + n0*4)*4 + e0] ^ (uint32_t)f[(m + n0*4)*4 + e1]
-                   ^ (uint32_t)f[(m + n1*4)*4 + e0] ^ (uint32_t)f[(m + n1*4)*4 + e1];
+        uint32_t x = (uint32_t)f[(m + n0*ROW_ITERS)*4 + e0]
+                   ^ (uint32_t)f[(m + n0*ROW_ITERS)*4 + e1]
+                   ^ (uint32_t)f[(m + n1*ROW_ITERS)*4 + e0]
+                   ^ (uint32_t)f[(m + n1*ROW_ITERS)*4 + e1];
         x = __reduce_xor_sync(0xffffffffu, x);  // broadcast to all lanes
-        if (lane == jr*4 + jc) myx = x;         // tile #it claimed by lane #it
+        if (lane == jr*JC + jc) myx = x;        // tile #it claimed by lane #it
       }
     }
-    // lane L owns tile (jr=L/4, jc=L%4): one warp-wide transcript RMW.
-    const int jtrib = warp_m*8 + (lane >> 2);
-    const int jtcib = warp_n*4 + (lane & 3);
+    // lane L owns tile (jr=L/JC, jc=L%JC); only active lanes write.
+    const int my_jr = lane / JC, my_jc = lane % JC;
+    if (my_jr >= JR) return;                    // idle lane (SMALL_TILE: lanes 16-31)
+    const int jtrib = warp_m*JR + my_jr;
+    const int jtcib = warp_n*JC + my_jc;
     if (bi + jtrib < nrow_off && bj + jtcib < ncol_off) {
       const int local_jt = jtrib*CTOFF + jtcib;
       JPS(local_jt, c % 16) = rotl32d(JPS(local_jt, c % 16), 13) ^ myx;
@@ -738,10 +749,10 @@ extern "C" int tc_search_wait(int* out_rt, int* out_ct)
   cudaError_t err = cudaStreamSynchronize(g_search_stream);
   if (g_miner_verbose) {
     float ms=0; cudaEventElapsedTime(&ms,g_se0,g_se1);
+    double ths = g_inflight_work / (ms * 1e-3) / 1e12;
     fprintf(stderr,
-            "tc(cutlass2): TB=%dx%dx%d W=64x64 s%d FUSED %zu tiles, %.3f ms, %.2f TH/s\n",
-            BM, BN, (int)TBShape::kK, kStages, g_inflight_tiles, ms,
-            g_inflight_work / (ms * 1e-3) / 1e12);
+            "tc(cutlass2): TB=%dx%dx%d W=%dx%d s%d T%d FUSED %zu tiles, %.3f ms, %.2f TH/s\n",
+            BM, BN, (int)TBShape::kK, WM, WN, kStages, TPB, g_inflight_tiles, ms, ths);
   }
   if (err!=cudaSuccess){ fprintf(stderr,"tc_cutlass: err %s\n",cudaGetErrorString(err)); return -1; }
 

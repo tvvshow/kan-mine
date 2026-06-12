@@ -3,7 +3,7 @@
 #
 # ONE fast path, no slow variants. This builds exactly what runs in production
 # and earns on the live pool:
-#   * CUTLASS fused int8 search kernel tc_cutlass_v2.cu (GROUPM=8, 108 TH/s kernel)
+#   * CUTLASS fused int8 search kernel tc_cutlass_v2.cu (GROUPM=128, 350+ TH/s kernel on 5090)
 #     + GPU-resident draw pipeline gpu_prep.cu  => 102+ TH/s wall-clock on a 3090
 #     (fallback when CUTLASS headers absent: tc_block.cu WMMA, ~30 TH/s)
 #   * BLAKE3 with SIMD asm (SSE2/SSE4.1/AVX2/AVX512), ~6x the portable scalar path
@@ -106,7 +106,7 @@ g++ -O3 -std=c++17 -I"${ROOT}/src" -I"${ROOT}/blake3" -I"${CUDA_HOME}/include" -
 # --- the ONE GPU kernel pair: CUTLASS fused search + GPU draw pipeline --------
 # tc_cutlass_v2.cu: CUTLASS 3.5.1 threadblock-level FoldMmaMultistage — IMMA
 #   m16n8k32 int8, TB 128x256x64, stages=3, fold callback every rank-chunk,
-#   redux.sync warp XOR, GROUPM=8 grouped raster (kernel 650 ms = 108 TH/s on
+#   redux.sync warp XOR, GROUPM=128 grouped raster (kernel 200 ms = 350+ TH/s on
 #   a 3090; POSTCHECK ok=1; live pool wall-clock 102+ TH/s, beats lpminer 91).
 # gpu_prep.cu: per-draw RNG fill + blake3 tree commitments + noise ON the GPU
 #   (10 ms vs 1490 ms CPU + 1 GB H2D). plainproof_gen auto-takes this path
@@ -115,7 +115,7 @@ g++ -O3 -std=c++17 -I"${ROOT}/src" -I"${ROOT}/blake3" -I"${CUDA_HOME}/include" -
 # Fallback: tc_block.cu (WMMA, ~30 TH/s) keeps GPU-less/CUTLASS-less builds alive.
 echo "=== fused tensor-core kernel ==="
 CUTLASS_HOME="${CUTLASS_HOME:-$HOME/cutlass}"
-GROUPM="${GROUPM:-8}"
+GROUPM="${GROUPM:-128}"
 SMALL_TILE="${SMALL_TILE:-}"
 PERSISTENT="${PERSISTENT:-}"
 EXTRA_FLAGS=""
