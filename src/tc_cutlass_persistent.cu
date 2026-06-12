@@ -94,7 +94,11 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
                      ^ (uint32_t)f[(m + n0*ROW_ITERS)*4 + e1]
                      ^ (uint32_t)f[(m + n1*ROW_ITERS)*4 + e0]
                      ^ (uint32_t)f[(m + n1*ROW_ITERS)*4 + e1];
-          x = __reduce_xor_sync(0xffffffffu, x);
+          x = __shfl_xor_sync(0xffffffffu, x, 16);
+          x = __shfl_xor_sync(0xffffffffu, x, 8);
+          x = __shfl_xor_sync(0xffffffffu, x, 4);
+          x = __shfl_xor_sync(0xffffffffu, x, 2);
+          x = __shfl_xor_sync(0xffffffffu, x, 1);
           if (lane == jr*JC + jc) myx = x;
         }
       }
