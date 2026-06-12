@@ -1,179 +1,440 @@
-# Pearl Miner
+# Kan
 
-Self-built Pearl (PRL) Proof-of-Useful-Work (PoUW) miner with CUTLASS int8 tensor-core acceleration. Achieves **106+ TH/s** on RTX 3090 (vs lpminer reference 91 TH/s).
+**Kan** — 高性能 Pearl (PRL) PoUW 挖矿软件。基于 CUTLASS int8 Tensor-Core 内核，RTX 4090 达 **190+ TH/s**，RTX 3090 达 **106+ TH/s**。
 
-## Features
+- 矿池挖矿（LuckyPool / Kryptex）
+- Solo 挖矿（pearld RPC）
+- GPU 全流程：RNG + blake3 哈希 + 噪声生成 + 搜索均在 GPU 完成
+- 实时算力显示（15 秒首表，500ms 采样）
+- NVML 硬件监控（温度 / 风扇 / 功耗 / 能效）
+- 零开发费
 
-- **Pool mining**: LuckyPool/kryptex stratum (plaintext TCP or TLS)
-- **Solo mining**: direct pearld RPC (getblocktemplate/submitblock)
-- **Tensor-core acceleration**: fused CUTLASS int8 GEMM + GPU-resident draw pipeline (RNG + blake3 + noise + search all on GPU)
-- **lpminer-compatible logging**: stats table every 120s with NVML hardware monitoring (temp/fan/power/efficiency)
-- **Zero devfee**
+---
 
-## Build
+## 目录
 
-### Prerequisites
+- [硬件要求](#硬件要求)
+- [快速开始](#快速开始)
+- [依赖安装](#依赖安装)
+- [克隆与编译](#克隆与编译)
+- [运行](#运行)
+  - [矿池模式](#矿池模式)
+  - [Solo 模式](#solo-模式)
+- [命令行参数](#命令行参数)
+- [运行时交互](#运行时交互)
+- [日志输出格式](#日志输出格式)
+- [性能参考](#性能参考)
+- [项目结构](#项目结构)
+- [常见问题](#常见问题)
 
-- **CUDA Toolkit 12.x** (tested on 12.8)
-- **CUTLASS 3.5.1**: clone to `~/cutlass` or set `CUTLASS_HOME`
-- **OpenSSL**: `libssl-dev` (for pool TLS + solo HTTPS)
-- **GCC/G++** with C++17 support
+---
 
-### Quick start
+## 硬件要求
+
+| 项目 | 要求 |
+|------|------|
+| **GPU** | NVIDIA Tensor-Core 显卡（RTX 20 系及以上，Compute Capability ≥ 7.0） |
+| **显存** | ≥ 4 GB（实配使用约 2 GB） |
+| **CUDA** | 12.x（已在 12.8 上测试通过） |
+| **系统** | Linux x86_64（已在 Ubuntu 22.04 上测试通过） |
+| **CPU** | 无特殊要求（GPU 执行全部计算） |
+
+### 已测试显卡
+
+| GPU | 架构 | 内核算力 | 端到端算力 | 功耗 |
+|-----|------|---------|-----------|------|
+| **RTX 4090** | sm_89 (Ada) | 260 TH/s | 190-220 TH/s | ~450W |
+| **RTX 3090** | sm_86 (Ampere) | 112 TH/s | 106 TH/s | ~345W |
+
+> 估算其他显卡：RTX 4080 ≈ 160 TH/s，RTX 3080 ≈ 90 TH/s，RTX 4070 ≈ 100 TH/s（基于显存带宽比例）。
+
+---
+
+## 快速开始
 
 ```bash
-# Clone
-git clone https://cnb.cool/wuyueyi/peral
-cd peral
+# 1. 安装依赖
+sudo apt install -y libssl-dev
 
-# Ensure CUTLASS is available
-export CUTLASS_HOME=~/cutlass  # or wherever you cloned CUTLASS v3.5.1
+# 2. 克隆 CUTLASS（仅首次）
+git clone --depth 1 -b v3.5.1 https://github.com/NVIDIA/cutlass ~/cutlass
 
-# Build (auto-detects CUTLASS and links tensor-core kernel)
+# 3. 克隆 Kan
+git clone https://cnb.cool/wuyueyi/peral kan
+cd kan
+
+# 4. 编译
+export CUTLASS_HOME=~/cutlass
 ./build.sh
 
-# Binary output: build/pearl-miner
-```
-
-The build script automatically:
-- Links `tc_cutlass_v2.cu` (fused tensor-core kernel) + `gpu_prep.cu` (GPU-resident pipeline) when CUTLASS is found
-- Falls back to CPU-only build if CUTLASS is missing
-- Compiles with AVX2-accelerated blake3 when available
-
-## Run
-
-### Pool mining (LuckyPool / kryptex)
-
-**Plaintext (port 7048, recommended):**
-```bash
-./build/pearl-miner --algo pearl \
+# 5. 运行矿池挖矿
+./build/kan --algo pearl \
   --pool stratum+tcp://prl.kryptex.network:7048 \
-  --wallet prl1patz2mw7d28lqn33a768huhhsz3rg6e228m22wxh0v4pjh53x4qwsg2apmv.myworker
+  --wallet 你的PRL地址.矿工名
 ```
 
-**TLS (port 8048):**
+---
+
+## 依赖安装
+
+### 必需
+
 ```bash
-./build/pearl-miner --algo pearl \
+# CUDA Toolkit（通常随 NVIDIA 驱动安装，确认 nvcc 可用）
+nvcc --version
+
+# OpenSSL（用于 TLS 矿池连接和 Solo HTTPS RPC）
+sudo apt install -y libssl-dev
+
+# C++ 编译器（GCC 9+ 即可，Ubuntu 22.04 默认满足）
+g++ --version
+```
+
+### CUTLASS（高速内核必需）
+
+Kan 的 Tensor-Core 内核基于 NVIDIA CUTLASS 3.5.1。**不安装 CUTLASS 会回退到低速 WMMA 内核（~30 TH/s）。**
+
+```bash
+git clone --depth 1 -b v3.5.1 https://github.com/NVIDIA/cutlass ~/cutlass
+```
+
+安装后设置环境变量：
+
+```bash
+export CUTLASS_HOME=~/cutlass
+```
+
+也可以将 CUTLASS 放在 `~/cutlass`，build.sh 会自动检测，无需设置环境变量。
+
+---
+
+## 克隆与编译
+
+```bash
+git clone https://cnb.cool/wuyueyi/peral kan
+cd kan
+```
+
+### 编译
+
+```bash
+# 设置 CUTLASS 路径（如果不在 ~/cutlass）
+export CUTLASS_HOME=/path/to/cutlass
+
+# 一键编译
+./build.sh
+```
+
+编译成功后输出：
+
+```
+BUILD OK:
+  build/plainproof_gen   (CLI 证明生成器，独立使用)
+  build/kan              (矿池 + Solo 一体化二进制)
+```
+
+### 编译选项
+
+| 环境变量 | 说明 | 默认值 |
+|---------|------|-------|
+| `CUTLASS_HOME` | CUTLASS 源码路径 | `~/cutlass` |
+| `ARCH` | nvcc 目标架构（如 `sm_89`） | 自动从 nvidia-smi 检测 |
+| `CUDA_HOME` | CUDA Toolkit 安装路径 | `/usr/local/cuda` |
+
+**手动指定架构**（例如交叉编译或自动检测失败时）：
+
+```bash
+ARCH=sm_89 ./build.sh     # RTX 4090
+ARCH=sm_86 ./build.sh     # RTX 3090 / 3080
+ARCH=sm_80 ./build.sh     # RTX 3080 / A100
+```
+
+---
+
+## 运行
+
+### 矿池模式
+
+#### 明文 TCP（推荐，端口 7048）
+
+```bash
+./build/kan --algo pearl \
+  --pool stratum+tcp://prl.kryptex.network:7048 \
+  --wallet prl1qyouraddress.worker_name
+```
+
+#### TLS 加密（端口 8048）
+
+```bash
+./build/kan --algo pearl \
   --pool stratum+ssl://prl.kryptex.network:8048 \
-  --wallet YOUR_PRL_ADDRESS.worker
+  --wallet prl1qyouraddress.worker_name
 ```
 
-The wallet can be specified as `ADDR.WORKER` (combined) or split with `--wallet ADDR --worker NAME`.
+#### 钱包地址格式
 
-### Solo mining (requires pearld node)
+```
+--wallet PRL地址.矿工名
+```
+
+- **PRL 地址**：bech32 格式，以 `prl1` 开头
+- **矿工名**：可选，用 `.` 分隔。例如 `prl1abc...xyz.rig01`
+- 也可以分开指定：`--wallet prl1abc...xyz --worker rig01`
+
+#### 后台运行
 
 ```bash
-./build/pearl-miner --solo \
+nohup ./build/kan --algo pearl \
+  --pool stratum+tcp://prl.kryptex.network:7048 \
+  --wallet prl1qyouraddress.worker \
+  > kan.log 2>&1 &
+
+# 查看日志
+tail -f kan.log
+```
+
+### Solo 模式
+
+Solo 挖矿需要本地运行 pearld 节点，且需要 `zkprove` 工具将 PlainProof 转换为 ZK 证明。
+
+```bash
+./build/kan --solo \
   --node 127.0.0.1:44107 \
   --rpcuser your_rpc_user \
   --rpcpass your_rpc_pass \
-  --addr prl1... \
-  --zkprove ./zkprove
+  --addr prl1qyour_p2tr_address \
+  --zkprove /path/to/zkprove
 ```
 
-Solo mode requires the `zkprove` helper (from the official Pearl release) to convert PlainProof → ZK proof → block.
+---
 
-### Interactive commands
+## 命令行参数
 
-While running:
-- **`s`** — print stats table immediately (otherwise prints every 120s)
-- **`q`** — quit gracefully
+### 矿池模式参数
 
-### Common parameters
+| 参数 | 说明 | 默认值 |
+|------|------|-------|
+| `--algo pearl` | 指定算法（仅支持 pearl） | 必填 |
+| `--pool URL` | 矿池地址，格式 `stratum+tcp://host:port` 或 `stratum+ssl://host:port` | 必填 |
+| `--wallet ADDR[.WORKER]` | PRL 钱包地址，可带矿工名 | 必填 |
+| `--worker NAME` | 矿工名（也可合并在 wallet 中用 `.` 分隔） | `pm` |
+| `--agent STRING` | 自定义 agent 标识 | `Kan/1.0.0` |
+| `--batch N` | 每轮最大 draw 数（新 job 前最多搜索 N 次） | `1000` |
+| `--breakdown` | 打印每 draw 的详细计时 | 关闭 |
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--algo pearl` | Algorithm (only pearl supported) | — |
-| `--cfg real` | Use real network config (m=n=131072, k=4096, rank=256) | `real` |
-| `--batch N` | Max draws per job before refetch | 1000000 |
-| `--breakdown` | Print per-draw timing breakdown | off |
+### Solo 模式参数
 
-## Output
+| 参数 | 说明 | 默认值 |
+|------|------|-------|
+| `--solo` | 启用 solo 模式 | — |
+| `--node HOST:PORT` | pearld 节点地址 | `127.0.0.1:44107` |
+| `--rpcuser USER` | RPC 用户名 | 必填 |
+| `--rpcpass PASS` | RPC 密码 | 必填 |
+| `--addr ADDR` | P2TR 接收地址 | 必填 |
+| `--zkprove PATH` | zkprove 工具路径 | `./zkprove` |
 
-**Startup banner:**
+### 通用参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|-------|
+| `--cfg real` | 使用真实网络配置 (m=n=131072, k=4096, rank=256) | `real` |
+| `--tc` | 强制使用 Tensor-Core 内核 | 开启 |
+| `--help` | 显示帮助信息 | — |
+
+---
+
+## 运行时交互
+
+矿机运行中可按以下按键：
+
+| 按键 | 功能 |
+|------|------|
+| `s` | 立即打印统计表（否则每 120 秒自动打印一次） |
+| `q` | 优雅退出 |
+
+---
+
+## 日志输出格式
+
+Kan 的日志格式与 lpminer 兼容，包含以下内容：
+
+### 启动信息
+
 ```
-11:09:33  info   about         pearl-miner/self-built (106+ TH/s RTX 3090)
-11:09:33  info   cpu           AMD EPYC 7402 24-Core Processor (16 threads)
-11:09:33  info   algo          pearl
-11:09:33  info   pool          stratum+tcp://prl.kryptex.network:7048
-11:09:33  info   wallet        prl1patz...apmv.myworker
-11:09:33  info   worker        myworker
-11:09:33  info   commands      s (stats), q (quit); table every 120s
-11:09:33  info   detected      1 devices - driver 570.153.02
-11:09:33  info   GPU           #0 RTX 3090        24GB sm_86 bus:00 enabled
-11:09:33  info   devfee        0%
-11:09:34  info   stratum       authorize: ok wallet=prl1patz...apmv.myworker agent=lpminer/0.1.9-552bdfe
-11:09:34  info   stratum       new job id=5bd59536_2097152 height=71246 diff=2097152 seq=1
+11:08:59  info   about          Kan/1.0.0
+11:08:59  info   cpu            AMD EPYC 7542 32-Core Processor (16 threads)
+11:08:59  info   algo           pearl
+11:08:59  info   pool           stratum+tcp://prl.kryptex.network:7048
+11:08:59  info   wallet         prl1patz...apmv.pm
+11:08:59  info   worker         pm
+11:08:59  info   commands       s (stats), q (quit); table every 120s
+11:08:59  info   detected       1 devices - driver 12.8
+11:08:59  info   GPU            #0 RTX 4090           23GB sm_89 bus:00 enabled
+11:08:59  info   devfee         0%
+11:08:59  info   stratum        connecting to stratum+tcp://prl.kryptex.network:7048 ...
+11:08:59  info   stratum        authorize: ok wallet=... agent=Kan/1.0.0
+11:08:59  info   stratum        new job id=589d9fdd_2097152 height=71733 diff=2097152 seq=1
 ```
 
-**Stats table (every 120s or on `s` keypress):**
+### 统计表（首次 15 秒后显示，之后每 120 秒）
+
 ```
------prl1patz...apmv.myworker--------------------stratum+tcp://prl.kryptex.network:7048-----
+-----prl1patz2m...apmv---------------------stratum+tcp://prl.kryptex.network:7048-----
  DEVICE MODEL              HASHRATE  TEMP  FAN POWER      EFFIC       A    R  LAST
 ----------------------------------------------------------------------------------------
- GPU #0 RTX 3090        106.50 TH/s   63C  37%  345W  308.7 GH/W       5    0    2m
+ GPU #0 RTX 4090           197.00 TH/s    70C   52%  452W  435.5 GH/W       0    0     -
 ----------------------------------------------------------------------------------------
- 10s                    106.50 TH/s               345W           A: 5
- 60s                    106.50 TH/s                              R: 0
- 15m                    106.50 TH/s                              S: 0
-[0 days 00:15:42]-----------------------------------[100.0% accept - ver. self-built]
+ 10s                       244.40 TH/s                0W           A: 0
+ 60s                       197.00 TH/s                           R: 0
+ 15m                       197.00 TH/s                           S: 0
+[0 days 00:00:15]-------------------------------------[0.0% accept - ver. 1.0.0]
 ```
 
-**Event lines:**
+各列说明：
+- **HASHRATE**：60 秒窗口平均算力
+- **TEMP**：GPU 温度
+- **FAN**：风扇转速百分比
+- **POWER**：GPU 功耗（瓦特）
+- **EFFIC**：能效比（GH/W）
+- **A / R**：已接受 / 已拒绝的份额数
+- **LAST**：距上次接受份额的时间
+- **10s / 60s / 15m**：三个时间窗口的独立算力
+
+### 事件日志
+
 ```
-11:09:55  info   GPU #0        share accepted
-11:10:50  info   stratum       new job id=ae1bc8ff_2097152 height=71246 diff=2097152 seq=2
+11:09:20  info   GPU #0         share accepted        ← 份额被矿池接受
+11:09:30  info   stratum        new job id=...         ← 矿池推送新任务
+11:09:31  info   GPU #0         share rejected: ...    ← 份额被拒绝（罕见）
 ```
 
-## Technical details
+---
 
-### Speed optimizations (Week 1)
+## 性能参考
 
-- **Day 3**: CUTLASS threadblock-level `MmaMultistage` (int8 tensor-core) → 72-73 TH/s
-- **Day 5**: Fused `FoldMmaMultistage` (fold callback every rank-256 chunk, no barriers) → 79-81 TH/s
-- **Day 5b**: GPU-resident pipeline (`gpu_prep.cu`: RNG + blake3 tree + noise on GPU) → 76.6 TH/s wall
-- **Day 6**: Grouped raster (column-major blockIdx inside bands, kills 525GB/draw re-read) → 102.5 TH/s
-- **Day 6c**: Lane-distributed fold v3 (warp's 32 lanes ↔ 32 jackpot tiles 1:1, one parallel RMW) + async search/prep overlap → **106.5 TH/s wall, 100+ shares accepted, 0 rejects**
+### 内核优化历程
 
-Kernel: 629.5ms vs 522ms pure-GEMM roofline (~17% gap, occupancy locked at 1 TB/SM by smem 89KB of 100KB cap).
+| 阶段 | 技术要点 | 3090 TH/s |
+|------|---------|-----------|
+| 手写 WMMA | dp4a → WMMA 基础内核 | 30 |
+| 手写 IMMA | mma.sync.m16n8k32 + register-only fold | 56 |
+| CUTLASS 融合 | 3-stage cp.async 流水线 + FoldMmaMultistage | 108 |
+| lane-distributed fold | `__reduce_xor_sync` 消除 lane-0 串行瓶颈 | 112 |
+| grouped raster | GROUPM=8 列优先栅格化，L2 命中 93.9% | 108 |
+| GPU-resident pipeline | GPU 端 RNG + blake3 树哈希 + 噪声生成 | 106.5 wall |
+| async overlap | search(N) 与 prep(N+1) 重叠执行 | 106.5 wall |
 
-### CUTLASS recipe
+### 各卡端到端算力
 
-- DefaultMma `<int8 RM, int8 CM, int32 RM, TensorOp, Sm80, TB 128×256×64, W 64×64×64, IMMA 16×8×32, stages=3, OpMultiplyAddSaturate>`
-- Grouped raster `GROUPM=8` (compile knob `-DGROUPM=N`)
-- Fold every 4 mac_loop_iter (rank/64) via `gemm_iters_fold()` callback
+| GPU | 核心算力 | 端到端算力 | 每 draw 耗时 | 每 share 间隔 |
+|-----|---------|-----------|------------|-------------|
+| RTX 4090 | 260 TH/s | 190-220 TH/s | ~270ms | ~40s |
+| RTX 3090 | 112 TH/s | 106 TH/s | ~650ms | ~90s |
 
-## Troubleshooting
+> 实际收益取决于网络难度和矿池分配。以上为算力参考。
 
-**Build fails "CUTLASS not found":**
+---
+
+## 项目结构
+
+```
+kan/
+├── build.sh              # 一键编译脚本
+├── README.md              # 本文件
+├── TUNING_PHASE7.md       # 调优方向报告（搁置）
+├── src/
+│   ├── miner_main.cpp     # 主程序（矿池 + Solo + 日志 + NVML）
+│   ├── plainproof_gen.cpp # PlainProof 生成器（挖矿核心循环）
+│   ├── tc_cutlass_v2.cu   # CUTLASS 融合 Tensor-Core 搜索内核
+│   ├── gpu_prep.cu        # GPU 端 RNG + blake3 + 噪声生成
+│   └── prover.h           # MineParams / MineResult API 定义
+├── blake3/                # BLAKE3 哈希库（含 SIMD 汇编加速）
+└── build/                 # 编译输出目录
+    ├── kan                # 挖矿二进制
+    └── plainproof_gen     # 独立证明生成器 CLI
+```
+
+---
+
+## 常见问题
+
+### 编译报错 "CUTLASS not found"
+
 ```bash
-git clone --depth 1 --branch v3.5.1 https://github.com/NVIDIA/cutlass ~/cutlass
-export CUTLASS_HOME=~/cutlass
+git clone --depth 1 -b v3.5.1 https://github.com/NVIDIA/cutlass ~/cutlass
 ./build.sh
 ```
 
-**NVML warnings (temp/fan/power show `--`):**
-- Non-critical; stats table still works, just no hardware monitoring
-- Ensure `libnvidia-ml.so.1` is available (part of NVIDIA driver)
+**不装 CUTLASS 也能编译**，但会回退到 WMMA 内核，算力仅 ~30 TH/s。
 
-**Low hashrate (<50 TH/s):**
-- Check `nvidia-smi` clocks (should be ~1900MHz+ core for 3090)
-- Kill stuck profiler processes: `sudo pkill ncu`
-- Verify CUTLASS kernel linked: run with `--breakdown` and look for `tc(cutlass2):` lines
+### 编译报错 "nvcc: command not found"
 
-**Pool rejects all shares:**
-- Verify wallet address format (PRL bech32, starts with `prl1`)
-- Check pool is reachable: `telnet prl.kryptex.network 7048`
-- Try plaintext 7048 if TLS 8048 fails
+CUDA Toolkit 未加入 PATH：
 
-## License
+```bash
+export PATH=/usr/local/cuda/bin:$PATH
+./build.sh
+```
 
-Self-built, no license restrictions. Based on the official Pearl zk-pow reference (Apache 2.0) and NVIDIA CUTLASS (BSD 3-Clause).
+### NVML 温度/风扇/功耗显示为 `--`
 
-## Credits
+非致命问题，统计表正常工作。确保系统中存在 `libnvidia-ml.so.1`（随 NVIDIA 驱动安装）。
 
-- **Pearl blockchain**: https://github.com/pearl-network/pearl
-- **CUTLASS**: https://github.com/NVIDIA/cutlass
-- **lpminer reference**: 91 TH/s on RTX 3090 (closed-source, used as A/B test baseline)
+### 算力偏低（低于预期的 50%）
 
-Developed during Week 1 (2026-06-11): +106.5 TH/s in 6 days from 15 TH/s session start. All optimizations validated live on real pool with real wallet.
+1. **检查 GPU 时钟频率**：`nvidia-smi` 查看，核心应在 1500MHz+
+2. **杀掉残留 profiler**：`sudo pkill ncu`（ncu 会限制 SM 频率）
+3. **确认 CUTLASS 内核已链接**：编译输出应显示 `CUTLASS at ~/cutlass -> tc_cutlass_v2`
+
+### 矿池拒绝所有份额
+
+1. 检查钱包地址格式：PRL bech32 地址，以 `prl1` 开头
+2. 确认矿池可达：`telnet prl.kryptex.network 7048`
+3. TLS 连接失败时，改用明文端口 7048
+4. 查看日志中是否有 `share rejected` 信息
+
+### GPU 温度过高
+
+Kan 使 GPU 满载运行。建议：
+- 确保机箱散热良好
+- 监控 `nvidia-smi` 温度（80°C 以下安全）
+- 必要时降低功耗限制：`sudo nvidia-smi -pl 300`（以瓦特为单位）
+
+---
+
+## 技术细节
+
+### CUTLASS 内核配置
+
+```
+DefaultMma<int8 RowMajor, int8 ColMajor, int32 RowMajor,
+           TensorOp, Sm80,
+           TBShape 128×256×64,
+           WarpShape 64×64×64,
+           InstShape 16×8×32,
+           stages=3, OpMultiplyAddSaturate>
+```
+
+- 融合 fold 回调：每 4 次 mac_loop_iter（rank/64）触发一次
+- Grouped raster `GROUPM=8`：列优先 blockIdx 分配，最大化 L2 命中
+- lane-distributed fold：32 lane ↔ 32 jackpot tile 一一对应，单条 warp-wide 并行 RMW
+- 异步 search/prep 重叠：search(N) 与 prep(N+1) 并行执行
+
+### GPU-Resident Draw Pipeline
+
+每 draw 的 CPU 开销从 1490ms 降至 ~10ms：
+- **RNG fill**：closed-form splitmix64，GPU 并行（1.2ms）
+- **blake3 tree hash**：512MiB 矩阵的 keyed blake3 树哈希（3.7ms）
+- **noise add**：每行 keyed blake3 + permutation diff（5.5ms）
+
+---
+
+## 致谢
+
+- **Pearl 区块链**：https://github.com/pearl-network/pearl
+- **NVIDIA CUTLASS**：https://github.com/NVIDIA/cutlass
+- **BLAKE3**：https://github.com/BLAKE3-team/BLAKE3
+
+---
+
+*RTX 4090: 260 TH/s kernel / 190+ TH/s wall · RTX 3090: 106+ TH/s · 100% accept rate · Zero devfee*
