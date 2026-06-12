@@ -190,35 +190,36 @@ verify:
 # ---- Cloud dev environment ----
 # 开机自动配置 CUDA 12.4 + gcc + CUTLASS，然后编译。
 # 开机完成后直接运行测试即可。
-dev:
-  docker:
-    image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-  runner:
-    tags: cnb:arch:amd64:gpu
-  stages:
-    - name: setup-env
-      script:
-        - apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates libssl-dev
-        - nvcc --version | tail -2
-        - g++ --version | head -1
-        - nvidia-smi -L || echo "no GPU"
-    - name: clone-cutlass
-      script:
-        - if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
-        - ls ~/cutlass/include/cutlass/cutlass.h && echo "CUTLASS OK"
-    - name: build
-      script:
-        - cd /workspace && bash build.sh
-    - name: ready
-      script:
-        - echo "=========================================="
-        - echo "  编译完成! 运行以下命令测试:"
-        - echo "=========================================="
-        - echo ""
-        - echo "  基准测试:"
-        - echo "    cd /workspace/build && ./plainproof_gen --mine --tc --cfg real --maxdraws 15 --breakdown"
-        - echo ""
-        - echo "  连接矿池:"
-        - echo "    cd /workspace/build && ./kan --algo pearl --pool stratum+tcp://prl.kryptex.network:7048 --wallet prl1patz2mw7d28lqn33a768huhhsz3rg6e228m22wxh0v4pjh53x4qwsg2apmv.pm --worker pm --batch 500 --cfg real --tc"
-        - echo ""
-        - ls -la /workspace/build/plainproof_gen /workspace/build/kan
+$:
+  vscode:
+    - docker:
+        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      services:
+        - vscode
+      stages:
+        - name: setup-env
+          script:
+            - apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates libssl-dev
+            - nvcc --version | tail -2
+            - g++ --version | head -1
+            - nvidia-smi -L || echo "no GPU"
+        - name: clone-cutlass
+          script:
+            - if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
+            - ls ~/cutlass/include/cutlass/cutlass.h && echo "CUTLASS OK"
+        - name: build
+          script:
+            - cd /workspace && bash build.sh
+        - name: ready
+          script:
+            - echo "=========================================="
+            - echo "  编译完成! 运行以下命令测试:"
+            - echo "=========================================="
+            - echo ""
+            - echo "  基准测试:"
+            - echo "    cd /workspace/build && ./plainproof_gen --mine --tc --cfg real --maxdraws 15 --breakdown"
+            - echo ""
+            - echo "  连接矿池:"
+            - echo "    cd /workspace/build && ./kan --algo pearl --pool stratum+tcp://prl.kryptex.network:7048 --wallet prl1patz2mw7d28lqn33a768huhhsz3rg6e228m22wxh0v4pjh53x4qwsg2apmv.pm --worker pm --batch 500 --cfg real --tc"
+            - echo ""
+            - ls -la /workspace/build/plainproof_gen /workspace/build/kan
