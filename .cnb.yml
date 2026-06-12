@@ -96,6 +96,8 @@ gpu:
       stages:
         - name: deps
           script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates
+        - name: cutlass
+          script: if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
         - name: gpu-info
           script: nvidia-smi
         - name: build
@@ -104,9 +106,10 @@ gpu:
         - name: cpu-verify
           # cheap CPU sanity gate before spending the GPU smoke run
           script: bash cpu_test.sh
-        - name: gpu-smoke
-          # dp4a kernel runs on the real GPU: --mine 20 at golden nbits -> win + PlainProof, rc 0
-          script: bash run_test.sh
+        - name: gpu-persist-ab
+          # grid-stride kernel rework gate: golden POSTCHECK ok=1 on the real GPU,
+          # then real-config standard vs TC_PERSIST=1 kernel-ms A/B (3 draws each)
+          script: bash gpu_persist_ab.sh
 
 # poolprobe (push to `poolprobe` branch) -> M1c pre-flight. Pure network, no mining.
 # Runs on the SAME GPU runner the hunt will use, so it tests the REAL egress path:
