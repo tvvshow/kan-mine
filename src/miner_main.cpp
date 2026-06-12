@@ -1,4 +1,4 @@
-// miner_main.cpp — unified Pearl(PRL) PoUW miner (lpminer-compatible logging)
+// miner_main.cpp — Kan: Pearl(PRL) PoUW miner
 #include "prover.h"
 #include <atomic>
 #include <chrono>
@@ -27,9 +27,11 @@
 #include <cuda_runtime.h>
 
 extern "C" { int g_miner_verbose = 0; }  // gate per-draw prints in plainproof_gen/tc_cutlass
+extern std::atomic<uint64_t> g_live_draw_count;  // incremented per-draw in plainproof_gen
+extern double g_work_per_draw_export;  // set by plainproof_gen before draw loop starts
 
 // ===========================================================================
-// lpminer-style logger
+// lpminer-compatible logger
 // ===========================================================================
 static void log_line(const char* cat, const char* msg) {
   time_t t = time(nullptr);
@@ -94,28 +96,31 @@ static std::atomic<double> g_work_per_draw{0.0};
 static std::chrono::steady_clock::time_point g_start = std::chrono::steady_clock::now();
 static std::chrono::steady_clock::time_point g_last_share = g_start;
 static std::mutex g_stat_mu;
-struct DrawTick { std::chrono::steady_clock::time_point t; uint64_t draws; };
-static std::deque<DrawTick> g_ticks;
-static void tick_draw(uint64_t draws) {
+struct Sample { std::chrono::steady_clock::time_point t; uint64_t draws; };
+static std::deque<Sample> g_samples;
+static void sample_draws() {
   auto now = std::chrono::steady_clock::now();
+  uint64_t d = g_live_draw_count.load(std::memory_order_relaxed);
   std::lock_guard<std::mutex> lk(g_stat_mu);
-  g_ticks.push_back({now, draws});
-  while (!g_ticks.empty()) {
-    auto dt = std::chrono::duration<double>(now - g_ticks.front().t).count();
-    if (dt < 900.0) break;
-    g_ticks.pop_front();
-  }
+  g_samples.push_back({now, d});
+  while (g_samples.size() > 960) g_samples.pop_front();
 }
 static double window_ths(double win_s) {
   auto now = std::chrono::steady_clock::now();
+  auto cutoff = now - std::chrono::duration<double>(win_s);
   std::lock_guard<std::mutex> lk(g_stat_mu);
-  if (g_ticks.empty()) return 0.0;
-  uint64_t d0 = g_ticks.front().draws, d1 = g_ticks.back().draws;
-  double t0 = std::chrono::duration<double>(now - g_ticks.front().t).count();
-  if (t0 < 1.0) return 0.0;
-  double wpd = g_work_per_draw.load();
+  if (g_samples.size() < 2) return 0.0;
+  const Sample* s0 = nullptr;
+  for (auto& s : g_samples) {
+    if (s.t >= cutoff) { s0 = &s; break; }
+  }
+  if (!s0) s0 = &g_samples.front();
+  const Sample& s1 = g_samples.back();
+  double dt = std::chrono::duration<double>(now - s0->t).count();
+  if (dt < 0.5) return 0.0;
+  double wpd = g_work_per_draw_export > 0.0 ? g_work_per_draw_export : g_work_per_draw.load();
   if (wpd == 0.0) return 0.0;
-  return (double)(d1 - d0) * wpd / t0 / 1e12;
+  return (double)(s1.draws - s0->draws) * wpd / dt / 1e12;
 }
 static void print_stats(const std::string& wallet, const std::string& pool_url) {
   auto now = std::chrono::steady_clock::now();
@@ -156,7 +161,7 @@ static void print_stats(const std::string& wallet, const std::string& pool_url) 
   fprintf(stderr, " 60s                   %10.2f TH/s                           R: %llu\n", ths_60, (unsigned long long)rej);
   fprintf(stderr, " 15m                   %10.2f TH/s                           S: 0\n", ths_15m);
   double acc_pct = (acc + rej > 0) ? 100.0 * (double)acc / (double)(acc + rej) : 0.0;
-  fprintf(stderr, "[%d days %02d:%02d:%02d]-------------------------------------[%.1f%% accept - ver. self-built]\n",
+  fprintf(stderr, "[%d days %02d:%02d:%02d]-------------------------------------[%.1f%% accept - ver. 1.0.0]\n",
           up_d, up_h, up_m, up_sec, acc_pct);
   fprintf(stderr, "\n");
 }
@@ -294,7 +299,7 @@ struct PoolOpts {
   bool use_tls = false;
   std::string wallet = "prl1patz2mw7d28lqn33a768huhhsz3rg6e228m22wxh0v4pjh53x4qwsg2apmv";
   std::string worker = "pm";
-  std::string agent = "lpminer/0.1.9-552bdfe";
+  std::string agent = "Kan/1.0.0";
   uint64_t batch = 1000;
   bool real_cfg = true;
   bool use_tc = true;
@@ -421,13 +426,16 @@ static int run_pool(const PoolOpts& o) {
   std::atomic<bool> stop_attempt{false};
   std::atomic<bool> stats_req{false};
   std::thread stats_th([&]() {
+    bool first_print = true;
     auto last_print = std::chrono::steady_clock::now();
     while (!st.stop.load()) {
       auto now = std::chrono::steady_clock::now();
       double dt = std::chrono::duration<double>(now - last_print).count();
-      if (stats_req.load() || dt >= 120.0) {
+      sample_draws();
+      if (stats_req.load() || (first_print && dt >= 15.0) || (!first_print && dt >= 120.0)) {
         print_stats(o.wallet, proto + o.host + ":" + std::to_string(o.port));
         last_print = now;
+        first_print = false;
         stats_req.store(false);
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -459,7 +467,6 @@ static int run_pool(const PoolOpts& o) {
     if (R.draws > 0 && R.work_per_draw > 0.0) {
       g_total_draws.fetch_add(R.draws);
       g_work_per_draw.store(R.work_per_draw);
-      tick_draw(g_total_draws.load());
     }
 
     bool fresh;
@@ -642,7 +649,6 @@ static int run_solo(const SoloOpts& o) {
     if (R.draws > 0 && R.work_per_draw > 0.0) {
       g_total_draws.fetch_add(R.draws);
       g_work_per_draw.store(R.work_per_draw);
-      tick_draw(g_total_draws.load());
     }
     if (mrc != 0 || !R.found) continue;
     if (!write_file(pp_path, R.proof_b64)) { log_line("solo", "cannot write proof file"); continue; }
@@ -673,7 +679,7 @@ static int run_solo(const SoloOpts& o) {
 // main
 // ===========================================================================
 static void banner() {
-  log_line("about", "pearl-miner/self-built");
+  log_line("about", "Kan/1.0.0");
   FILE* f = fopen("/proc/cpuinfo", "r");
   if (f) {
     char line[256], model[128] = "CPU";
@@ -697,9 +703,9 @@ static void banner() {
 }
 static void usage() {
   fprintf(stderr,
-    "pearl-miner — self-built Pearl(PRL) PoUW miner (lpminer-compatible)\n\n"
-    "  pearl-miner --algo pearl --pool URL --wallet ADDR[.WORKER]\n"
-    "  pearl-miner --solo --node host:port --rpcuser U --rpcpass P --addr <p2tr>\n\n"
+    "kan — Kan Pearl(PRL) PoUW miner\n\n"
+    "  kan --algo pearl --pool URL --wallet ADDR[.WORKER]\n"
+    "  kan --solo --node host:port --rpcuser U --rpcpass P --addr <p2tr>\n\n"
     "pool URL:  stratum+ssl://host:port  or  stratum+tcp://host:port\n"
     "commands:  s (stats now), q (quit); table prints every 120s\n");
 }
@@ -728,7 +734,6 @@ int main(int argc, char** argv) {
     }
     else if (a == "--worker") po.worker = next();
     else if (a == "--agent") po.agent = next();
-    else if (a == "--hs") po.hs = atoll(next().c_str());
     else if (a == "--batch") po.batch = so.batch = strtoull(next("1000").c_str(), nullptr, 10);
     else if (a == "--cfg") { std::string c = next("real"); po.real_cfg = so.real_cfg = (c == "real"); }
     else if (a == "--tc") po.use_tc = so.use_tc = true;
@@ -788,19 +793,25 @@ int main(int argc, char** argv) {
     if (g_nvml.ok) {
       unsigned cnt = 0;
       g_nvml.DeviceGetCount(&cnt);
-      int drv_maj = 0, drv_min = 0;
-      if (cudaDriverGetVersion) {
-        int v = 0;
-        cudaDriverGetVersion(&v);
-        drv_maj = v / 1000;
-        drv_min = (v % 1000) / 10;
-      }
-      log_linef("detected", "%u devices - driver %d.%d", cnt, drv_maj, drv_min);
+      // Full driver version string from NVML
+      int nvml_drv_ver = 0;
+      char drv_str[32] = "N/A";
+      // Try to get driver version from CUDA API as fallback
+      int cuda_drv = 0;
+      cudaDriverGetVersion(&cuda_drv);
+      snprintf(drv_str, sizeof(drv_str), "%d.%d", cuda_drv / 1000, (cuda_drv % 1000) / 10);
+      log_linef("detected", "%u devices - driver %s", cnt, drv_str);
       for (unsigned i = 0; i < cnt && i < 16; i++) {
         GPUInfo gi;
         g_nvml.DeviceGetHandleByIndex(i, &gi.handle);
         if (gi.handle) {
           g_nvml.DeviceGetName(gi.handle, gi.name, sizeof(gi.name));
+          // Shorten GPU name: "NVIDIA GeForce RTX 4090" → "RTX 4090"
+          const char* shortname = gi.name;
+          if (strncmp(shortname, "NVIDIA GeForce ", 15) == 0) shortname += 15;
+          else if (strncmp(shortname, "NVIDIA ", 7) == 0) shortname += 7;
+          // Overwrite gi.name with short version for stats table
+          if (shortname != gi.name) memmove(gi.name, shortname, strlen(shortname)+1);
           struct { unsigned long long free, total, used; } mem{};
           g_nvml.DeviceGetMemoryInfo(gi.handle, &mem);
           gi.vram_mb = mem.total / (1024*1024);
@@ -808,14 +819,14 @@ int main(int argc, char** argv) {
           struct { char busId[16]; unsigned domain, bus, device; } pci{};
           g_nvml.DeviceGetPciInfo(gi.handle, &pci);
           gi.bus = pci.bus;
-          log_linef("GPU", "#%u %-16s %lluGB sm_%d%d bus:%02x enabled",
+          log_linef("GPU", "#%u %-18s %lluGB sm_%d%d bus:%02x enabled",
                     i, gi.name, gi.vram_mb/1024, gi.sm_maj, gi.sm_min, gi.bus);
         }
         g_gpus.push_back(gi);
       }
     } else {
       log_line("detected", "1 devices - driver N/A");
-      log_line("GPU", "#0 GPU            N/A sm_xx bus:00 enabled");
+      log_line("GPU", "#0 GPU              N/A sm_xx bus:00 enabled");
       g_gpus.push_back({});
     }
     log_line("devfee", "0%");

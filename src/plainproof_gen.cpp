@@ -24,6 +24,7 @@
 #include <random>
 #include <algorithm>
 #include <chrono>
+#include <atomic>
 #include <thread>
 #ifdef _OPENMP
 #include <omp.h>
@@ -32,8 +33,16 @@
 extern "C" {
 #include "blake3.h"
 #include "blake3_impl.h"
+#ifndef PROVER_LIB
 int g_miner_verbose = 1;  // default ON for standalone plainproof_gen CLI
+#else
+extern int g_miner_verbose;  // defined in miner_main.cpp
+#endif
 }
+// Live draw counter for real-time hashrate display (sampled by miner_main stats thread)
+std::atomic<uint64_t> g_live_draw_count{0};
+// Exported work_per_draw so stats thread can show hashrate before first batch returns
+double g_work_per_draw_export = 0;
 // gpu_draw.h deliberately NOT included: gpu_produce_draw is unused here until
 // Week4 GPU-RNG lands, and pulling <cuda_runtime.h> into this TU breaks the
 // host-only build (CUDA-13 headers are C++-template-heavy).
@@ -930,9 +939,11 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         size_t dot_len = k - (k % rank);
         uint64_t factor = (uint64_t)h * wsz * dot_len;
         bound = mul_u256_u64_saturate(target_le, factor);
-        fprintf(stderr, "TARGET bound (LE hex)=");
-        for (int i = 31; i >= 0; i--) fprintf(stderr, "%02x", bound.b[i]);
-        fprintf(stderr, " (factor=%llu)\n", (unsigned long long)factor);
+        if (g_miner_verbose) {
+            fprintf(stderr, "TARGET bound (LE hex)=");
+            for (int i = 31; i >= 0; i--) fprintf(stderr, "%02x", bound.b[i]);
+            fprintf(stderr, " (factor=%llu)\n", (unsigned long long)factor);
+        }
     }
 
     // We need noise rows of A only for a_rows we test, and noise cols of B for b_cols.
@@ -1021,6 +1032,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
             (double)row_parts.size() * (double)col_parts.size() *
             (double)hh * (double)ww * (double)(k - (k % rank));
         R.work_per_draw = work_per_draw;
+        g_work_per_draw_export = work_per_draw;  // for miner_main stats before first batch
         auto ths_for = [&](uint64_t draws_done, double seconds) -> double {
             return seconds > 0.0 ? (double)draws_done * work_per_draw / seconds / 1e12 : 0.0;
         };
@@ -1121,7 +1133,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                           (int)row_parts.size(),(int)col_parts.size(),
                           &g_dA,&g_dBt) == 0) {
             gpu_pipe = true;
-            fprintf(stderr, "MINE: GPU-resident draw pipeline ACTIVE (RNG+hash+noise on GPU, no per-draw H2D)\n");
+            if (g_miner_verbose) fprintf(stderr, "MINE: GPU-resident draw pipeline ACTIVE (RNG+hash+noise on GPU, no per-draw H2D)\n");
         }
         if (gpu_pipe) {
             std::vector<unsigned int> perm_fa((size_t)k*2), perm_fb((size_t)k*2);
@@ -1133,7 +1145,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                 if (gpu_prep_phase1(g_dA, g_dBt, (int)m,(int)n,(int)k, seed, d,
                                     job_key.data(), hash_a.data(), hash_b.data(),
                                     &ms_rng, &ms_hash)) {
-                    fprintf(stderr, "MINE: gpu_prep_phase1 failed at draw=%llu\n", (unsigned long long)d);
+                    if (g_miner_verbose) fprintf(stderr, "MINE: gpu_prep_phase1 failed at draw=%llu\n", (unsigned long long)d);
                     return 2;
                 }
                 { uint8_t si[64];
@@ -1149,23 +1161,23 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                                     a_noise_seed.data(), b_noise_seed.data(),
                                     seed_a_label.data(), seed_b_label.data(),
                                     perm_fa.data(), perm_fb.data(), &ms_noise)) {
-                    fprintf(stderr, "MINE: gpu_prep_phase2 failed at draw=%llu\n", (unsigned long long)d);
+                    if (g_miner_verbose) fprintf(stderr, "MINE: gpu_prep_phase2 failed at draw=%llu\n", (unsigned long long)d);
                     return 2;
                 }
-                if (breakdown || d == 5)
+                if (g_miner_verbose && (breakdown || d == 5))
                     fprintf(stderr, "GPUPREP draw=%llu (ms): rng=%.1f hash=%.1f noise=%.1f\n",
                             (unsigned long long)d, ms_rng, ms_hash, ms_noise);
                 return 0;
             };
 
             const bool async_split = (tc_search_launch && tc_search_wait);
-            if (async_split)
+            if (async_split && g_miner_verbose)
                 fprintf(stderr, "MINE: async search/prep overlap ACTIVE (prep N+1 under search N)\n");
 
             // Prime: prep draw 0 (GPU idle, runs at full speed).
             if (maxdraws > 0 && !stopping() && gpu_prep_draw(0)) return 2;
             for (draw = 0; draw < maxdraws; draw++) {
-                if (stopping()) { fprintf(stderr, "MINE abort: stop requested at draw=%llu\n", (unsigned long long)draw); break; }
+                if (stopping()) { if (g_miner_verbose) fprintf(stderr, "MINE abort: stop requested at draw=%llu\n", (unsigned long long)draw); break; }
 
                 int rt=-1, ct=-1, ok;
                 if (async_split) {
@@ -1180,7 +1192,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                                          row_off.data(),(int)row_parts.size(),
                                          col_off.data(),(int)col_parts.size(),
                                          a_noise_seed.data(), bound.b)) {
-                        fprintf(stderr, "MINE: kernel launch error at draw=%llu\n", (unsigned long long)draw); return 2;
+                        if (g_miner_verbose) fprintf(stderr, "MINE: kernel launch error at draw=%llu\n", (unsigned long long)draw); return 2;
                     }
                     uint64_t nd = draw + 1;
                     if (nd < maxdraws && !stopping()) {
@@ -1198,6 +1210,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                     uint64_t nd = draw + 1;
                     if (ok == 0 && nd < maxdraws && !stopping() && gpu_prep_draw(nd)) return 2;
                 }
+                g_live_draw_count.fetch_add(1, std::memory_order_relaxed);
                 if (ok==1 && rt>=0 && ct>=0) {
                     // Re-derive draw N fully on the CPU: restores A/Bt/padded/
                     // seeds/perms for POSTCHECK + Merkle (the shared host vars
@@ -1205,11 +1218,11 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                     // POSTCHECK is the GPU-vs-CPU equivalence gate.
                     produce_draw(draw, 0, false);
                     found=true; win_rows=row_parts[(size_t)rt]; win_cols=col_parts[(size_t)ct];
-                    fprintf(stderr, "MINE WIN draw=%llu tile rt=%d ct=%d\n",
+                    if (g_miner_verbose) fprintf(stderr, "MINE WIN draw=%llu tile rt=%d ct=%d\n",
                             (unsigned long long)(draw+1), rt, ct);
                     break;
                 }
-                if (ok < 0) { fprintf(stderr, "MINE: kernel error at draw=%llu\n", (unsigned long long)draw); return 2; }
+                if (ok < 0) { if (g_miner_verbose) fprintf(stderr, "MINE: kernel error at draw=%llu\n", (unsigned long long)draw); return 2; }
 
                 uint64_t done = draw + 1;
                 auto t_now = clk::now();
@@ -1265,13 +1278,14 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                 fprintf(stderr, "BREAKDOWN draw=%llu GPU=%.2f ms (kernel=%.2f) [CPU(N+1) overlapped]\n",
                         (unsigned long long)draw, ms_gpu, (double)kms);
 
+            g_live_draw_count.fetch_add(1, std::memory_order_relaxed);
             if (ok==1 && rt>=0 && ct>=0) {
                 // The producer already advanced shared A/Bt/e_ar_t/e_bl/seeds to
                 // draw nd; re-run draw N to restore byte-exact state for the
                 // POSTCHECK + Merkle proof assembly that follows the loop.
                 produce_draw(draw, cur, false);
                 found=true; win_rows=row_parts[(size_t)rt]; win_cols=col_parts[(size_t)ct];
-                fprintf(stderr, "MINE WIN draw=%llu tile rt=%d ct=%d\n",
+                if (g_miner_verbose) fprintf(stderr, "MINE WIN draw=%llu tile rt=%d ct=%d\n",
                         (unsigned long long)(draw+1), rt, ct);
                 break;
             }
@@ -1300,10 +1314,11 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         uint64_t draws_done = found ? (draw + 1) : draw;
         R.draws = draws_done;
         R.elapsed_s = el;
-        fprintf(stderr, "MINE done: draws=%llu elapsed=%.2fs %.2f draws/sec %.2f TH/s found=%d\n",
-                (unsigned long long)draws_done, el,
-                (double)draws_done/(el>0?el:1),
-                ths_for(draws_done, el), found?1:0);
+        if (g_miner_verbose)
+            fprintf(stderr, "MINE done: draws=%llu elapsed=%.2fs %.2f draws/sec %.2f TH/s found=%d\n",
+                    (unsigned long long)draws_done, el,
+                    (double)draws_done/(el>0?el:1),
+                    ths_for(draws_done, el), found?1:0);
     } else if (use_tc) {
         std::vector<signed char> a_noised((size_t)m*k), b_noised_t((size_t)n*k);
         for (size_t row=0; row<m; row++){ const auto& na=get_noise_a(row); for(size_t l=0;l<k;l++) a_noised[row*k+l]=(signed char)((int)A[row*k+l]+(int)na[l]); }
@@ -1318,9 +1333,9 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                                    nullptr, nullptr, &rt, &ct);
         if (ok==1 && rt>=0 && ct>=0) {
             found=true; win_rows=row_parts[(size_t)rt]; win_cols=col_parts[(size_t)ct];
-            fprintf(stderr, "TC WIN tile rt=%d ct=%d\n", rt, ct);
+            if (g_miner_verbose) fprintf(stderr, "TC WIN tile rt=%d ct=%d\n", rt, ct);
         } else {
-            fprintf(stderr, "TC search: no win (ok=%d)\n", ok);
+            if (g_miner_verbose) fprintf(stderr, "TC search: no win (ok=%d)\n", ok);
         }
     } else if (probe) {
         // Probe: emit a structurally-valid proof for the FIRST tile without searching
@@ -1384,15 +1399,17 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
     }
 
     if (!found) {
-        fprintf(stderr, "No winning tile found with seed %llu\n", (unsigned long long)seed);
+        if (g_miner_verbose) fprintf(stderr, "No winning tile found with seed %llu\n", (unsigned long long)seed);
         return 2;
     }
 
-    fprintf(stderr, "WIN rows=[");
-    for (size_t i=0;i<win_rows.size();i++) fprintf(stderr, "%zu%s", win_rows[i], i+1<win_rows.size()?", ":"");
-    fprintf(stderr, "] cols=[");
-    for (size_t i=0;i<win_cols.size();i++) fprintf(stderr, "%zu%s", win_cols[i], i+1<win_cols.size()?", ":"");
-    fprintf(stderr, "]\n");
+    if (g_miner_verbose) {
+        fprintf(stderr, "WIN rows=[");
+        for (size_t i=0;i<win_rows.size();i++) fprintf(stderr, "%zu%s", win_rows[i], i+1<win_rows.size()?", ":"");
+        fprintf(stderr, "] cols=[");
+        for (size_t i=0;i<win_cols.size();i++) fprintf(stderr, "%zu%s", win_cols[i], i+1<win_cols.size()?", ":"");
+        fprintf(stderr, "]\n");
+    }
 
     // Final CPU ground-truth gate for any real mined win.  --probe intentionally
     // emits a structurally-valid but non-winning proof, so it is excluded.
@@ -1403,13 +1420,15 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
             seed_a_label, seed_b_label, a_noise_seed, b_noise_seed, post_jackpot);
         U256 post_v = U256::from_le(post_hash.data());
         const bool post_ok = post_v.le(bound);
-        fprintf(stderr, "POSTCHECK jackpot=");
-        for (int i = 0; i < 16; i++) fprintf(stderr, "%08x%s", post_jackpot[i], i+1<16?",":"");
-        fprintf(stderr, " hash_u256_be=");
-        fprint_digest_be_as_u256(stderr, post_hash);
-        fprintf(stderr, " bound_be=");
-        fprint_u256_be(stderr, bound);
-        fprintf(stderr, " ok=%d\n", post_ok ? 1 : 0);
+        if (g_miner_verbose) {
+            fprintf(stderr, "POSTCHECK jackpot=");
+            for (int i = 0; i < 16; i++) fprintf(stderr, "%08x%s", post_jackpot[i], i+1<16?",":"");
+            fprintf(stderr, " hash_u256_be=");
+            fprint_digest_be_as_u256(stderr, post_hash);
+            fprintf(stderr, " bound_be=");
+            fprint_u256_be(stderr, bound);
+            fprintf(stderr, " ok=%d\n", post_ok ? 1 : 0);
+        }
         if (!post_ok) {
             fprintf(stderr, "ERROR: GPU/driver reported a win, but CPU postcheck says it does not meet the active target; refusing to emit a pool-rejected proof.\n");
             return 4;
@@ -1441,9 +1460,11 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
 
     // header hex for verifier
     {
-        fprintf(stderr, "HEADER_HEX=");
-        for (uint8_t x : header_bytes) fprintf(stderr, "%02x", x);
-        fprintf(stderr, "\n");
+        if (g_miner_verbose) {
+            fprintf(stderr, "HEADER_HEX=");
+            for (uint8_t x : header_bytes) fprintf(stderr, "%02x", x);
+            fprintf(stderr, "\n");
+        }
     }
 
     if (dump) {

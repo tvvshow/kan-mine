@@ -137,12 +137,12 @@ g++ -O3 -fopenmp plainproof_gen.o ${BL_OBJ} ${TC_OBJ} \
   -L"${CUDA_HOME}/lib64" -lcudart -o plainproof_gen
 ls -la "${BUILD}/plainproof_gen"
 
-echo "=== link: pearl-miner (unified pool + solo) ==="
+echo "=== link: kan (unified pool + solo) ==="
 # OpenSSL for solo HTTPS RPC; pthread for the stratum/poller threads.
 # shellcheck disable=SC2086
 g++ -O3 -fopenmp miner_main.o prover_lib.o ${BL_OBJ} ${TC_OBJ} \
-  -L"${CUDA_HOME}/lib64" -lcudart -lssl -lcrypto -lpthread -o pearl-miner
-ls -la "${BUILD}/pearl-miner"
+  -L"${CUDA_HOME}/lib64" -lcudart -lssl -lcrypto -lpthread -o kan
+ls -la "${BUILD}/kan"
 
 # --- zkprove (Rust): SOLO-only PlainProof -> ZK proof -> block helper ---------
 # Needs cargo (Rust). The C++ binaries above do NOT need it; only `--solo` calls
@@ -165,7 +165,7 @@ fi
 echo ""
 echo "BUILD OK:"
 echo "  ${BUILD}/plainproof_gen   (CLI proof generator)"
-echo "  ${BUILD}/pearl-miner      (unified: --pool / --solo)"
+echo "  ${BUILD}/kan              (unified: --pool / --solo)"
 if [ -x "${BUILD}/zkprove" ]; then
   echo "  ${BUILD}/zkprove          (solo ZK-proof + block assembly)"
 fi

@@ -34,6 +34,8 @@
 #include <cstdint>
 #include <cstdio>
 
+extern "C" int g_miner_verbose;  // defined in miner_main.cpp (or plainproof_gen for standalone)
+
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/mma.h"
@@ -631,8 +633,9 @@ static bool ensure_dev_bufs(int m, int n, int k, int h, int w, int nrow_off, int
       g_bufs.ok=false; return false;
     }
     g_bufs.ok=true;
-    fprintf(stderr,"tc_cutlass: persistent device buffers allocated (%zu MB)\n",
-            ((size_t)m*k+(size_t)n*k+apk+bpk)/1024/1024);
+    if (g_miner_verbose)
+        fprintf(stderr,"tc_cutlass: persistent device buffers allocated (%zu MB)\n",
+                ((size_t)m*k+(size_t)n*k+apk+bpk)/1024/1024);
   }
   return true;
 }
@@ -723,8 +726,6 @@ extern "C" int tc_search_launch(
   }
   return 0;
 }
-
-extern "C" int g_miner_verbose;
 
 extern "C" int tc_search_wait(int* out_rt, int* out_ct)
 {
