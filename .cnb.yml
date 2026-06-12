@@ -95,7 +95,7 @@ gpu:
         tags: cnb:arch:amd64:gpu        # H20 (sm_90); change to :gpu:L40 / :gpu:L20 if that's what was granted
       stages:
         - name: deps
-          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates
+          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates libssl-dev
         - name: cutlass
           script: if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
         - name: gpu-info
