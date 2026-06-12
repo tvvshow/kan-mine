@@ -98,7 +98,7 @@ SMALL_TILE=1 GROUPM=16 ./build.sh
 
 ## 未实施优化（Phase 8）
 
-### ⏸️ Persistent Scheduler（ROI 中，成本高）
+### 🔄 Persistent Scheduler（ROI 中，成本高）
 
 **原理**：lpminer 使用 `StaticPersistentTileScheduler`
 - gridDim = N_SM，每个 TB 循环 `tile_idx += gridDim`
@@ -108,7 +108,24 @@ SMALL_TILE=1 GROUPM=16 ./build.sh
 
 **成本**：需要重写 CUTLASS host wrapper
 
-**优先级**：仅当路径 1-3 达到 300+ TH/s 但仍不够时考虑
+**代码状态**：✅ 已就绪（2026-06-12）
+- `src/tc_cutlass_persistent.cu` — 完整实现
+- `build.sh` 支持 `PERSISTENT=1` 环境变量
+- `bench/test_persistent.sh` — 对比标准 vs persistent
+
+**优先级**：仅当路径 1-3 达到 300+ TH/s 但仍不够时测试
+
+**测试方式**：
+```bash
+# 在 v2.0.0 最优配置基础上测试
+cd kan
+BASELINE="SMALL_TILE=1 GROUPM=16" bash bench/test_persistent.sh
+```
+
+**判断标准**：
+- **>5% 提升** → 部署到生产
+- **<5% 提升** → 边际收益，保持标准版本
+- **负提升** → 回退，persistent 不适合此工作负载
 
 ---
 

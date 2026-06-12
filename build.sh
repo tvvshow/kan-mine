@@ -117,12 +117,19 @@ echo "=== fused tensor-core kernel ==="
 CUTLASS_HOME="${CUTLASS_HOME:-$HOME/cutlass}"
 GROUPM="${GROUPM:-8}"
 SMALL_TILE="${SMALL_TILE:-}"
+PERSISTENT="${PERSISTENT:-}"
 EXTRA_FLAGS=""
-[ -n "$SMALL_TILE" ] && EXTRA_FLAGS="-DSMALL_TILE"
+[ -n "$SMALL_TILE" ] && EXTRA_FLAGS="${EXTRA_FLAGS} -DSMALL_TILE"
 if [ -d "${CUTLASS_HOME}/include/cutlass" ]; then
-  echo "  CUTLASS at ${CUTLASS_HOME} -> tc_cutlass_v2 (GROUPM=${GROUPM}${SMALL_TILE:+ SMALL_TILE}) + gpu_prep [LIVE 102+ TH/s]"
-  # shellcheck disable=SC2086
-  nvcc -O3 ${GENCODE} -std=c++17 -DGROUPM=${GROUPM} ${EXTRA_FLAGS} -I"${CUTLASS_HOME}/include" -c "${ROOT}/src/tc_cutlass_v2.cu" -o tc_kernel.o
+  if [ -n "$PERSISTENT" ]; then
+    echo "  CUTLASS at ${CUTLASS_HOME} -> tc_cutlass_persistent (GROUPM=${GROUPM}${SMALL_TILE:+ SMALL_TILE} PERSISTENT) + gpu_prep [Phase 8]"
+    # shellcheck disable=SC2086
+    nvcc -O3 ${GENCODE} -std=c++17 -DGROUPM=${GROUPM} ${EXTRA_FLAGS} -I"${CUTLASS_HOME}/include" -c "${ROOT}/src/tc_cutlass_persistent.cu" -o tc_kernel.o
+  else
+    echo "  CUTLASS at ${CUTLASS_HOME} -> tc_cutlass_v2 (GROUPM=${GROUPM}${SMALL_TILE:+ SMALL_TILE}) + gpu_prep [LIVE 102+ TH/s]"
+    # shellcheck disable=SC2086
+    nvcc -O3 ${GENCODE} -std=c++17 -DGROUPM=${GROUPM} ${EXTRA_FLAGS} -I"${CUTLASS_HOME}/include" -c "${ROOT}/src/tc_cutlass_v2.cu" -o tc_kernel.o
+  fi
   # shellcheck disable=SC2086
   nvcc -O3 ${GENCODE} -std=c++17 -c "${ROOT}/src/gpu_prep.cu"
   TC_OBJ="tc_kernel.o gpu_prep.o"
