@@ -46,8 +46,13 @@ extern "C" int g_miner_verbose;  // defined in miner_main.cpp (or plainproof_gen
 #include "cutlass/gemm/threadblock/mma_multistage.h"
 
 // ---- CUTLASS recipe (identical to v1: the 128.6 TH/s bench config) ----------
+#ifdef SMALL_TILE
+using TBShape   = cutlass::gemm::GemmShape<64, 128, 64>;
+using WarpShape = cutlass::gemm::GemmShape<32, 64, 64>;
+#else
 using TBShape   = cutlass::gemm::GemmShape<128, 256, 64>;
 using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+#endif
 using InstShape = cutlass::gemm::GemmShape<16, 8, 32>;
 constexpr int kStages = 3;
 
