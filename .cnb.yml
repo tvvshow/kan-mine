@@ -196,6 +196,8 @@ $:
         image: nvidia/cuda:12.4.1-devel-ubuntu22.04
       services:
         - vscode
+      runner:
+        tags: cnb:arch:amd64:gpu
       stages:
         - name: setup-env
           script:
