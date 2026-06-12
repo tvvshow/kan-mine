@@ -1,87 +1,36 @@
 #!/usr/bin/env bash
-# Phase 8 persistent scheduler benchmark
-# Compare standard vs persistent on the SAME configuration
+# Persistent scheduler benchmark — RUNTIME toggle (TC_PERSIST=1), ONE build.
+# The grid-stride kernel in tc_cutlass_v2.cu runs identically either way;
+# TC_PERSIST only changes the launch grid (524k one-trip blocks vs N_SM
+# persistent blocks looping over tile ids).
 set -e
-
 cd "$(dirname "$0")/.."
 
-echo "=== Phase 8 Persistent Scheduler Benchmark ==="
-echo "Compares standard grid-stride vs persistent scheduler"
-echo ""
-
-# Test baseline first (must be v2.0.0 optimized, e.g. SMALL_TILE=1)
-BASELINE="${BASELINE:-SMALL_TILE=1 GROUPM=16}"
-echo "Baseline config: ${BASELINE}"
-echo ""
-
-# --- Test 1: Standard scheduler (v2.0.0) ---
-echo "--- [1/2] Standard scheduler ---"
+BASELINE="${BASELINE:-GROUPM=128}"
+echo "=== Persistent Scheduler Benchmark (runtime toggle) ==="
+echo "Build config: ${BASELINE}"
 export ${BASELINE}
-unset PERSISTENT
 ./build.sh 2>&1 | grep -E "CUTLASS at|BUILD OK" || { echo "BUILD FAILED"; exit 1; }
 
-echo -n "Running 3 draws: "
-timeout 120 ./build/plainproof_gen --cfg real --mine --batch 3 2>&1 | \
-  tee /tmp/standard.log | grep -oP '\d+ draws.*?(\d+\.\d+) ms/draw' | tail -1 || echo "TIMEOUT"
+run_one() {  # $1 = label, $2 = TC_PERSIST value, $3 = logfile
+  echo "--- ${1} ---"
+  TC_PERSIST=${2} timeout 300 ./build/plainproof_gen --cfg real --mine --batch 3 2>&1 | \
+    tee "${3}" | grep -E "TH/s|POSTCHECK" | tail -3
+  grep -q "POSTCHECK ok=1" "${3}" || { echo "  ✗ POSTCHECK failed (${1})"; exit 1; }
+}
 
-if grep -q "POSTCHECK ok=1" /tmp/standard.log; then
-  STANDARD_MS=$(grep -oP '\d+\.\d+ ms/draw' /tmp/standard.log | tail -1 | awk '{print $1}')
-  echo "  Standard: ${STANDARD_MS} ms/draw"
-else
-  echo "  ✗ POSTCHECK failed"
-  exit 1
-fi
+run_one "Standard (full grid)"      0 /tmp/standard.log
+run_one "Persistent (TC_PERSIST=1)" 1 /tmp/persistent.log
 
-# --- Test 2: Persistent scheduler ---
+S=$(grep -oP 'FUSED .*? \K[0-9.]+(?= ms)' /tmp/standard.log   | tail -1)
+P=$(grep -oP 'FUSED .*? \K[0-9.]+(?= ms)' /tmp/persistent.log | tail -1)
 echo ""
-echo "--- [2/2] Persistent scheduler ---"
-export ${BASELINE}
-export PERSISTENT=1
-./build.sh 2>&1 | grep -E "CUTLASS at|BUILD OK" || { echo "BUILD FAILED"; exit 1; }
-
-echo -n "Running 3 draws: "
-timeout 120 ./build/plainproof_gen --cfg real --mine --batch 3 2>&1 | \
-  tee /tmp/persistent.log | grep -oP '\d+ draws.*?(\d+\.\d+) ms/draw' | tail -1 || echo "TIMEOUT"
-
-if grep -q "POSTCHECK ok=1" /tmp/persistent.log; then
-  PERSISTENT_MS=$(grep -oP '\d+\.\d+ ms/draw' /tmp/persistent.log | tail -1 | awk '{print $1}')
-  echo "  Persistent: ${PERSISTENT_MS} ms/draw"
-else
-  echo "  ✗ POSTCHECK failed"
-  exit 1
+echo "=== Results (kernel ms, last draw) ==="
+echo "Standard:   ${S} ms"
+echo "Persistent: ${P} ms"
+if command -v bc >/dev/null 2>&1 && [ -n "$S" ] && [ -n "$P" ]; then
+  D=$(echo "scale=2; ($S / $P - 1) * 100" | bc)
+  echo "Delta:      ${D}%  (positive = persistent faster)"
+  echo ""
+  echo "Deploy persistent by exporting TC_PERSIST=1 before launching kan — no rebuild."
 fi
-
-# --- Compare results ---
-echo ""
-echo "=== Results ==="
-echo "Standard:   ${STANDARD_MS} ms/draw"
-echo "Persistent: ${PERSISTENT_MS} ms/draw"
-
-if command -v bc >/dev/null 2>&1; then
-  SPEEDUP=$(echo "scale=2; ($STANDARD_MS / $PERSISTENT_MS - 1) * 100" | bc)
-  if (( $(echo "$SPEEDUP > 0" | bc -l) )); then
-    echo "Speedup:    +${SPEEDUP}% ✅"
-    if (( $(echo "$SPEEDUP >= 5" | bc -l) )); then
-      echo ""
-      echo "✅ DEPLOY: Persistent scheduler shows >5% improvement"
-      echo "   Use: PERSISTENT=1 ${BASELINE} ./build.sh"
-    else
-      echo ""
-      echo "🤔 Marginal: <5% improvement, consider deployment cost"
-    fi
-  else
-    SLOWDOWN=$(echo "scale=2; -$SPEEDUP" | bc)
-    echo "Slowdown:   -${SLOWDOWN}% ❌"
-    echo ""
-    echo "❌ REJECT: Persistent scheduler is slower, keep standard"
-  fi
-else
-  echo "(install bc for speedup calculation)"
-fi
-
-# Restore baseline
-unset PERSISTENT
-export ${BASELINE}
-./build.sh >/dev/null 2>&1
-echo ""
-echo "Restored baseline build"

@@ -31,6 +31,10 @@ main:
       stages:
         - name: deps
           script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates libssl-dev
+        - name: cutlass
+          # header-only; without it build.sh silently falls back to tc_block and
+          # the production CUTLASS kernel never gets compile-checked on push
+          script: if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
         - name: toolchain-info
           script:
             - nvcc --version | tail -2

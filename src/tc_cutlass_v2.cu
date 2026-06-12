@@ -33,6 +33,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 extern "C" int g_miner_verbose;  // defined in miner_main.cpp (or plainproof_gen for standalone)
 
@@ -500,11 +501,17 @@ static __global__ void gather_rows(const signed char* __restrict__ src, signed c
 }
 
 // ---- the kernel: ONE fused mainloop over full K, fold hooked in -------------
+// Grid-stride over tile ids: with grid.x == nbm*nbn the loop runs EXACTLY once
+// per block (identical to the old one-block-per-tile launch); with grid.x ==
+// num_SM (TC_PERSIST=1 at runtime, no rebuild) each block is persistent and
+// walks tiles id, id+gridDim, ... — same pid order, so the GROUPM raster and
+// its L2 locality are preserved in both modes.
 __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
     const int8_t* __restrict__ Ap, const int8_t* __restrict__ Btp,
     int k, int rank, int nrow_off, int ncol_off,
     const uint32_t* __restrict__ key, const uint32_t* __restrict__ bound,
-    int* __restrict__ win_flag, int* __restrict__ win_rt, int* __restrict__ win_ct)
+    int* __restrict__ win_flag, int* __restrict__ win_rt, int* __restrict__ win_ct,
+    int nbm, int nbn)
 {
   extern __shared__ __align__(16) char smem_raw[];
   auto* mma_smem = reinterpret_cast<typename FoldMma::Base::SharedStorage*>(smem_raw);
@@ -521,6 +528,15 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
   const int warp_m = warp_idx % Mma::WarpCount::kM;
   const int warp_n = warp_idx / Mma::WarpCount::kM;
 
+  const int M  = nrow_off * H;            // gathered A' rows
+  const int N  = ncol_off * W;            // gathered Bt' rows (= B cols)
+  const int kfold = k - (k % rank);
+  const int gemm_k_iterations = kfold / FoldMma::Shape::kK;
+  const int fold_every        = rank / FoldMma::Shape::kK;
+  // ONE iterator-Params pair over the FULL K extent — shared by all tiles
+  typename FoldMma::IteratorA::Params paramsA{cutlass::layout::RowMajor(k)};
+  typename FoldMma::IteratorB::Params paramsB{cutlass::layout::ColumnMajor(k)};
+
   // GROUPED RASTER (the L2 swizzle device::Gemm gets from its
   // ThreadblockSwizzle and a naive 2D launch loses): with row-major raster a
   // wave of ~82 concurrent TBs sits on ONE row strip and streams 82 distinct
@@ -532,10 +548,10 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
 #ifndef GROUPM
 #define GROUPM 8
 #endif
-  const int nbm = gridDim.y, nbn = gridDim.x;
+  const int total_tiles = nbm * nbn;
+  for (int pid = blockIdx.x; pid < total_tiles; pid += gridDim.x) {
   int bm_, bn_;
   {
-    int pid    = (int)blockIdx.y * nbn + (int)blockIdx.x;
     int band   = pid / (GROUPM * nbn);          // which band of row strips
     int first  = band * GROUPM;
     int gsz    = (nbm - first < GROUPM) ? (nbm - first) : GROUPM;
@@ -545,8 +561,6 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
   }
   const int bi = bm_ * RTOFF;             // first jackpot-tile row of this block
   const int bj = bn_ * CTOFF;             // first jackpot-tile col of this block
-  const int M  = nrow_off * H;            // gathered A' rows
-  const int N  = ncol_off * W;            // gathered Bt' rows (= B cols)
 
   for (int t = thread_idx; t < NJT*17; t += blockDim.x) jp_sh[t] = 0;
   __syncthreads();
@@ -554,10 +568,6 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
   typename FoldMma::FragmentC accum;
   accum.clear();
 
-  // ONE iterator pair over the FULL K extent — no per-chunk re-construction
-  typename FoldMma::IteratorA::Params paramsA{cutlass::layout::RowMajor(k)};
-  typename FoldMma::IteratorB::Params paramsB{cutlass::layout::ColumnMajor(k)};
-  const int kfold = k - (k % rank);
   typename FoldMma::IteratorA itA(paramsA, const_cast<int8_t*>(Ap), {M, kfold}, thread_idx,
                                   cutlass::MatrixCoord(bm_ * BM, 0));
   typename FoldMma::IteratorB itB(paramsB, const_cast<int8_t*>(Btp), {kfold, N}, thread_idx,
@@ -586,11 +596,20 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
                    ^ (uint32_t)f[(m + n0*ROW_ITERS)*4 + e1]
                    ^ (uint32_t)f[(m + n1*ROW_ITERS)*4 + e0]
                    ^ (uint32_t)f[(m + n1*ROW_ITERS)*4 + e1];
+        // full-warp XOR reduction: single-instruction redux on sm_80+; the
+        // shfl butterfly only exists for the sm_75 slice of the fatbin.
+        // (commit 1beb62d removed redux globally blaming "CUDA 12.8+" — wrong:
+        // __reduce_xor_sync is CUDA 11.0+, it just doesn't exist on cc<8.0,
+        // so the portable sm_75 pass failed. Arch guard is the real fix.)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+        x = __reduce_xor_sync(0xffffffffu, x);
+#else
         x ^= __shfl_xor_sync(0xffffffffu, x, 16);
         x ^= __shfl_xor_sync(0xffffffffu, x, 8);
         x ^= __shfl_xor_sync(0xffffffffu, x, 4);
         x ^= __shfl_xor_sync(0xffffffffu, x, 2);
-        x ^= __shfl_xor_sync(0xffffffffu, x, 1);      // full-warp XOR reduction
+        x ^= __shfl_xor_sync(0xffffffffu, x, 1);
+#endif
         if (lane == jr*JC + jc) myx = x;        // tile #it claimed by lane #it
       }
     }
@@ -606,8 +625,6 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
   };
 
   FoldMma mma(*mma_smem, thread_idx, warp_idx, lane);
-  const int gemm_k_iterations = kfold / FoldMma::Shape::kK;
-  const int fold_every        = rank / FoldMma::Shape::kK;
   mma(gemm_k_iterations, accum, itA, itB, accum, fold_every, fold);
   // gemm_iters_fold tail already drained cp.async + syncthreads — JPS is coherent
 
@@ -623,6 +640,11 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
       if (atomicCAS(win_flag, 0, 1) == 0) { *win_rt = jt_i; *win_ct = jt_j; }
     }
   }
+  // persistent mode reuses jp_sh next iteration: every thread must finish
+  // READING its tiles above before any thread re-clears. One-trip mode pays a
+  // single extra sync at block end — noise.
+  __syncthreads();
+  } // pid grid-stride loop
 }
 
 // ---- host wrapper: identical ABI/flow to v1 ---------------------------------
@@ -725,7 +747,8 @@ extern "C" int tc_search_launch(
   gather_rows<<<ncol_off*w, 256, 0, s>>>(B.dBt, B.dBtp, k, B.dcoff, B.dpc, w, ncol_off);
   cudaEventRecord(g_gather_evt, s);   // prep(N+1) may write dA/dBt after this
 
-  dim3 grid((ncol_off + CTOFF - 1)/CTOFF, (nrow_off + RTOFF - 1)/RTOFF);
+  const int nbm = (nrow_off + RTOFF - 1)/RTOFF;
+  const int nbn = (ncol_off + CTOFF - 1)/CTOFF;
   size_t smem_bytes = sizeof(typename FoldMma::Base::SharedStorage) + (size_t)NJT*17*4;
   static bool attr_set=false;
   if (!attr_set) {
@@ -734,14 +757,36 @@ extern "C" int tc_search_launch(
     if (ae!=cudaSuccess) fprintf(stderr,"tc_cutlass: smem attr (%zu B) err %s\n", smem_bytes, cudaGetErrorString(ae));
     attr_set=true;
   }
+  // TC_PERSIST=1 (env, runtime — no rebuild): persistent grid of exactly the
+  // max co-resident block count; each block grid-strides over tile ids. Same
+  // pid order as the one-block-per-tile launch, so GROUPM locality holds.
+  // Default (unset/0) keeps the proven full grid — the hardware scheduler
+  // already keeps SMs fed; persistent only wins by saving 524k block setups.
+  static int persist_blocks = -1;
+  if (persist_blocks < 0) {
+    const char* e = getenv("TC_PERSIST");
+    if (e && atoi(e)) {
+      int dev=0, nsm=0, per_sm=0;
+      cudaGetDevice(&dev);
+      cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, tc_cutlass_jackpot, TPB, smem_bytes);
+      persist_blocks = nsm * (per_sm > 0 ? per_sm : 1);
+      if (g_miner_verbose)
+        fprintf(stderr,"tc_cutlass: PERSISTENT grid %d blocks (%d SM x %d/SM)\n",
+                persist_blocks, nsm, per_sm > 0 ? per_sm : 1);
+    } else persist_blocks = 0;
+  }
+  dim3 grid(persist_blocks > 0 ? (unsigned)((nbm*nbn < persist_blocks) ? nbm*nbn : persist_blocks)
+                               : (unsigned)(nbm*nbn));
   cudaEventRecord(g_se0, s);
   tc_cutlass_jackpot<<<grid, TPB, smem_bytes, s>>>(
-      (const int8_t*)B.dAp,(const int8_t*)B.dBtp,k,rank,nrow_off,ncol_off,B.dk,B.db,B.df,B.dr,B.dc);
+      (const int8_t*)B.dAp,(const int8_t*)B.dBtp,k,rank,nrow_off,ncol_off,B.dk,B.db,B.df,B.dr,B.dc,
+      nbm, nbn);
   cudaEventRecord(g_se1, s);
   cudaError_t le = cudaGetLastError();
   if (le!=cudaSuccess) {
-    fprintf(stderr,"tc_cutlass: LAUNCH err %s (tpb=%d, grid=%dx%d, smem=%zuB)\n",
-            cudaGetErrorString(le), TPB, grid.x, grid.y, smem_bytes);
+    fprintf(stderr,"tc_cutlass: LAUNCH err %s (tpb=%d, grid=%d, smem=%zuB)\n",
+            cudaGetErrorString(le), TPB, grid.x, smem_bytes);
     return -1;
   }
   return 0;

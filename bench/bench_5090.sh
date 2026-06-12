@@ -68,10 +68,24 @@ echo "=== v2.0.0 Best: $BEST_NAME ==="
 echo "  $BEST_MS ms/draw = $BEST_THS TH/s"
 echo ""
 
-# Phase 8: Persistent scheduler on best v2.0.0 config
+# Phase 8: Persistent scheduler on best v2.0.0 config (RUNTIME toggle, reuses the
+# binary just built for the best config — rebuild it first, then run with TC_PERSIST=1)
 BEST_ENV=$(grep "^$BEST_NAME," $LOG | cut -d, -f1 | sed 's/.*(\(.*\))/\1/' | tr ' ' '\n' | grep = | tr '\n' ' ')
 if [ -n "$BEST_ENV" ]; then
-  test_config "Phase 8: Persistent ($BEST_NAME)" "$BEST_ENV PERSISTENT=1"
+  eval "export $BEST_ENV"
+  ./build.sh >/dev/null 2>&1
+  echo "--- Testing: Phase 8 Persistent ($BEST_NAME, TC_PERSIST=1) ---"
+  TC_PERSIST=1 timeout 180 ./build/plainproof_gen --cfg real --mine --batch 3 2>&1 | tee /tmp/test.log | \
+    grep -oP '\d+ draws.*?(\d+\.\d+) ms/draw' | tail -1 || echo "TIMEOUT"
+  if grep -q "POSTCHECK ok=1" /tmp/test.log; then
+    MS=$(grep -oP '\d+\.\d+ ms/draw' /tmp/test.log | tail -1 | awk '{print $1}')
+    THS=$(echo "scale=1; 70000000 / $MS / 1000" | bc)
+    echo "  ✓ $MS ms/draw = $THS TH/s"
+    echo "Phase 8 Persistent ($BEST_NAME),$MS,$THS" >> $LOG
+  else
+    echo "  ✗ POSTCHECK failed"
+    echo "Phase 8 Persistent ($BEST_NAME),FAILED,0" >> $LOG
+  fi
 fi
 
 # Summary
