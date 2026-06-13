@@ -120,6 +120,9 @@ KSTAGES="${KSTAGES:-3}"
 SMALL_TILE="${SMALL_TILE:-}"
 EXTRA_FLAGS=""
 [ -n "$SMALL_TILE" ] && EXTRA_FLAGS="${EXTRA_FLAGS} -DSMALL_TILE"
+# Arbitrary extra nvcc flags passthrough (A/B benchmarking + profiling switches),
+# e.g. NVCC_EXTRA="-DFOLD_RMW_ALWAYS" or "-DPROFILE_NOFOLD". Empty in production.
+EXTRA_FLAGS="${EXTRA_FLAGS} ${NVCC_EXTRA:-}"
 if [ -d "${CUTLASS_HOME}/include/cutlass" ]; then
   echo "  CUTLASS at ${CUTLASS_HOME} -> tc_cutlass_v2 (GROUPM=${GROUPM} KSTAGES=${KSTAGES}${SMALL_TILE:+ SMALL_TILE}) + gpu_prep [LIVE 102+ TH/s]"
   echo "  (persistent scheduler is a RUNTIME toggle now: TC_PERSIST=1 ./build/kan ...)"

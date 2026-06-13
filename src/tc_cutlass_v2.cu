@@ -631,7 +631,21 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
     const int jtcib = warp_n*JC + my_jc;
     if (bi + jtrib < nrow_off && bj + jtcib < ncol_off) {
       const int local_jt = jtrib*CTOFF + jtcib;
-      JPS(local_jt, c % 16) = rotl32d(JPS(local_jt, c % 16), 13) ^ myx;
+      const int q = c & 15;                       // transcript word (c % 16)
+      // A1 fold direct-store: jp_sh is zero-cleared (line ~572) and `c` is
+      // block-uniform, so the FIRST touch of word q (c<16) is
+      // rotl32d(0,13)^myx == myx — skip the smem read + rotl + xor RMW. For a
+      // config with >16 fold chunks (k/rank>16) word q is revisited (c>=16) and
+      // the full rotl13 RMW is still applied, so this stays correct for ALL
+      // configs. The branch is block-uniform -> fully predicted, no divergence;
+      // REAL (k/rank==16) always takes the cheap path. -DFOLD_RMW_ALWAYS forces
+      // the pre-A1 path for one-flag A/B benchmarking.
+#if defined(FOLD_RMW_ALWAYS)
+      JPS(local_jt, q) = rotl32d(JPS(local_jt, q), 13) ^ myx;
+#else
+      if (c < 16) JPS(local_jt, q) = myx;
+      else        JPS(local_jt, q) = rotl32d(JPS(local_jt, q), 13) ^ myx;
+#endif
     }
   };
 
