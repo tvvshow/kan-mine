@@ -590,6 +590,10 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
   // a register; after the loop ALL active lanes do the rotl13-RMW of their own
   // tile's transcript word in ONE parallel instruction.
   auto fold = [&](typename FoldMma::FragmentC const& acc, int c) {
+#ifdef PROFILE_NOFOLD
+    // timing-only build: results WRONG, isolates the fold callback's cost
+    (void)acc; (void)c; return;
+#endif
     const int32_t* f = reinterpret_cast<const int32_t*>(acc.data());
     uint32_t myx = 0;                           // lane's claimed tile XOR
     #pragma unroll
@@ -636,6 +640,7 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
   // gemm_iters_fold tail already drained cp.async + syncthreads — JPS is coherent
 
   // ---- jackpot: blake3 every tile's transcript, flag a winner ---------------
+#ifndef PROFILE_NOJACKPOT
   for (int t = thread_idx; t < NJT; t += blockDim.x) {
     int jt_i = bi + t / CTOFF, jt_j = bj + t % CTOFF;
     if (jt_i >= nrow_off || jt_j >= ncol_off) continue;
@@ -647,6 +652,7 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
       if (atomicCAS(win_flag, 0, 1) == 0) { *win_rt = jt_i; *win_ct = jt_j; }
     }
   }
+#endif // PROFILE_NOJACKPOT
   // persistent mode reuses jp_sh next iteration: every thread must finish
   // READING its tiles above before any thread re-clears. One-trip mode pays a
   // single extra sync at block end — noise.
