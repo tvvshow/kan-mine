@@ -31,13 +31,17 @@ WITH_AB="${WITH_AB:-1}"
 rm -rf "${STAGE}"; mkdir -p "${LIBDIR}/../bench"
 
 echo "=== [1/5] build portable binaries ==="
+# ARCH (if the caller set it) flows to build.sh through the environment, so we do
+# NOT inline-pass it: `PORTABLE=1 ${ARCH:+ARCH=$ARCH} ...` misparses — a $-leading
+# word isn't recognized as an assignment prefix, so when ARCH is empty the NEXT
+# assignment becomes the command ("NVCC_EXTRA=...: command not found").
 if [ "${WITH_AB}" = "1" ]; then
   echo "  [1a] pre-A1 RMW baseline (for on-box A/B) ..."
-  PORTABLE=1 ${ARCH:+ARCH=$ARCH} NVCC_EXTRA="-DFOLD_RMW_ALWAYS" bash build.sh
+  PORTABLE=1 NVCC_EXTRA="-DFOLD_RMW_ALWAYS" bash build.sh
   cp -f build/plainproof_gen "${STAGE}/plainproof_gen_rmw"
 fi
 echo "  [1b] A1 (default) -> the shipped kan + plainproof_gen ..."
-PORTABLE=1 ${ARCH:+ARCH=$ARCH} bash build.sh
+PORTABLE=1 bash build.sh
 cp -f build/kan build/plainproof_gen "${STAGE}/"
 
 echo "=== [2/5] bundle non-glibc / non-driver shared libs (fixpoint over ldd) ==="
