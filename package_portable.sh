@@ -30,18 +30,15 @@ LIBDIR="${STAGE}/lib"
 WITH_AB="${WITH_AB:-1}"
 rm -rf "${STAGE}"; mkdir -p "${LIBDIR}/../bench"
 
-echo "=== [1/5] build A1 (portable) ==="
-PORTABLE=1 ${ARCH:+ARCH=$ARCH} bash build.sh
-cp -f build/kan build/plainproof_gen "${STAGE}/"
-
+echo "=== [1/5] build portable binaries ==="
 if [ "${WITH_AB}" = "1" ]; then
-  echo "=== [1b] build pre-A1 RMW baseline (portable) for on-box A/B ==="
+  echo "  [1a] pre-A1 RMW baseline (for on-box A/B) ..."
   PORTABLE=1 ${ARCH:+ARCH=$ARCH} NVCC_EXTRA="-DFOLD_RMW_ALWAYS" bash build.sh
   cp -f build/plainproof_gen "${STAGE}/plainproof_gen_rmw"
-  # restore the A1 binaries (the RMW build overwrote build/*)
-  PORTABLE=1 ${ARCH:+ARCH=$ARCH} bash build.sh >/dev/null 2>&1
-  cp -f build/kan build/plainproof_gen "${STAGE}/"
 fi
+echo "  [1b] A1 (default) -> the shipped kan + plainproof_gen ..."
+PORTABLE=1 ${ARCH:+ARCH=$ARCH} bash build.sh
+cp -f build/kan build/plainproof_gen "${STAGE}/"
 
 echo "=== [2/5] bundle non-glibc / non-driver shared libs (fixpoint over ldd) ==="
 # Keep as SYSTEM (never bundle): glibc core (ABI-stable, everywhere) + the NVIDIA
