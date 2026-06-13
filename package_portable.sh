@@ -70,6 +70,20 @@ while [ "$added" = 1 ]; do
 done
 [ -z "$(ls -A "${LIBDIR}" 2>/dev/null)" ] && echo "  (nothing to bundle — fully static)"
 
+# Give bundled libs a $ORIGIN rpath so a sibling dep (e.g. libssl -> libcrypto)
+# resolves INSIDE lib/ no matter how the binary is launched; otherwise the
+# transitive dep silently falls back to the host's system copy. patchelf is
+# tiny; install best-effort (we're root on the build host).
+if [ -n "$(ls -A "${LIBDIR}" 2>/dev/null)" ]; then
+  command -v patchelf >/dev/null 2>&1 || { apt-get install -y --no-install-recommends patchelf >/dev/null 2>&1 || true; }
+  if command -v patchelf >/dev/null 2>&1; then
+    for so in "${LIBDIR}"/*; do patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true; done
+    echo "  patchelf: \$ORIGIN rpath on bundled libs (siblings resolve within lib/)"
+  else
+    echo "  WARNING: patchelf unavailable — bundled libs may use system transitive deps"
+  fi
+fi
+
 echo "=== [3/5] launcher + bench + README ==="
 cat > "${STAGE}/run.sh" <<'LAUNCH'
 #!/usr/bin/env bash
@@ -87,8 +101,8 @@ chmod +x "${STAGE}/run.sh"
 cat > "${STAGE}/bench/ablate_a1_prebuilt.sh" <<'ABLATE'
 #!/usr/bin/env bash
 # Phase A1 (fold direct-store) A/B with NO toolchain — uses the two prebuilt
-# binaries shipped in this package. A1 MUST be byte-identical to RMW for REAL
-# (same proof sha256) and POSTCHECK ok=1 on both; reports kernel Δ%.
+# binaries shipped in this package. Correctness gate = POSTCHECK ok=1 on BOTH
+# (CPU recomputes the GPU's winning tile). Reports kernel Δ%.
 set -uo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 SEED="${SEED:-777}"; NDRAW="${NDRAW:-3}"
@@ -97,21 +111,25 @@ HARD="0000000000000000000000000000000000000000000000000000000000000001"
 [ -x "$here/plainproof_gen_rmw" ] || { echo "no plainproof_gen_rmw (package built WITH_AB=0)"; exit 2; }
 ab() { local L="$1" BIN="$2"
   "$BIN" --cfg real --mine 1 --target "$EASY" "$SEED" >/tmp/a1_$L.b64 2>/tmp/a1_$L.corr
-  local ok; ok="$(grep -oE 'POSTCHECK ok=[01]' /tmp/a1_$L.corr | tail -1)"
+  local ok; ok="$(grep -E 'POSTCHECK' /tmp/a1_$L.corr | grep -oE 'ok=[01]' | tail -1)"
   local sha; sha="$(sha256sum /tmp/a1_$L.b64 | awk '{print $1}')"
   "$BIN" --cfg real --mine "$NDRAW" --target "$HARD" --breakdown "$SEED" >/dev/null 2>/tmp/a1_$L.time
   local ms; ms="$(grep -oE 'FUSED [0-9]+ tiles, [0-9.]+ ms' /tmp/a1_$L.time | grep -oE '[0-9.]+ ms' | grep -oE '[0-9.]+' | tail -1)"
-  echo "  $L: ${ok:-<none>}  kernel=${ms} ms  proof=${sha:0:16}…"
+  echo "  $L: POSTCHECK ${ok:-<none>}  kernel=${ms} ms  proof=${sha:0:16}…"
   eval "MS_$L=$ms; SHA_$L='$sha'; OK_$L='$ok'"
 }
 echo "=== A1 vs RMW (prebuilt, SEED=$SEED) ==="
 ab RMW "$here/plainproof_gen_rmw"
 ab A1  "$here/plainproof_gen"
+# Gate on POSTCHECK ok=1, NOT proof identity: the easy target makes EVERY tile a
+# winner, so which one atomicCAS records is racy and differs run-to-run (even
+# RMW vs RMW). ok=1 means the CPU re-verified the GPU's winning jackpot tile.
 fail=0
-[ "${OK_RMW:-}" = "POSTCHECK ok=1" ] || { echo "  ✗ RMW POSTCHECK"; fail=1; }
-[ "${OK_A1:-}"  = "POSTCHECK ok=1" ] || { echo "  ✗ A1 POSTCHECK"; fail=1; }
-[ "${SHA_RMW:-}" = "${SHA_A1:-}" ] && echo "  ✓ proof byte-identical" || { echo "  ✗ PROOF DIVERGED — revert A1"; fail=1; }
-if [ "$fail" = 0 ] && [ -n "${MS_RMW:-}" ] && [ -n "${MS_A1:-}" ]; then
+[ "${OK_RMW:-}" = "ok=1" ] || { echo "  ✗ RMW POSTCHECK not ok=1"; fail=1; }
+[ "${OK_A1:-}"  = "ok=1" ] || { echo "  ✗ A1 POSTCHECK not ok=1"; fail=1; }
+[ "$fail" = 0 ] && echo "  ✓ A1 + RMW both POSTCHECK ok=1 (A1 jackpot transcript verified on real GPU)"
+[ "${SHA_RMW:-}" != "${SHA_A1:-}" ] && echo "  (proofs differ — expected: easy-target winner is racy, not an A1 fault)"
+if [ -n "${MS_RMW:-}" ] && [ -n "${MS_A1:-}" ]; then
   awk "BEGIN{printf \"  RMW %.1f TH/s | A1 %.1f TH/s | Δ %+.2f%% kernel\n\",70368.744/$MS_RMW,70368.744/$MS_A1,($MS_RMW-$MS_A1)/$MS_RMW*100}"
 fi
 exit $fail
