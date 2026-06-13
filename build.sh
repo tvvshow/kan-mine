@@ -36,7 +36,9 @@ GENCODE=""
 if [ -n "${ARCH:-}" ]; then
   GENCODE="-arch=${ARCH}"
   echo "arch: ENV override -> ${ARCH}"
-elif command -v nvidia-smi >/dev/null 2>&1; then
+elif [ -z "${PORTABLE:-}" ] && command -v nvidia-smi >/dev/null 2>&1; then
+  # PORTABLE builds are REDISTRIBUTABLE -> never tune to the build box's GPU;
+  # fall through to the multi-arch fatbin so the tarball runs on every arch.
   DETECTED="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ' || true)"
   if [[ "${DETECTED:-}" =~ ^[0-9]+$ ]]; then
     GENCODE="-arch=sm_${DETECTED}"
