@@ -55,7 +55,14 @@ using TBShape   = cutlass::gemm::GemmShape<128, 256, 64>;
 using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
 #endif
 using InstShape = cutlass::gemm::GemmShape<16, 8, 32>;
-constexpr int kStages = 3;
+// cp.async pipeline depth. 3 = the proven default. 4/5 trade smem for more
+// latency hiding (TB 128x256x64: 24KB/stage, +JPS 17.4KB -> stages=4 needs
+// ~113KB dynamic smem = over Ada's 99KB cap but fine on Hopper/Blackwell-DC;
+// the launch prints a clear smem-attr error if the target can't fit it).
+#ifndef KSTAGES
+#define KSTAGES 3
+#endif
+constexpr int kStages = KSTAGES;
 
 using DefaultMmaT = cutlass::gemm::threadblock::DefaultMma<
     int8_t,  cutlass::layout::RowMajor,    16,   // A  (gathered A',  lda = k)
