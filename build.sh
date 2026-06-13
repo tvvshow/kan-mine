@@ -141,16 +141,32 @@ else
 fi
 
 echo "=== link: plainproof_gen (CLI) ==="
+# PORTABLE=1 -> a "download & run" binary whose ONLY runtime dep is the NVIDIA
+# driver (libcuda, always on a GPU host): static cudart (no CUDA toolkit needed
+# on the target), static libstdc++/libgcc, and an $ORIGIN/lib rpath so the few
+# remaining .so (libssl/libcrypto/libgomp...) can sit beside the binary. Default
+# (empty PORTABLE) links exactly as before. $ORIGIN must reach the linker
+# LITERALLY -> stored with \$ at assignment, NOT re-expanded on unquoted use.
+if [ -n "${PORTABLE:-}" ]; then
+  CUDART_LIBS="-lcudart_static -lculibos -lpthread -ldl -lrt"
+  STATIC_CXX="-static-libstdc++ -static-libgcc"
+  RPATH_ARG="-Wl,-rpath,\$ORIGIN/lib"
+  echo "  PORTABLE: static cudart + static libstdc++/libgcc + \$ORIGIN/lib rpath"
+else
+  CUDART_LIBS="-lcudart -lpthread"
+  STATIC_CXX=""
+  RPATH_ARG=""
+fi
 # shellcheck disable=SC2086
-g++ -O3 -fopenmp plainproof_gen.o ${BL_OBJ} ${TC_OBJ} \
-  -L"${CUDA_HOME}/lib64" -lcudart -o plainproof_gen
+g++ -O3 -fopenmp ${STATIC_CXX} ${RPATH_ARG} plainproof_gen.o ${BL_OBJ} ${TC_OBJ} \
+  -L"${CUDA_HOME}/lib64" ${CUDART_LIBS} -o plainproof_gen
 ls -la "${BUILD}/plainproof_gen"
 
 echo "=== link: kan (unified pool + solo) ==="
 # OpenSSL for solo HTTPS RPC; pthread for the stratum/poller threads.
 # shellcheck disable=SC2086
-g++ -O3 -fopenmp miner_main.o prover_lib.o ${BL_OBJ} ${TC_OBJ} \
-  -L"${CUDA_HOME}/lib64" -lcudart -lssl -lcrypto -lpthread -o kan
+g++ -O3 -fopenmp ${STATIC_CXX} ${RPATH_ARG} miner_main.o prover_lib.o ${BL_OBJ} ${TC_OBJ} \
+  -L"${CUDA_HOME}/lib64" -lssl -lcrypto ${CUDART_LIBS} -o kan
 ls -la "${BUILD}/kan"
 
 # --- zkprove (Rust): SOLO-only PlainProof -> ZK proof -> block helper ---------
