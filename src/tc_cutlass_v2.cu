@@ -508,11 +508,11 @@ static __global__ void gather_rows(const signed char* __restrict__ src, signed c
 }
 
 // ---- the kernel: ONE fused mainloop over full K, fold hooked in -------------
-// Grid-stride over tile ids: with grid.x == nbm*nbn the loop runs EXACTLY once
-// per block (identical to the old one-block-per-tile launch); with grid.x ==
-// num_SM (TC_PERSIST=1 at runtime, no rebuild) each block is persistent and
-// walks tiles id, id+gridDim, ... — same pid order, so the GROUPM raster and
-// its L2 locality are preserved in both modes.
+// Grid-stride over tile ids: with grid.x == num_SM*blocks_per_SM (the DEFAULT
+// persistent launch) each block walks tiles id, id+gridDim, ...; with grid.x ==
+// nbm*nbn (TC_PERSIST=0) the loop runs EXACTLY once per block (the old
+// one-block-per-tile launch). Same pid order either way, so the GROUPM raster
+// and its L2 locality are preserved in both modes.
 __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
     const int8_t* __restrict__ Ap, const int8_t* __restrict__ Btp,
     int k, int rank, int nrow_off, int ncol_off,
@@ -849,24 +849,25 @@ extern "C" int tc_search_launch(
     if (ae!=cudaSuccess) fprintf(stderr,"tc_cutlass: smem attr (%zu B) err %s\n", smem_bytes, cudaGetErrorString(ae));
     attr_set=true;
   }
-  // TC_PERSIST=1 (env, runtime — no rebuild): persistent grid of exactly the
-  // max co-resident block count; each block grid-strides over tile ids. Same
-  // pid order as the one-block-per-tile launch, so GROUPM locality holds.
-  // Default (unset/0) keeps the proven full grid — the hardware scheduler
-  // already keeps SMs fed; persistent only wins by saving 524k block setups.
+  // Persistent grid is the DEFAULT (2026-06-14): launch exactly the max
+  // co-resident block count and grid-stride over tile ids in the SAME pid order
+  // as the old one-block-per-tile launch, so GROUPM L2 locality is preserved.
+  // Measured neutral-to-positive everywhere (3080Ti +~1%, L40 +3.2%, 5090 flat)
+  // by saving ~524k block setups per draw, and correctness is identical
+  // (POSTCHECK ok=1). Escape hatch: TC_PERSIST=0 restores the full grid.
   static int persist_blocks = -1;
   if (persist_blocks < 0) {
     const char* e = getenv("TC_PERSIST");
-    if (e && atoi(e)) {
+    if (!e || atoi(e)) {                       // default ON; TC_PERSIST=0 disables
       int dev=0, nsm=0, per_sm=0;
       cudaGetDevice(&dev);
       cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, tc_cutlass_jackpot, TPB, smem_bytes);
       persist_blocks = nsm * (per_sm > 0 ? per_sm : 1);
       if (g_miner_verbose)
-        fprintf(stderr,"tc_cutlass: PERSISTENT grid %d blocks (%d SM x %d/SM)\n",
-                persist_blocks, nsm, per_sm > 0 ? per_sm : 1);
-    } else persist_blocks = 0;
+        fprintf(stderr,"tc_cutlass: PERSISTENT grid %d blocks (%d SM x %d/SM)%s\n",
+                persist_blocks, nsm, per_sm > 0 ? per_sm : 1, e ? "" : " [default]");
+    } else persist_blocks = 0;                 // TC_PERSIST=0 -> full one-trip grid
   }
   dim3 grid(persist_blocks > 0 ? (unsigned)((nbm*nbn < persist_blocks) ? nbm*nbn : persist_blocks)
                                : (unsigned)(nbm*nbn));

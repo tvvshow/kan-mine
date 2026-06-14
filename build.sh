@@ -127,7 +127,7 @@ EXTRA_FLAGS=""
 EXTRA_FLAGS="${EXTRA_FLAGS} ${NVCC_EXTRA:-}"
 if [ -d "${CUTLASS_HOME}/include/cutlass" ]; then
   echo "  CUTLASS at ${CUTLASS_HOME} -> tc_cutlass_v2 (GROUPM=${GROUPM} KSTAGES=${KSTAGES}${SMALL_TILE:+ SMALL_TILE}) + gpu_prep [LIVE 102+ TH/s]"
-  echo "  (persistent scheduler is a RUNTIME toggle now: TC_PERSIST=1 ./build/kan ...)"
+  echo "  (persistent grid is the DEFAULT now; disable at runtime with TC_PERSIST=0 ./build/kan ...)"
   # shellcheck disable=SC2086
   nvcc -O3 ${GENCODE} -std=c++17 -DGROUPM=${GROUPM} -DKSTAGES=${KSTAGES} ${EXTRA_FLAGS} -I"${CUTLASS_HOME}/include" -c "${ROOT}/src/tc_cutlass_v2.cu" -o tc_kernel.o
   # shellcheck disable=SC2086
