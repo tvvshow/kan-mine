@@ -522,11 +522,13 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
 {
   extern __shared__ __align__(16) char smem_raw[];
   auto* mma_smem = reinterpret_cast<typename FoldMma::Base::SharedStorage*>(smem_raw);
+#ifndef A2_REG_TRANSCRIPT
   uint32_t* jp_sh = reinterpret_cast<uint32_t*>(smem_raw + sizeof(typename FoldMma::Base::SharedStorage));
 // stride 17 (not 16): the lane-distributed fold store writes 32 tiles' word c
 // in ONE instruction; tile stride 16 words would land on 2 banks (16-way
 // conflict), 17 spreads it to 8 banks (4-way). +1 KB smem, still under cap.
 #define JPS(t,q) jp_sh[(t)*17+(q)]
+#endif
 
   const int thread_idx = threadIdx.x;
   const int warp_idx   = threadIdx.x >> 5;
@@ -569,8 +571,20 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
   const int bi = bm_ * RTOFF;             // first jackpot-tile row of this block
   const int bj = bn_ * CTOFF;             // first jackpot-tile col of this block
 
+#ifdef A2_REG_TRANSCRIPT
+  // A2: lane-owned register transcript. A 64x64 warp covers JR*JC==32 jackpot
+  // tiles and has 32 lanes, so each lane owns EXACTLY one tile and holds its 16
+  // transcript words in registers. q = c&15 is a RUNTIME chunk index, so these
+  // words are written ONLY through compile-time-indexed predicated selects (in
+  // the fold below) — a dynamic `mytrans[q] = ...` would spill the array to
+  // local memory and erase the win. No smem, no clear barrier.
+  uint32_t mytrans[16];
+  #pragma unroll
+  for (int qi = 0; qi < 16; ++qi) mytrans[qi] = 0;
+#else
   for (int t = thread_idx; t < NJT*17; t += blockDim.x) jp_sh[t] = 0;
   __syncthreads();
+#endif
 
   typename FoldMma::FragmentC accum;
   accum.clear();
@@ -612,7 +626,11 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
         // (commit 1beb62d removed redux globally blaming "CUDA 12.8+" — wrong:
         // __reduce_xor_sync is CUDA 11.0+, it just doesn't exist on cc<8.0,
         // so the portable sm_75 pass failed. Arch guard is the real fix.)
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+#ifdef PROFILE_NOREDUX
+        // timing-only (WRONG result): skip the cross-lane reduction to isolate
+        // the 32x warp-redux cost per fold call from the accumulator XOR reads.
+        // full - NOREDUX = redux cost; NOREDUX - NOFOLD = accumulator-read cost.
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
         x = __reduce_xor_sync(0xffffffffu, x);
 #else
         x ^= __shfl_xor_sync(0xffffffffu, x, 16);
@@ -627,11 +645,27 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
     // lane L owns tile (jr=L/JC, jc=L%JC); only active lanes write.
     const int my_jr = lane / JC, my_jc = lane % JC;
     if (my_jr >= JR) return;                    // idle lane (SMALL_TILE: lanes 16-31)
+    const int q = c & 15;                       // transcript word (c % 16)
+#ifdef A2_REG_TRANSCRIPT
+    // A2: store the lane's OWN tile word in registers. q is RUNTIME, so the write
+    // goes through a compile-time-indexed predicated select (16 unrolled cmp/sel)
+    // — a dynamic `mytrans[q] = ...` would force the array into local memory and
+    // kill the win. Bounds (bi+jt < n..._off) are enforced in the epilogue, not
+    // here: writing registers for an out-of-range tile is harmless (never emitted).
+    // Direct-store on first touch (c<16) mirrors the A1 strength reduction.
+    #pragma unroll
+    for (int qi = 0; qi < 16; ++qi) if (qi == q) {
+#if defined(FOLD_RMW_ALWAYS)
+      mytrans[qi] = rotl32d(mytrans[qi], 13) ^ myx;
+#else
+      mytrans[qi] = (c < 16) ? myx : (rotl32d(mytrans[qi], 13) ^ myx);
+#endif
+    }
+#else
     const int jtrib = warp_m*JR + my_jr;
     const int jtcib = warp_n*JC + my_jc;
     if (bi + jtrib < nrow_off && bj + jtcib < ncol_off) {
       const int local_jt = jtrib*CTOFF + jtcib;
-      const int q = c & 15;                       // transcript word (c % 16)
       // A1 fold direct-store: jp_sh is zero-cleared (line ~572) and `c` is
       // block-uniform, so the FIRST touch of word q (c<16) is
       // rotl32d(0,13)^myx == myx — skip the smem read + rotl + xor RMW. For a
@@ -647,6 +681,7 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
       else        JPS(local_jt, q) = rotl32d(JPS(local_jt, q), 13) ^ myx;
 #endif
     }
+#endif // A2_REG_TRANSCRIPT
   };
 
   FoldMma mma(*mma_smem, thread_idx, warp_idx, lane);
@@ -655,6 +690,30 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
 
   // ---- jackpot: blake3 every tile's transcript, flag a winner ---------------
 #ifndef PROFILE_NOJACKPOT
+#ifdef A2_REG_TRANSCRIPT
+  // A2: each lane hashes the ONE tile it owns straight from its register
+  // transcript, using the SAME lane->tile map the fold used (registers are
+  // private, so the reader must be the writer). jackpot_blake3 dynamically
+  // indexes its msg[] (the blake3 message schedule), so copy mytrans -> a
+  // short-lived scratch jp[] first; jp is epilogue-only — identical in spirit
+  // to the smem path's per-tile read buffer, just sourced from registers.
+  {
+    const int my_jr = lane / JC, my_jc = lane % JC;
+    if (my_jr < JR) {                          // active lanes own a tile
+      const int jt_i = bi + warp_m*JR + my_jr;
+      const int jt_j = bj + warp_n*JC + my_jc;
+      if (jt_i < nrow_off && jt_j < ncol_off) {
+        uint32_t jp[16];
+        #pragma unroll
+        for (int q = 0; q < 16; q++) jp[q] = mytrans[q];
+        uint32_t out[8];
+        jackpot_blake3(key, jp, out);
+        if (le_u256(out, bound))
+          if (atomicCAS(win_flag, 0, 1) == 0) { *win_rt = jt_i; *win_ct = jt_j; }
+      }
+    }
+  }
+#else
   for (int t = thread_idx; t < NJT; t += blockDim.x) {
     int jt_i = bi + t / CTOFF, jt_j = bj + t % CTOFF;
     if (jt_i >= nrow_off || jt_j >= ncol_off) continue;
@@ -666,10 +725,12 @@ __global__ void __launch_bounds__(TPB, 1) tc_cutlass_jackpot(
       if (atomicCAS(win_flag, 0, 1) == 0) { *win_rt = jt_i; *win_ct = jt_j; }
     }
   }
+#endif // A2_REG_TRANSCRIPT
 #endif // PROFILE_NOJACKPOT
-  // persistent mode reuses jp_sh next iteration: every thread must finish
-  // READING its tiles above before any thread re-clears. One-trip mode pays a
-  // single extra sync at block end — noise.
+  // smem (mma_smem) is reused next pid iteration. The mainloop drain already
+  // syncs, but a block-end barrier is cheap insurance for persistent reuse and,
+  // on the non-A2 path, ensures every thread finished READING jp_sh before the
+  // next iteration re-clears it.
   __syncthreads();
   } // pid grid-stride loop
 }
@@ -776,7 +837,11 @@ extern "C" int tc_search_launch(
 
   const int nbm = (nrow_off + RTOFF - 1)/RTOFF;
   const int nbn = (ncol_off + CTOFF - 1)/CTOFF;
+#ifdef A2_REG_TRANSCRIPT
+  size_t smem_bytes = sizeof(typename FoldMma::Base::SharedStorage);          // A2: transcript is in registers — no JPS smem (frees ~17KB -> KSTAGES=4 fits)
+#else
   size_t smem_bytes = sizeof(typename FoldMma::Base::SharedStorage) + (size_t)NJT*17*4;
+#endif
   static bool attr_set=false;
   if (!attr_set) {
     cudaError_t ae = cudaFuncSetAttribute(tc_cutlass_jackpot,
