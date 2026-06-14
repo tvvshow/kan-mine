@@ -1,4 +1,5 @@
 build/
+dist/
 *.o
 plainproof_gen
 cutlass/

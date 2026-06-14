@@ -340,8 +340,8 @@ Kan 的日志格式与 lpminer 兼容，包含以下内容：
 ```
 kan/
 ├── build.sh              # 一键编译脚本
-├── README.md              # 本文件
-├── TUNING_PHASE7.md       # 调优方向报告（搁置）
+├── package_portable.sh   # 便携包打包脚本（下载即用）
+├── README.md             # 本文件
 ├── src/
 │   ├── miner_main.cpp     # 主程序（矿池 + Solo + 日志 + NVML）
 │   ├── plainproof_gen.cpp # PlainProof 生成器（挖矿核心循环）

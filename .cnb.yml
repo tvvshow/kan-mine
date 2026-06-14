@@ -1,28 +1,16 @@
-# cnb.cool pipeline for the Pearl(PRL) self-built PoUW solver.
+# cnb.cool pipeline - Pearl(PRL) PoUW miner (kan).
 #
-# Cloud dev environment: auto-configures CUDA 12.4 + gcc + CUTLASS on boot.
-# After boot, just run:
-#   cd /workspace && bash build.sh
-#   cd build && ./plainproof_gen --mine --tc --cfg real --maxdraws 15 --breakdown
-#   cd build && ./kan --algo pearl --pool stratum+tcp://prl.kryptex.network:7048 --wallet prl1patz2mw7d28lqn33a768huhhsz3rg6e228m22wxh0v4pjh53x4qwsg2apmv.pm --worker pm --batch 500 --cfg real --tc
+# ONE branch line (main) + tag-driven Releases. No feature branches.
 #
-# Two pipelines:
-#   main (push) -> FREE GPU-less runner. CUDA still COMPILES with no GPU, and the
-#                  solver's reference path runs entirely on CPU, so this fully
-#                  builds AND correctness-verifies the solver at zero GPU cost:
-#                    build      -> portable multi-arch CUDA fatbin (sm_75..sm_90 SASS + PTX)
-#                    cpu-verify -> reference jackpot search -> oracle-shaped PlainProof
-#   gpu  (push) -> GPU runner (metered!). Builds natively for the runner's arch and
-#                  runs the dp4a kernel smoke test. Deliberately on a SEPARATE branch
-#                  so it only spends GPU minutes when you push to `gpu` on purpose.
+#   main / push      -> FREE GPU-less runner. CUDA compiles without a GPU and the
+#                       solver's reference path runs on CPU, so every commit is fully
+#                       built AND correctness-verified at zero GPU cost:
+#                         build      -> portable multi-arch fatbin (sm_75..sm_90 SASS + PTX)
+#                         cpu-verify -> reference jackpot search -> oracle-shaped PlainProof
 #
-# cnb GPU-runner selection is by tag (confirmed from working cnb.cool repos):
-#   cnb:arch:amd64:gpu        -> default, H20  (Hopper, sm_90)  <-- our fatbin already has sm_90 SASS
-#   cnb:arch:amd64:gpu:L40    -> L40           (Ada,    sm_89)
-#   cnb:arch:amd64:gpu:L20    -> L20 48GB      (Ada,    sm_89)
-# NOTE: cnb offers no Blackwell/sm_120 (5090) runner, so cnb GPU validates CORRECTNESS
-# on a real GPU (proof is arch-independent); sm_120 perf still needs the 5090 box.
-# NOTE: the GPU tag only schedules if GPU is enabled/approved for this repo (the 申请 step).
+#   <tag> / tag_push -> build the "download & run" portable package and publish it as a
+#                       Release with the tarball attached. Push a semver tag (e.g. v1.2.0)
+#                       to cut a release. Tags drive Releases - the only other trigger.
 
 main:
   push:
@@ -30,205 +18,44 @@ main:
         image: nvidia/cuda:12.4.1-devel-ubuntu22.04
       stages:
         - name: deps
-          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates libssl-dev
+          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git curl ca-certificates libssl-dev
         - name: cutlass
-          # header-only; without it build.sh silently falls back to tc_block and
-          # the production CUTLASS kernel never gets compile-checked on push
+          # header-only; without it build.sh silently falls back to tc_block and the
+          # production CUTLASS kernel never gets compile-checked on push.
           script: if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
         - name: toolchain-info
           script:
             - nvcc --version | tail -2
             - g++ --version | head -1
-            - (command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi) || echo "no GPU on this runner (expected; build is GPU-independent)"
         - name: build
           script: bash build.sh
         - name: cpu-verify
           script: bash cpu_test.sh
 
-# unified (push `unified` branch) -> FULL standalone-build verification at ZERO GPU
-# cost on the free GPU-less runner: installs Rust + libssl-dev, then `bash build.sh`
-# builds ALL THREE artifacts (plainproof_gen CLI, the unified pearl-miner with
-# pool+solo, the zkprove solo helper), runs the CPU correctness gate, zkprove's
-# byte-exact coinbase selftest, and a pearl-miner --help smoke. The "可独立编译" proof.
-unified:
-  push:
+# Tag-driven Release. The Release must exist before attachments can upload, so the
+# built-in git:release task runs FIRST, then cnbcool/attachments uploads the tarball.
+# On tag_push both tasks auto-target the pushed tag (no `tag:` needed).
+$:
+  tag_push:
     - docker:
         image: nvidia/cuda:12.4.1-devel-ubuntu22.04
       stages:
         - name: deps
-          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git curl ca-certificates libssl-dev pkg-config
-        - name: rust
-          script: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && . "$HOME/.cargo/env" && rustc --version && cargo --version
-        - name: build
-          script: . "$HOME/.cargo/env" && bash build.sh
-        - name: cpu-verify
-          script: bash cpu_test.sh
-        - name: miner-smoke
-          script:
-            - ./build/pearl-miner --help || true
-            - ./build/zkprove selftest
-
-# netprobe (push `netprobe` branch) -> LIVE validation of the C++ stratum contract
-# on the GPU runner's egress path (the one the real hunt uses): build pearl-miner,
-# then `--pool --net-probe` connects to kryptex 7048, authorizes, awaits one job,
-# logs it and exits 0. No mining (cheap). Proves the rewritten C++ pool client
-# speaks the same wire as the proven Python driver, before any paid live run.
-netprobe:
-  push:
-    - docker:
-        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-      runner:
-        tags: cnb:arch:amd64:gpu
-      stages:
-        - name: deps
-          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates libssl-dev
-        - name: build
-          script: bash build.sh
-        - name: net-probe
-          script: ./build/pearl-miner --pool --worker pmprobe --net-probe
-
-gpu:
-  push:
-    - docker:
-        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-      runner:
-        tags: cnb:arch:amd64:gpu        # H20 (sm_90); change to :gpu:L40 / :gpu:L20 if that's what was granted
-      stages:
-        - name: deps
-          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates libssl-dev
+          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git curl ca-certificates libssl-dev patchelf
         - name: cutlass
           script: if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
-        - name: gpu-info
-          script: nvidia-smi
-        - name: build
-          # build.sh auto-detects the runner's GPU (nvidia-smi -> sm_90 on H20) and builds natively
-          script: bash build.sh
-        - name: cpu-verify
-          # cheap CPU sanity gate before spending the GPU smoke run
-          script: bash cpu_test.sh
-        - name: gpu-persist-ab
-          # grid-stride kernel rework gate: golden POSTCHECK ok=1 on the real GPU,
-          # then real-config standard vs TC_PERSIST=1 kernel-ms A/B (3 draws each)
-          script: bash gpu_persist_ab.sh
-
-# poolprobe (push to `poolprobe` branch) -> M1c pre-flight. Pure network, no mining.
-# Runs on the SAME GPU runner the hunt will use, so it tests the REAL egress path:
-# can this runner reach kryptex stratum, authorize our wallet, and pull a job?
-# Gates the full ~1.8h/share hunt — cheap (~30s) fail-fast before spending GPU.
-poolprobe:
-  push:
-    - docker:
-        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-      runner:
-        tags: cnb:arch:amd64:gpu        # same tag that scheduled the L40 for the gpu pipeline
-      stages:
-        - name: deps
-          script: apt-get update -y && apt-get install -y --no-install-recommends python3 ca-certificates
-        - name: net-info
-          script: nvidia-smi -L && python3 --version
-        - name: pool-probe
-          script: python3 pool_probe.py
-
-# hunt (push to `hunt` branch) -> M1c REAL share hunt on the GPU runner.
-# Builds the solver natively (sm_89 on L40), then runs m1c_pool_hunt.py: mine the
-# latest kryptex job at share diff 2^20; on a win, submit + wait 30s for the pool's
-# verdict (the M1c ground truth), then stop. MAXSEC is large so cnb's OWN job cap is
-# the binding limit (lets us measure it); STOP_AFTER_WIN ends early on the first win.
-hunt:
-  push:
-    - docker:
-        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-      runner:
-        tags: cnb:arch:amd64:gpu
-      stages:
-        - name: deps
-          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git python3 ca-certificates
-        - name: gpu-info
-          script: nvidia-smi -L
-        - name: build
-          script: bash build.sh
-        - name: hunt
-          script: OMP_NUM_THREADS=16 WORKER=m1ccnb GEN=$PWD/build/plainproof_gen GENDIR=$PWD/build WIN_FILE=/tmp/m1c_win.json MAXSEC=7200 BATCH=1000000 STOP_AFTER_WIN=1 STOP_ON_ACK=1 python3 m1c_pool_hunt.py
-
-# probe2 (push `probe2` branch) -> M1c submit-shape disambiguation. The hunt found a
-# real win but the pool was SILENT on the submit. This builds the solver (for a
-# well-formed proof) then sends 3 mining.submit variants (real-job / bogus-job_id /
-# garbage-proof), with and without mining.subscribe, and reports which the pool ACKs.
-# A bogus-job_id "unknown job" ack => our shape is recognized; all-silent => it isn't.
-probe2:
-  push:
-    - docker:
-        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-      runner:
-        tags: cnb:arch:amd64:gpu
-      stages:
-        - name: deps
-          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git python3 ca-certificates
-        - name: build
-          script: bash build.sh
-        - name: probe2-nosub
-          script: WORKER=probe2n GEN=$PWD/build/plainproof_gen SUBSCRIBE=0 python3 pool_probe2.py
-        - name: probe2-sub
-          script: WORKER=probe2s GEN=$PWD/build/plainproof_gen SUBSCRIBE=1 python3 pool_probe2.py
-
-# verify (push `verify` branch) -> M1c OFFLINE self-verify. Removes the LAST doubt about
-# our side before spending money on lpminer capture. Builds the OFFICIAL Rust verifier
-# (zk_pow::api::verify::verify_plain_proof, from vendored pearl-spec) and our solver, then
-# checks proofs from BOTH the CPU reference path AND the GPU `--mine` redraw loop the live
-# hunt used (whose winning-share assembly has never been officially verified). GPU runner
-# is required because `--mine` runs the dp4a CUDA kernel.
-#   ALL-VALID  => our proof is officially correct end to end => kryptex reject is THEIR
-#                 third-party submit contract, not us => greenlight paid lpminer capture.
-#   any INVALID => a real, free-fixable bug on our side, found before spending a cent.
-verify:
-  push:
-    - docker:
-        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-      runner:
-        tags: cnb:arch:amd64:gpu
-      stages:
-        - name: deps
-          script: apt-get update -y && apt-get install -y --no-install-recommends curl gcc g++ make git ca-certificates
-        - name: gpu-info
-          script: nvidia-smi -L
-        - name: self-verify
-          script: bash verify_run.sh
-
-# ---- Cloud dev environment ----
-# 开机自动配置 CUDA 12.4 + gcc + CUTLASS，然后编译。
-# 开机完成后直接运行测试即可。
-$:
-  vscode:
-    - docker:
-        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-      services:
-        - vscode
-      runner:
-        tags: cnb:arch:amd64:gpu
-      stages:
-        - name: setup-env
-          script:
-            - apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git ca-certificates libssl-dev
-            - nvcc --version | tail -2
-            - g++ --version | head -1
-            - nvidia-smi -L || echo "no GPU"
-        - name: clone-cutlass
-          script:
-            - if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
-            - ls ~/cutlass/include/cutlass/cutlass.h && echo "CUTLASS OK"
-        - name: build
-          script:
-            - cd /workspace && bash build.sh
-        - name: ready
-          script:
-            - echo "=========================================="
-            - echo "  编译完成! 运行以下命令测试:"
-            - echo "=========================================="
-            - echo ""
-            - echo "  基准测试:"
-            - echo "    cd /workspace/build && ./plainproof_gen --mine --tc --cfg real --maxdraws 15 --breakdown"
-            - echo ""
-            - echo "  连接矿池:"
-            - echo "    cd /workspace/build && ./kan --algo pearl --pool stratum+tcp://prl.kryptex.network:7048 --wallet prl1patz2mw7d28lqn33a768huhhsz3rg6e228m22wxh0v4pjh53x4qwsg2apmv.pm --worker pm --batch 500 --cfg real --tc"
-            - echo ""
-            - ls -la /workspace/build/plainproof_gen /workspace/build/kan
+        - name: package
+          # -> dist/kan-portable-linux-x64.tar.gz (static cudart + bundled libs + multi-arch
+          # fatbin). WITH_AB=0 ships a clean miner (no RMW A/B baseline binary).
+          script: WITH_AB=0 bash package_portable.sh
+        - name: create-release
+          # built-in task; title defaults to the tag name, tag auto-taken from tag_push.
+          type: git:release
+          options:
+            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs, multi-arch fatbin (sm_75..sm_90 SASS + PTX; Blackwell JITs the PTX at runtime). Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt inside."
+            latest: true
+        - name: upload-portable-package
+          image: cnbcool/attachments:latest
+          settings:
+            attachments:
+              - dist/kan-portable-linux-x64.tar.gz
