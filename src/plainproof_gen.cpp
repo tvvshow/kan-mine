@@ -43,9 +43,6 @@ extern int g_miner_verbose;  // defined in miner_main.cpp
 std::atomic<uint64_t> g_live_draw_count{0};
 // Exported work_per_draw so stats thread can show hashrate before first batch returns
 double g_work_per_draw_export = 0;
-// gpu_draw.h deliberately NOT included: gpu_produce_draw is unused here until
-// Week4 GPU-RNG lands, and pulling <cuda_runtime.h> into this TU breaks the
-// host-only build (CUDA-13 headers are C++-template-heavy).
 
 #include "prover.h"
 
