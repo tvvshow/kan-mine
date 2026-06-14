@@ -55,6 +55,37 @@ fold 总开销（vs 真 floor）= 698 - 537 = 161 ms = 内核的 23%
 
 ---
 
+## ⚑⚑ 功耗墙 + 时钟 = "计算回落"的真因（2026-06-14 实测，3080Ti @ 350W）
+
+用户问的"计算回落"和"为什么达不到 roofline"，实测定位到 **功耗墙**，不是算法、不是散热：
+
+**回落现象**：sustained 30-draw，per-draw 从 705.9ms 单调爬到 725ms（~3%）后稳定。
+**根因**：`clocks_throttle_reasons.active = 0x04 = SW Power Cap`，109/124 采样都在限功。
+- 功耗钉在 348–350W = 卡的硬上限（`power.max_limit=350W`，**不可调高**；容器内 `nvidia-smi -lgc` 锁频**被拒权限**）。
+- SM 时钟从启动 boost 1665 → 稳态 ~1560 MHz（够不到 2100 max boost）。
+- 温度只有 51–56°C → **不是热降频**，纯粹是 350W 功耗墙压住时钟。
+
+**100 vs 130 的真相（apples-to-apples）**：
+- 纯 int8 GEMM bench（**同 tile 128×256×64**）sustained iters=300 = **129.6 TMAC/s @ avg 1786 MHz**（也在 0x04 限功）。
+- fused 内核 = 97.5 TH/s @ avg 1583 MHz。
+- **130→100 的差距主要是时钟**（GEMM bench boost 到 1786，fused 只能 1583）；
+  clock-normalize 后 fused ≈ GEMM roofline 的 ~85%，即 fold/epilogue 非 GEMM 开销 ~15%（其中 redux ~7%）。
+- GEMM bench 时钟更高的原因 ≈ **occupancy**：fused 是 255 寄存器 → 1 block/SM → 8 warp/SM = **16.7% occupancy**；
+  纯 device::Gemm 每 SM 塞更多 warp，在 350W 预算内能 boost 更高。
+
+**redux 复核**：FULL 721ms(97.5) → NOREDUX 671ms(104.9) = redux 50ms = **7%**（与早先 46ms 一致，可复现）。
+但 **NOREDUX 时钟反而更低（1538<1583）→ "fold 功耗压时钟" 假设被否**：fold 是靠**时间**拖慢，不是功耗/时钟。
+且 5090 实测 shfl-butterfly 比 REDUX.SYNC **更慢**（223 vs 200ms）→ REDUX 已是最优原语，A2.1 大概率没用。
+
+**关键结论（已证）**：
+1. **sm_86 上内核已接近"功耗墙下的 GEMM roofline"**，fold 用的是最优原语，没有显著的 on-box 提速杠杆了。
+2. 97.5 TH/s 已**超过 lpminer（91）**、接近 SRBMiner（106）——是有竞争力的、接近实际天花板的位置。
+3. "回落"是功耗墙下的正常时钟沉降，所有矿工在这张卡上都一样，不是我们的 bug。
+4. **唯一能实质提速的方向 = Phase C：sm_90+（Hopper/Blackwell）的 WGMMA/TMA** —— 更高 MAC/watt +
+   更大功耗预算 + 重构 fold。需要换机（sm_86 不支持 WGMMA）。次选 = 直接换更高功耗预算的新卡（5090 @600W=350TH/s）。
+
+---
+
 ## 0. 核心结论（这次的重定向）
 
 > **fold 不是 5090 专属问题，是所有架构的头号瓶颈。3080Ti 不只是正确性盒子，
