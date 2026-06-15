@@ -1,5 +1,13 @@
 # Pearl(PRL) 矿工提速设计 (DESIGN_speedup.md)
 
+> **【状态：已收口，2026-06-15】** 本文是 sm_86(3080Ti) 视角的历史提速路线。其中的 Phase 全部
+> 已落地并经实测验证——内核从 30 → 106-112 TH/s（3090），4090=260，5090=354。后续的
+> fold/占用/Blackwell 假设已在真 5090 上测完，结论是**算法近硬件天花板、无 2× 空间**。
+> **当前权威结论看 [`BRANCHES.md`](BRANCHES.md)；fold 实测矩阵看 `dev/fold` 分支的 `FOLD_PLAN.md`。**
+> 本文保留作设计与诊断方法学的历史记录。
+
+---
+
 > 目标卡：RTX 3080 Ti (sm_86)。同卡同配置基线：
 > **SRBMiner 106 TH/s / lpminer ~91 TH/s（share 640–774ms）**，本实现 kernel-only ~30 TH/s。
 > 配置 REAL：m=n=131072, k=4096, rank=256, h=8, w=16；每 draw 工作量 70.37e12 PRL-work。
