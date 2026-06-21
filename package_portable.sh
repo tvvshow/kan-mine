@@ -117,6 +117,19 @@ here="$(cd "$(dirname "$0")" && pwd)"
 if ! ls /dev/nvidia0 >/dev/null 2>&1 && ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "WARNING: no NVIDIA GPU/driver detected — this is a CUDA GPU miner." >&2
 fi
+
+# Ampere sm_86 packages measured faster on the 3080Ti test box with the
+# non-persistent launch path.  Keep this as a package/runtime default instead of
+# baking it into the kernel so operators can still override:
+#   TC_PERSIST=1 ./run.sh ...
+if [ -z "${TC_PERSIST+x}" ]; then
+  arch="$(awk -F': ' '/^arch:/ {print $2; exit}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
+  flavor="$(awk -F': ' '/^package_flavor:/ {print $2; exit}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
+  case "$arch:$flavor" in
+    sm_86:*|*:sm86-*) export TC_PERSIST=0 ;;
+  esac
+fi
+
 exec "$here/kan" "$@"
 LAUNCH
 chmod +x "${STAGE}/run.sh"
@@ -346,6 +359,10 @@ GPU arch note:
 
 Verify it's truly portable (should list only glibc + libcuda as external):
   ldd ./kan
+
+Ampere tuning note:
+  sm_86 packages default TC_PERSIST=0 because v1.2.11/v1.2.12 VPS data showed
+  it is faster on RTX 3080Ti. Override with TC_PERSIST=1 ./run.sh ... if needed.
 README
 
 echo "=== [4/5] portability proof (ldd of staged kan) ==="

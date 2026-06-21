@@ -67,6 +67,16 @@ $:
           script: WITH_AB=0 ARCH=sm_86 GROUPM=16 KSTAGES=3 PACKAGE_FLAVOR=sm86-g16-k3 bash package_portable.sh
         - name: package-sm86-g24-k3
           script: WITH_AB=0 ARCH=sm_86 GROUPM=24 KSTAGES=3 PACKAGE_FLAVOR=sm86-g24-k3 bash package_portable.sh
+        - name: package-sm86-g8-k2
+          # Pipeline-depth sweep: GROUPM=8 was still best in v1.2.12, so test
+          # whether a shallower/deeper cp.async pipeline moves sm_86 over 100 TH/s.
+          script: WITH_AB=0 ARCH=sm_86 GROUPM=8 KSTAGES=2 PACKAGE_FLAVOR=sm86-g8-k2 bash package_portable.sh
+        - name: package-sm86-g8-k4
+          script: WITH_AB=0 ARCH=sm_86 GROUPM=8 KSTAGES=4 PACKAGE_FLAVOR=sm86-g8-k4 bash package_portable.sh
+        - name: package-sm86-g4-k4
+          script: WITH_AB=0 ARCH=sm_86 GROUPM=4 KSTAGES=4 PACKAGE_FLAVOR=sm86-g4-k4 bash package_portable.sh
+        - name: package-sm86-g12-k4
+          script: WITH_AB=0 ARCH=sm_86 GROUPM=12 KSTAGES=4 PACKAGE_FLAVOR=sm86-g12-k4 bash package_portable.sh
         - name: create-release
           # built-in task; title defaults to the tag name, tag auto-taken from tag_push.
           type: git:release
@@ -83,3 +93,7 @@ $:
               - dist/kan-portable-linux-x64-sm86-g12-k3.tar.gz
               - dist/kan-portable-linux-x64-sm86-g16-k3.tar.gz
               - dist/kan-portable-linux-x64-sm86-g24-k3.tar.gz
+              - dist/kan-portable-linux-x64-sm86-g8-k2.tar.gz
+              - dist/kan-portable-linux-x64-sm86-g8-k4.tar.gz
+              - dist/kan-portable-linux-x64-sm86-g4-k4.tar.gz
+              - dist/kan-portable-linux-x64-sm86-g12-k4.tar.gz
