@@ -858,14 +858,29 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
     // each draw immediately regenerates fresh A/B and seeds below. Running this
     // setup before entering the loop cost ~20 seconds at the real config and made
     // pool jobs stale before the first actual draw could even start.
-    vector<int8_t> A(m * k);     // A[i*k + j]
-    vector<int8_t> Bt(n * k);    // Bt[i*k + j] = b_matrix[j][i]  (transpose)
+    // Large CPU-side draw/proof buffers are allocated lazily.  The production
+    // GPU-resident mining path does not need them while searching: it only
+    // needs them after a GPU win, to re-derive the winning draw for POSTCHECK
+    // and proof serialization.  Allocating several GiB on every pool job
+    // refresh was a real wall-hashrate tax under frequent stratum notify.
+    vector<int8_t> A;            // A[i*k + j]
+    vector<int8_t> Bt;           // Bt[i*k + j] = b_matrix[j][i]  (transpose)
     auto chunk_padded_len = [](size_t len) -> size_t {
         const size_t rem = len % BLAKE3_CHUNK_LEN;
         return rem ? (len + (BLAKE3_CHUNK_LEN - rem)) : len;
     };
-    vector<uint8_t> a_padded(chunk_padded_len(A.size()));
-    vector<uint8_t> bt_padded(chunk_padded_len(Bt.size()));
+    vector<uint8_t> a_padded;
+    vector<uint8_t> bt_padded;
+    auto ensure_cpu_base = [&]() {
+        const size_t a_len = m * k;
+        const size_t b_len = n * k;
+        if (A.size() != a_len) A.resize(a_len);
+        if (Bt.size() != b_len) Bt.resize(b_len);
+        const size_t ap_len = chunk_padded_len(a_len);
+        const size_t bp_len = chunk_padded_len(b_len);
+        if (a_padded.size() != ap_len) a_padded.resize(ap_len);
+        if (bt_padded.size() != bp_len) bt_padded.resize(bp_len);
+    };
     Digest hash_a{}, hash_b{}, b_noise_seed{}, a_noise_seed{};
 
     Digest seed_a_label; memcpy(seed_a_label.data(), SEED_LABEL_A, 32);
@@ -875,6 +890,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
     vector<array<uint32_t,2>> e_bl;
 
     if (!mine) {
+        ensure_cpu_base();
         // RNG: signal in [-64, 64] inclusive (65 values). Reproducible.
         std::mt19937_64 rng(seed);
         std::uniform_int_distribution<int> dist(-64, 64);
@@ -1009,12 +1025,25 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         // tc_jackpot_search (tc_block.cu) manages its own device memory per call.
         // -------------------------------------------------------------------
 
-        // Double-buffered GPU handoff (two slots). Everything else is shared
-        // scratch, allocated once and written only inside produce_draw.
-        std::vector<signed char> a_noised[2]   = { std::vector<signed char>((size_t)m*k), std::vector<signed char>((size_t)m*k) };
-        std::vector<signed char> b_noised_t[2] = { std::vector<signed char>((size_t)n*k), std::vector<signed char>((size_t)n*k) };
+        // Double-buffered CPU fallback/proof handoff (two slots).  On the
+        // GPU-resident search path these stay empty until an actual win needs
+        // CPU re-derivation for POSTCHECK/proof.  This avoids allocating several
+        // GiB every time the pool sends a fresh job.
+        std::vector<signed char> a_noised[2];
+        std::vector<signed char> b_noised_t[2];
         Digest a_noise_seed_slot[2] = {};
-        std::vector<int8_t> noise_a((size_t)m*k), noise_b((size_t)n*k);
+        std::vector<int8_t> noise_a, noise_b;
+        auto ensure_cpu_mine_scratch = [&]() {
+            ensure_cpu_base();
+            const size_t a_len = m * k;
+            const size_t b_len = n * k;
+            for (int s = 0; s < 2; s++) {
+                if (a_noised[s].size() != a_len) a_noised[s].resize(a_len);
+                if (b_noised_t[s].size() != b_len) b_noised_t[s].resize(b_len);
+            }
+            if (noise_a.size() != a_len) noise_a.resize(a_len);
+            if (noise_b.size() != b_len) noise_b.resize(b_len);
+        };
 
         using clk = std::chrono::high_resolution_clock;
         auto t_start = clk::now();
@@ -1043,6 +1072,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         // shared state after the producer has moved on. Runs on the producer
         // thread (overlapping the GPU) and, once, on this thread to re-derive.
         auto produce_draw = [&](uint64_t d, int slot, bool tells) {
+            ensure_cpu_mine_scratch();
             double ms_rng=0, ms_hash=0, ms_noise=0, ms_build=0;
             auto tic = clk::now();
             auto lap = [&](double& dst){ auto now=clk::now(); dst=std::chrono::duration<double,std::milli>(now-tic).count(); tic=now; };
