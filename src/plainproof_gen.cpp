@@ -166,7 +166,9 @@ struct MerkleTree {
         }
         size_t num_chunks = (dl + CHUNK_LEN - 1) / CHUNK_LEN;
         vector<Digest> chunk_cvs(num_chunks);
-        for (size_t i = 0; i < num_chunks; i++) {
+        #pragma omp parallel for schedule(static)
+        for (long long ii = 0; ii < (long long)num_chunks; ii++) {
+            size_t i = (size_t)ii;
             size_t start = i * CHUNK_LEN;
             size_t len = std::min(CHUNK_LEN, dl - start);
             chunk_cvs[i] = chunk_cv(k, d + start, len, (uint64_t)i);
@@ -174,11 +176,14 @@ struct MerkleTree {
         layers.push_back(std::move(chunk_cvs));
         while (layers.back().size() > 2) {
             const vector<Digest>& prev = layers.back();
-            vector<Digest> next;
-            next.reserve((prev.size() + 1) / 2);
-            for (size_t i = 0; i + 1 < prev.size(); i += 2)
-                next.push_back(parent_cv(k, prev[i], prev[i+1]));
-            if (prev.size() % 2 == 1) next.push_back(prev.back());
+            size_t pairs = prev.size() / 2;
+            vector<Digest> next((prev.size() + 1) / 2);
+            #pragma omp parallel for schedule(static)
+            for (long long pp = 0; pp < (long long)pairs; pp++) {
+                size_t p = (size_t)pp;
+                next[p] = parent_cv(k, prev[2*p], prev[2*p + 1]);
+            }
+            if (prev.size() % 2 == 1) next[pairs] = prev.back();
             layers.push_back(std::move(next));
         }
         const vector<Digest>& last = layers.back();
