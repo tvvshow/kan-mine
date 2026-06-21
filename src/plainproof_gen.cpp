@@ -861,16 +861,21 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
     // Large CPU-side draw/proof buffers are allocated lazily.  The production
     // GPU-resident mining path does not need them while searching: it only
     // needs them after a GPU win, to re-derive the winning draw for POSTCHECK
-    // and proof serialization.  Allocating several GiB on every pool job
-    // refresh was a real wall-hashrate tax under frequent stratum notify.
-    vector<int8_t> A;            // A[i*k + j]
-    vector<int8_t> Bt;           // Bt[i*k + j] = b_matrix[j][i]  (transpose)
+    // and proof serialization.  Keep the backing storage thread-local so the
+    // next found share reuses capacity instead of paying multi-GiB allocation
+    // and zero-fill again.  Contents are fully overwritten for each rederive.
+    static thread_local vector<int8_t> A_store;   // A[i*k + j]
+    static thread_local vector<int8_t> Bt_store;  // Bt[i*k + j] = b_matrix[j][i]
+    static thread_local vector<uint8_t> a_padded_store;
+    static thread_local vector<uint8_t> bt_padded_store;
+    vector<int8_t>& A = A_store;
+    vector<int8_t>& Bt = Bt_store;
     auto chunk_padded_len = [](size_t len) -> size_t {
         const size_t rem = len % BLAKE3_CHUNK_LEN;
         return rem ? (len + (BLAKE3_CHUNK_LEN - rem)) : len;
     };
-    vector<uint8_t> a_padded;
-    vector<uint8_t> bt_padded;
+    vector<uint8_t>& a_padded = a_padded_store;
+    vector<uint8_t>& bt_padded = bt_padded_store;
     auto ensure_cpu_base = [&]() {
         const size_t a_len = m * k;
         const size_t b_len = n * k;
@@ -878,8 +883,28 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         if (Bt.size() != b_len) Bt.resize(b_len);
         const size_t ap_len = chunk_padded_len(a_len);
         const size_t bp_len = chunk_padded_len(b_len);
-        if (a_padded.size() != ap_len) a_padded.resize(ap_len);
-        if (bt_padded.size() != bp_len) bt_padded.resize(bp_len);
+        if (ap_len == a_len) {
+            a_padded.clear();  // aligned: use A bytes directly for hash/Merkle
+        } else if (a_padded.size() != ap_len) {
+            a_padded.resize(ap_len);
+        }
+        if (bp_len == b_len) {
+            bt_padded.clear();  // aligned: use Bt bytes directly for hash/Merkle
+        } else if (bt_padded.size() != bp_len) {
+            bt_padded.resize(bp_len);
+        }
+    };
+    auto matrix_bytes = [](const vector<int8_t>& raw,
+                           const vector<uint8_t>& padded,
+                           const uint8_t** data,
+                           size_t* len) {
+        if (!padded.empty()) {
+            *data = padded.data();
+            *len = padded.size();
+        } else {
+            *data = reinterpret_cast<const uint8_t*>(raw.data());
+            *len = raw.size();
+        }
     };
     Digest hash_a{}, hash_b{}, b_noise_seed{}, a_noise_seed{};
 
@@ -1094,15 +1119,28 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
             }
             if (tells) lap(ms_rng);
 
-            // (b) blake3 hash_a + hash_b (over padded A / padded Bt) + chained seeds.
-            #pragma omp parallel for schedule(static)
-            for (long i = 0; i < (long)m; i++)
-                for (size_t j=0;j<k;j++) a_padded[(size_t)i*k+j]=(uint8_t)A[(size_t)i*k+j];
-            #pragma omp parallel for schedule(static)
-            for (long i = 0; i < (long)n; i++)
-                for (size_t j=0;j<k;j++) bt_padded[(size_t)i*k+j]=(uint8_t)Bt[(size_t)i*k+j];
-            hash_a = blake3_digest(a_padded, &job_key);
-            hash_b = blake3_digest(bt_padded, &job_key);
+            // (b) blake3 hash_a + hash_b + chained seeds.  Real/golden matrix
+            // byte lengths are already 1024-byte aligned, so the canonical
+            // padded data is byte-identical to A/Bt.  In that common path hash
+            // the raw int8 storage directly and avoid a 1 GiB padding copy.
+            if (!a_padded.empty()) {
+                #pragma omp parallel for schedule(static)
+                for (long i = 0; i < (long)m; i++)
+                    for (size_t j=0;j<k;j++) a_padded[(size_t)i*k+j]=(uint8_t)A[(size_t)i*k+j];
+                hash_a = blake3_digest(a_padded, &job_key);
+            } else {
+                hash_a = blake3_digest(reinterpret_cast<const uint8_t*>(A.data()),
+                                       A.size(), &job_key);
+            }
+            if (!bt_padded.empty()) {
+                #pragma omp parallel for schedule(static)
+                for (long i = 0; i < (long)n; i++)
+                    for (size_t j=0;j<k;j++) bt_padded[(size_t)i*k+j]=(uint8_t)Bt[(size_t)i*k+j];
+                hash_b = blake3_digest(bt_padded, &job_key);
+            } else {
+                hash_b = blake3_digest(reinterpret_cast<const uint8_t*>(Bt.data()),
+                                       Bt.size(), &job_key);
+            }
             { uint8_t si[64];
               memcpy(si, job_key.data(),32); memcpy(si+32, hash_b.data(),32);
               b_noise_seed = blake3_digest(si,64,nullptr);
@@ -1497,9 +1535,15 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
     }
 
     // Build Merkle proofs
-    MerkleTree tree_a(a_padded.data(), a_padded.size(), job_key);
+    const uint8_t* a_merkle_data = nullptr;
+    const uint8_t* bt_merkle_data = nullptr;
+    size_t a_merkle_len = 0;
+    size_t bt_merkle_len = 0;
+    matrix_bytes(A, a_padded, &a_merkle_data, &a_merkle_len);
+    matrix_bytes(Bt, bt_padded, &bt_merkle_data, &bt_merkle_len);
+    MerkleTree tree_a(a_merkle_data, a_merkle_len, job_key);
     proof_lap(ms_merkle_a_tree);
-    MerkleTree tree_bt(bt_padded.data(), bt_padded.size(), job_key);
+    MerkleTree tree_bt(bt_merkle_data, bt_merkle_len, job_key);
     proof_lap(ms_merkle_bt_tree);
     vector<size_t> a_leaf_idx = compute_leaf_indices_from_rows(win_rows, m, k);
     vector<size_t> bt_leaf_idx = compute_leaf_indices_from_rows(win_cols, n, k);
@@ -1525,11 +1569,12 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         double ms_total = std::chrono::duration<double, std::milli>(
                               proof_clk::now() - proof_total_t0).count();
         fprintf(stderr,
-                "PROOF_TIMING postcheck=%.2fms merkle_a_tree=%.2fms merkle_bt_tree=%.2fms leaf_idx=%.2fms proof_a=%.2fms proof_bt=%.2fms serialize=%.2fms base64=%.2fms total=%.2fms leaves_a=%zu leaves_bt=%zu siblings_a=%zu siblings_bt=%zu proof_bytes=%zu b64_chars=%zu\n",
+                "PROOF_TIMING postcheck=%.2fms merkle_a_tree=%.2fms merkle_bt_tree=%.2fms leaf_idx=%.2fms proof_a=%.2fms proof_bt=%.2fms serialize=%.2fms base64=%.2fms total=%.2fms leaves_a=%zu leaves_bt=%zu siblings_a=%zu siblings_bt=%zu direct_a=%d direct_bt=%d proof_bytes=%zu b64_chars=%zu\n",
                 ms_postcheck, ms_merkle_a_tree, ms_merkle_bt_tree, ms_leaf_idx,
                 ms_merkle_a_proof, ms_merkle_bt_proof, ms_serialize, ms_base64,
                 ms_total, a_leaf_idx.size(), bt_leaf_idx.size(),
                 a_proof.siblings.size(), bt_proof.siblings.size(),
+                a_padded.empty() ? 1 : 0, bt_padded.empty() ? 1 : 0,
                 w.buf.size(), b64.size());
     }
     R.proof_b64 = b64;
