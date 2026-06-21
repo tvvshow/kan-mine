@@ -790,14 +790,25 @@ extern "C" int tc_alloc_bufs(int m,int n,int k,int h,int w,int nrow_off,int ncol
 // after the gathers so gpu_prep's stream can order itself behind them.
 static cudaStream_t g_search_stream = nullptr;
 static cudaEvent_t  g_gather_evt = nullptr, g_se0 = nullptr, g_se1 = nullptr;
+static cudaEvent_t  g_te0 = nullptr, g_te_gather = nullptr;
 static size_t g_inflight_tiles = 0;
 static double g_inflight_work = 0;
+static int g_tc_timing = -1;
+
+static bool tc_timing_enabled() {
+  if (g_tc_timing < 0) {
+    const char* e = getenv("TC_TIMING");
+    g_tc_timing = (e && atoi(e)) ? 1 : 0;
+  }
+  return g_tc_timing != 0;
+}
 
 static bool ensure_search_stream() {
   if (g_search_stream) return true;
   if (cudaStreamCreateWithFlags(&g_search_stream, cudaStreamNonBlocking) != cudaSuccess) return false;
   cudaEventCreateWithFlags(&g_gather_evt, cudaEventDisableTiming);
   cudaEventCreate(&g_se0); cudaEventCreate(&g_se1);
+  cudaEventCreate(&g_te0); cudaEventCreate(&g_te_gather);
   return true;
 }
 
@@ -821,6 +832,8 @@ extern "C" int tc_search_launch(
   g_inflight_tiles = (size_t)nrow_off * ncol_off;
   g_inflight_work  = (double)g_inflight_tiles * h * w * (k - (k % rank));
 
+  if (tc_timing_enabled() || g_miner_verbose) cudaEventRecord(g_te0, s);
+
   // pageable-source async copies stage synchronously -> stack/temp sources OK
   cudaMemcpyAsync(B.dpr,pat_rows,h*4,cudaMemcpyHostToDevice,s);
   cudaMemcpyAsync(B.dpc,pat_cols,w*4,cudaMemcpyHostToDevice,s);
@@ -834,6 +847,7 @@ extern "C" int tc_search_launch(
   gather_rows<<<nrow_off*h, 256, 0, s>>>(B.dA, B.dAp, k, B.droff, B.dpr, h, nrow_off);
   gather_rows<<<ncol_off*w, 256, 0, s>>>(B.dBt, B.dBtp, k, B.dcoff, B.dpc, w, ncol_off);
   cudaEventRecord(g_gather_evt, s);   // prep(N+1) may write dA/dBt after this
+  if (tc_timing_enabled() || g_miner_verbose) cudaEventRecord(g_te_gather, s);
 
   const int nbm = (nrow_off + RTOFF - 1)/RTOFF;
   const int nbn = (ncol_off + CTOFF - 1)/CTOFF;
@@ -889,12 +903,21 @@ extern "C" int tc_search_wait(int* out_rt, int* out_ct)
 {
   DevBufs& B = g_bufs;
   cudaError_t err = cudaStreamSynchronize(g_search_stream);
-  if (g_miner_verbose) {
-    float ms=0; cudaEventElapsedTime(&ms,g_se0,g_se1);
-    double ths = g_inflight_work / (ms * 1e-3) / 1e12;
+  if (g_miner_verbose || tc_timing_enabled()) {
+    float search_ms=0, pre_ms=0, total_ms=0;
+    cudaEventElapsedTime(&search_ms,g_se0,g_se1);
+    if (g_te0 && g_te_gather) {
+      cudaEventElapsedTime(&pre_ms,g_te0,g_te_gather);
+      cudaEventElapsedTime(&total_ms,g_te0,g_se1);
+    } else {
+      total_ms = search_ms;
+    }
+    double search_ths = g_inflight_work / (search_ms * 1e-3) / 1e12;
+    double total_ths = g_inflight_work / (total_ms * 1e-3) / 1e12;
     fprintf(stderr,
-            "tc(cutlass2): TB=%dx%dx%d W=%dx%d s%d T%d FUSED %zu tiles, %.3f ms, %.2f TH/s\n",
-            BM, BN, (int)TBShape::kK, WM, WN, kStages, TPB, g_inflight_tiles, ms, ths);
+            "tc(cutlass2): TB=%dx%dx%d W=%dx%d s%d T%d G%d FUSED %zu tiles, prep+gather=%.3f ms, search=%.3f ms %.2f TH/s, total=%.3f ms %.2f TH/s\n",
+            BM, BN, (int)TBShape::kK, WM, WN, kStages, TPB, GROUPM,
+            g_inflight_tiles, pre_ms, search_ms, search_ths, total_ms, total_ths);
   }
   if (err!=cudaSuccess){ fprintf(stderr,"tc_cutlass: err %s\n",cudaGetErrorString(err)); return -1; }
 
