@@ -1447,6 +1447,23 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         fprintf(stderr, "]\n");
     }
 
+    using proof_clk = std::chrono::high_resolution_clock;
+    auto proof_total_t0 = proof_clk::now();
+    auto proof_tic = proof_total_t0;
+    auto proof_lap = [&](double& dst_ms) {
+        auto now = proof_clk::now();
+        dst_ms = std::chrono::duration<double, std::milli>(now - proof_tic).count();
+        proof_tic = now;
+    };
+    double ms_postcheck = 0.0;
+    double ms_merkle_a_tree = 0.0;
+    double ms_merkle_bt_tree = 0.0;
+    double ms_leaf_idx = 0.0;
+    double ms_merkle_a_proof = 0.0;
+    double ms_merkle_bt_proof = 0.0;
+    double ms_serialize = 0.0;
+    double ms_base64 = 0.0;
+
     // Final CPU ground-truth gate for any real mined win.  --probe intentionally
     // emits a structurally-valid but non-winning proof, so it is excluded.
     if (!probe) {
@@ -1454,6 +1471,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         Digest post_hash = compute_tile_jackpot_hash_cpu(
             A, Bt, k, rank, win_rows, win_cols, e_ar_t, e_bl,
             seed_a_label, seed_b_label, a_noise_seed, b_noise_seed, post_jackpot);
+        proof_lap(ms_postcheck);
         U256 post_v = U256::from_le(post_hash.data());
         const bool post_ok = post_v.le(bound);
         if (g_miner_verbose) {
@@ -1466,6 +1484,13 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
             fprintf(stderr, " ok=%d\n", post_ok ? 1 : 0);
         }
         if (!post_ok) {
+            if (mine) {
+                fprintf(stderr,
+                        "PROOF_TIMING failed=1 postcheck=%.2fms total=%.2fms\n",
+                        ms_postcheck,
+                        std::chrono::duration<double, std::milli>(
+                            proof_clk::now() - proof_total_t0).count());
+            }
             fprintf(stderr, "ERROR: GPU/driver reported a win, but CPU postcheck says it does not meet the active target; refusing to emit a pool-rejected proof.\n");
             return 4;
         }
@@ -1473,11 +1498,16 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
 
     // Build Merkle proofs
     MerkleTree tree_a(a_padded.data(), a_padded.size(), job_key);
+    proof_lap(ms_merkle_a_tree);
     MerkleTree tree_bt(bt_padded.data(), bt_padded.size(), job_key);
+    proof_lap(ms_merkle_bt_tree);
     vector<size_t> a_leaf_idx = compute_leaf_indices_from_rows(win_rows, m, k);
     vector<size_t> bt_leaf_idx = compute_leaf_indices_from_rows(win_cols, n, k);
+    proof_lap(ms_leaf_idx);
     MerkleProof a_proof = get_multileaf_proof(tree_a, a_leaf_idx);
+    proof_lap(ms_merkle_a_proof);
     MerkleProof bt_proof = get_multileaf_proof(tree_bt, bt_leaf_idx);
+    proof_lap(ms_merkle_bt_proof);
 
     // Serialize PlainProof via bincode
     BinWriter w;
@@ -1487,8 +1517,21 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
     w.u64((uint64_t)rank); // noise_rank
     write_matrix_proof(w, a_proof, win_rows);
     write_matrix_proof(w, bt_proof, win_cols);
+    proof_lap(ms_serialize);
 
     std::string b64 = base64_encode(w.buf);
+    proof_lap(ms_base64);
+    if (mine) {
+        double ms_total = std::chrono::duration<double, std::milli>(
+                              proof_clk::now() - proof_total_t0).count();
+        fprintf(stderr,
+                "PROOF_TIMING postcheck=%.2fms merkle_a_tree=%.2fms merkle_bt_tree=%.2fms leaf_idx=%.2fms proof_a=%.2fms proof_bt=%.2fms serialize=%.2fms base64=%.2fms total=%.2fms leaves_a=%zu leaves_bt=%zu siblings_a=%zu siblings_bt=%zu proof_bytes=%zu b64_chars=%zu\n",
+                ms_postcheck, ms_merkle_a_tree, ms_merkle_bt_tree, ms_leaf_idx,
+                ms_merkle_a_proof, ms_merkle_bt_proof, ms_serialize, ms_base64,
+                ms_total, a_leaf_idx.size(), bt_leaf_idx.size(),
+                a_proof.siblings.size(), bt_proof.siblings.size(),
+                w.buf.size(), b64.size());
+    }
     R.proof_b64 = b64;
     R.found = true;
     R.win_rows = win_rows;
