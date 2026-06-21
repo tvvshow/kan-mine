@@ -15,6 +15,7 @@
 
 - [硬件要求](#硬件要求)
 - [快速开始](#快速开始)
+- [便携版发布包（开箱即用）](#便携版发布包开箱即用)
 - [依赖安装](#依赖安装)
 - [克隆与编译](#克隆与编译)
 - [运行](#运行)
@@ -56,6 +57,9 @@
 
 ## 快速开始
 
+如果只是部署到矿机，优先下载 Release 里的便携包；它不需要 CUDA Toolkit、
+CUTLASS 或编译器。下面的源码编译流程只适合开发/自编译。
+
 ```bash
 # 1. 安装依赖
 sudo apt install -y libssl-dev
@@ -76,6 +80,44 @@ export CUTLASS_HOME=~/cutlass
   --pool stratum+tcp://prl.kryptex.network:7048 \
   --wallet 你的PRL地址.矿工名
 ```
+
+---
+
+## 便携版发布包（开箱即用）
+
+每个正式版本通过 **git tag** 触发 CNB Release，自动生成下载即用的
+`kan-portable-linux-x64.tar.gz`。包内包含：
+
+- `kan`：当前主程序；
+- `pearl-miner`：兼容旧启动脚本的同构别名；
+- `plainproof_gen`：离线 proof / kernel benchmark；
+- `run.sh`：只检查 NVIDIA 驱动并转发参数到 `kan`；
+- `VERSION`、`BUILD_INFO.txt`、`RELEASE_NOTES.txt`：版本号、构建信息和该
+  tag 的版本说明。
+
+矿机上只需要 NVIDIA 驱动和 Linux x86-64 / glibc ≥ 2.35：
+
+```bash
+tar xzf kan-portable-linux-x64.tar.gz
+cd kan-portable-linux-x64
+./run.sh --algo pearl \
+  --pool stratum+tcp://prl.kryptex.network:7048 \
+  --wallet 你的PRL地址.矿工名 \
+  --batch 500 --cfg real --tc
+```
+
+发版约定：
+
+```bash
+# 在 main 通过 build/cpu_test 后，创建带说明的 tag 即可触发 Release
+git tag -a v1.2.1 -m "v1.2.1 — portable release: 说明本版变更、性能、兼容性"
+git push origin v1.2.1
+```
+
+`package_portable.sh` 会同时产出版本化文件名
+`dist/kan-portable-linux-x64-<version>.tar.gz` 和稳定上传别名
+`dist/kan-portable-linux-x64.tar.gz`；稳定别名用于 CNB 附件上传，包内文件保存
+精确版本信息。
 
 ---
 

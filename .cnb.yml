@@ -9,8 +9,10 @@
 #                         cpu-verify -> reference jackpot search -> oracle-shaped PlainProof
 #
 #   <tag> / tag_push -> build the "download & run" portable package and publish it as a
-#                       Release with the tarball attached. Push a semver tag (e.g. v1.2.0)
-#                       to cut a release. Tags drive Releases - the only other trigger.
+#                       Release with the tarball attached. Push an annotated semver tag
+#                       (e.g. v1.2.1) to cut a release. The tag message is copied into
+#                       RELEASE_NOTES.txt inside the tarball, so every version ships
+#                       with its own explanation.
 
 main:
   push:
@@ -45,14 +47,16 @@ $:
         - name: cutlass
           script: if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
         - name: package
-          # -> dist/kan-portable-linux-x64.tar.gz (static cudart + bundled libs + multi-arch
-          # fatbin). WITH_AB=0 ships a clean miner (no RMW A/B baseline binary).
+          # -> dist/kan-portable-linux-x64.tar.gz stable attachment alias plus a
+          # versioned dist/kan-portable-linux-x64-<tag>.tar.gz. Static cudart +
+          # bundled libs + multi-arch fatbin. WITH_AB=0 ships a clean miner
+          # (no RMW A/B baseline binary).
           script: WITH_AB=0 bash package_portable.sh
         - name: create-release
           # built-in task; title defaults to the tag name, tag auto-taken from tag_push.
           type: git:release
           options:
-            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs, multi-arch fatbin (sm_75..sm_90 SASS + PTX; Blackwell JITs the PTX at runtime). Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt inside."
+            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs, multi-arch fatbin (sm_75..sm_90 SASS + PTX; Blackwell JITs the PTX at runtime). Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt and version-specific RELEASE_NOTES.txt inside."
             latest: true
         - name: upload-portable-package
           image: cnbcool/attachments:latest

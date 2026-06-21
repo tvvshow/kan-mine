@@ -23,7 +23,18 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
 
+# Version/release metadata:
+# - On tag builds this resolves to the pushed tag (for example v1.2.1).
+# - On main/dev builds it resolves to vX.Y.Z-N-g<sha>[-dirty].
+# The package keeps a stable directory name for easy `cd`, but emits both a
+# versioned tarball and a stable CI attachment alias.
+VERSION="${VERSION:-$(git describe --tags --dirty --always 2>/dev/null || echo dev)}"
+COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+BUILD_DATE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+SAFE_VERSION="$(printf '%s' "${VERSION}" | tr '/ :' '---')"
 PKG="kan-portable-linux-x64"
+VERSIONED_TAR="${PKG}-${SAFE_VERSION}.tar.gz"
+STABLE_TAR="${PKG}.tar.gz"
 DIST="${ROOT}/dist"
 STAGE="${DIST}/${PKG}"
 LIBDIR="${STAGE}/lib"
@@ -43,6 +54,11 @@ fi
 echo "  [1b] A1 (default) -> the shipped kan + plainproof_gen ..."
 PORTABLE=1 bash build.sh
 cp -f build/kan build/plainproof_gen "${STAGE}/"
+# Compatibility alias for old scripts/docs that still launch pearl-miner. The
+# production binary remains `kan`; this is intentionally just the same build.
+cp -f build/pearl-miner "${STAGE}/pearl-miner" 2>/dev/null || cp -f build/kan "${STAGE}/pearl-miner"
+chmod +x "${STAGE}/kan" "${STAGE}/pearl-miner" "${STAGE}/plainproof_gen"
+[ -f "${STAGE}/plainproof_gen_rmw" ] && chmod +x "${STAGE}/plainproof_gen_rmw"
 
 echo "=== [2/5] bundle non-glibc / non-driver shared libs (fixpoint over ldd) ==="
 # Keep as SYSTEM (never bundle): glibc core (ABI-stable, everywhere) + the NVIDIA
@@ -136,16 +152,73 @@ exit $fail
 ABLATE
 chmod +x "${STAGE}/bench/ablate_a1_prebuilt.sh"
 
+cat > "${STAGE}/VERSION" <<EOF
+${VERSION}
+EOF
+
+cat > "${STAGE}/BUILD_INFO.txt" <<EOF
+version: ${VERSION}
+commit: ${COMMIT}
+built_utc: ${BUILD_DATE}
+package_dir: ${PKG}
+versioned_tar: ${VERSIONED_TAR}
+stable_tar_alias: ${STABLE_TAR}
+with_ab: ${WITH_AB}
+portable: 1
+toolchain: CUDA 12.x portable build; static cudart/libstdc++; bundled non-glibc shared libs
+runtime_dependency: NVIDIA driver + Linux x86-64 glibc >= 2.35
+EOF
+
+release_notes="${STAGE}/RELEASE_NOTES.txt"
+{
+  echo "Kan portable release notes"
+  echo "=========================="
+  echo
+  echo "Version: ${VERSION}"
+  echo "Commit:  ${COMMIT}"
+  echo "Built:   ${BUILD_DATE}"
+  echo
+  if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null 2>&1; then
+    echo "Tag notes:"
+    echo "----------"
+    git for-each-ref "refs/tags/${VERSION}" --format='%(contents)' | sed '/^[[:space:]]*$/N;/^\n$/D'
+  else
+    last_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+    if [ -n "${last_tag}" ]; then
+      echo "Changes since ${last_tag}:"
+      echo "-----------------------"
+      git log --oneline --decorate --no-merges "${last_tag}..HEAD" 2>/dev/null || true
+      if [ "${VERSION}" != "${last_tag}" ]; then
+        echo
+        echo "Latest release baseline (${last_tag}):"
+        echo "-----------------------------------"
+        git for-each-ref "refs/tags/${last_tag}" --format='%(contents)' | sed '/^[[:space:]]*$/N;/^\n$/D'
+      fi
+    else
+      echo "No git tag found. This is a development portable build."
+      git log --oneline --decorate --no-merges -20 2>/dev/null || true
+    fi
+  fi
+  echo
+  echo "Open-box use:"
+  echo "-------------"
+  echo "Unpack ${STABLE_TAR} or ${VERSIONED_TAR}, cd ${PKG}, then run ./run.sh."
+} > "${release_notes}"
+
 WALLET="prl1patz2mw7d28lqn33a768huhhsz3rg6e228m22wxh0v4pjh53x4qwsg2apmv.pm"
 cat > "${STAGE}/README.txt" <<README
 Pearl(PRL) portable miner — download & run
 ===========================================
+Version: ${VERSION}
+Commit:  ${COMMIT}
+Built:   ${BUILD_DATE}
+
 Built on cnb (Ubuntu 22.04 / glibc 2.35 / CUDA 12.4). Runs on any Linux x86-64
 GPU host with glibc >= 2.35 and an NVIDIA driver. NO CUDA toolkit, NO CUTLASS,
 NO compiler needed on this machine.
 
 Quick start (pool mining):
-  tar xzf ${PKG}.tar.gz && cd ${PKG}
+  tar xzf ${STABLE_TAR} && cd ${PKG}
   ./run.sh --algo pearl \\
     --pool stratum+tcp://prl.kryptex.network:7048 \\
     --wallet ${WALLET} \\
@@ -156,11 +229,15 @@ Kernel benchmark (no pool):
 
 Files:
   kan                 unified miner (--pool / --solo)
+  pearl-miner         compatibility alias of kan for old launch scripts
   plainproof_gen      CLI proof generator + kernel benchmark (Phase A1 build)
   plainproof_gen_rmw  pre-A1 baseline (present only if built WITH_AB=1)
   bench/ablate_a1_prebuilt.sh   on-box A1-vs-RMW A/B, no toolchain
   lib/                bundled libssl/libcrypto/libgomp... (found via rpath)
   run.sh              launcher (driver check + forwards args to kan)
+  VERSION             exact package version / git describe string
+  BUILD_INFO.txt      build metadata for audit and support
+  RELEASE_NOTES.txt   version-specific notes generated from the pushed git tag
 
 GPU arch note:
   CUDA 12.4 nvcc emits sm_75..sm_90 SASS + compute_90 PTX. On Blackwell (RTX
@@ -178,7 +255,9 @@ echo "    libcuda.so.* (the driver, supplied by the GPU host). Anything else = a
 echo "    missed bundle — add it to package_portable.sh."
 
 echo "=== [5/5] tar ==="
-( cd "${DIST}" && tar czf "${PKG}.tar.gz" "${PKG}" )
-ls -la "${DIST}/${PKG}.tar.gz"
+( cd "${DIST}" && tar czf "${VERSIONED_TAR}" "${PKG}" )
+cp -f "${DIST}/${VERSIONED_TAR}" "${DIST}/${STABLE_TAR}"
+ls -la "${DIST}/${VERSIONED_TAR}" "${DIST}/${STABLE_TAR}"
 du -sh "${STAGE}" | awk '{print "  unpacked size: "$1}'
-echo "PORTABLE PACKAGE OK -> dist/${PKG}.tar.gz"
+echo "PORTABLE PACKAGE OK -> dist/${VERSIONED_TAR}"
+echo "STABLE CI ALIAS      -> dist/${STABLE_TAR}"
