@@ -10,8 +10,8 @@
 # What it does:
 #   1. checks for GPU + CUDA toolkit
 #   2. installs build deps (gcc g++ libssl-dev) if missing
-#   3. builds pearl-miner (auto-detects GPU arch via nvidia-smi)
-#   4. runs pearl-miner --pool in an auto-restart loop
+#   3. builds Kan (auto-detects GPU arch via nvidia-smi)
+#   4. runs Kan --pool in an auto-restart loop
 #
 # Config (env overrides):
 #   WALLET   PRL payout address  (default: built-in)
@@ -29,12 +29,14 @@ WORKER="${WORKER:-$(hostname 2>/dev/null || echo box)}"
 BRANCH="${BRANCH:-unified}"
 LOG="$DIR/miner.log"
 PIDF="$DIR/miner.pid"
+BUILD_LOG="${BUILD_LOG:-$DIR/build.log}"
+ALLOW_FALLBACK="${ALLOW_FALLBACK:-0}"
 
 # ---- commands: stop / log ----
 if [ "${1:-}" = "stop" ]; then
   if [ -f "$PIDF" ]; then
     PID="$(cat "$PIDF")"
-    # Kill the wrapper (which kills pearl-miner); wait up to 5s
+    # Kill the wrapper (which kills the miner); wait up to 5s
     kill "$PID" 2>/dev/null && echo "stopped PID=$PID" || echo "PID=$PID not running"
     rm -f "$PIDF"
   else
@@ -84,13 +86,30 @@ if [ -d ".git" ]; then
 fi
 
 # ---- build ----
-echo "=== building pearl-miner ==="
-bash build.sh 2>&1 | tail -20
+echo "=== building Kan miner ==="
+if ! bash build.sh >"$BUILD_LOG" 2>&1; then
+  echo "FATAL: build failed. Last 80 lines from $BUILD_LOG:"
+  tail -80 "$BUILD_LOG"
+  exit 1
+fi
+tail -20 "$BUILD_LOG"
 echo ""
 
-if [ ! -x "./build/pearl-miner" ]; then
-  echo "FATAL: build/pearl-miner not found — build failed."
-  echo "Full build log above."
+if grep -q "falling back to tc_block" "$BUILD_LOG" && [ "$ALLOW_FALLBACK" != "1" ]; then
+  echo "FATAL: CUTLASS kernel was not built; build fell back to tc_block (~30 TH/s)."
+  echo "       Install/point CUTLASS_HOME, or set ALLOW_FALLBACK=1 for an explicit fallback run."
+  echo "       Full build log: $BUILD_LOG"
+  exit 1
+fi
+
+MINER_BIN="$DIR/build/kan"
+if [ ! -x "$MINER_BIN" ]; then
+  # Compatibility fallback for older build trees.
+  MINER_BIN="$DIR/build/pearl-miner"
+fi
+if [ ! -x "$MINER_BIN" ]; then
+  echo "FATAL: neither build/kan nor build/pearl-miner is executable -- build failed."
+  echo "Full build log: $BUILD_LOG"
   exit 1
 fi
 
@@ -118,7 +137,8 @@ echo "=== starting pool miner ==="
 echo "  wallet : ${WALLET:0:20}...${WALLET: -8}"
 echo "  worker : $WORKER"
 echo "  pool   : prl.kryptex.network:7048"
-echo "  config : real (m=n=131072, k=4096, rank=256), dp4a default"
+echo "  binary : $MINER_BIN"
+echo "  config : real (m=n=131072, k=4096, rank=256), CUTLASS primary"
 echo "  log    : $LOG"
 echo "  pid    : $PIDF"
 echo ""
@@ -132,15 +152,16 @@ echo ""
 # is easy to manage (one PID, kills cleanly).
 cat > "$DIR/_run_loop.sh" <<LOOP
 #!/usr/bin/env bash
-# auto-restart wrapper for pearl-miner --pool
-# pearl-miner exits on disconnect/job-error; this loop reconnects.
+# auto-restart wrapper for Kan --pool
+# The miner exits on disconnect/job-error; this loop reconnects.
 WALLET="$WALLET"
 WORKER="$WORKER"
 LOG="$LOG"
+MINER_BIN="$MINER_BIN"
 
 while true; do
-  echo "[\$(date '+%Y-%m-%d %H:%M:%S')] pearl-miner starting..." >> "\$LOG"
-  "$DIR/build/pearl-miner" --pool \\
+  echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Kan starting: \$MINER_BIN" >> "\$LOG"
+  "\$MINER_BIN" --pool \\
     --wallet "\$WALLET" \\
     --worker "\$WORKER" \\
     >> "\$LOG" 2>&1

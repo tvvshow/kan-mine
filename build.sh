@@ -171,6 +171,13 @@ g++ -O3 -fopenmp ${STATIC_CXX} ${RPATH_ARG} miner_main.o prover_lib.o ${BL_OBJ} 
   -L"${CUDA_HOME}/lib64" -lssl -lcrypto ${CUDART_LIBS} -o kan
 ls -la "${BUILD}/kan"
 
+# Compatibility alias for older launch/deploy helpers.  `kan` is the canonical
+# binary name, but some production scripts and boxes still look for
+# `build/pearl-miner`.  Keep a byte-identical copy so those entry points do not
+# accidentally fail or run a stale pre-rename binary.
+cp -f kan pearl-miner
+ls -la "${BUILD}/pearl-miner"
+
 # --- zkprove (Rust): SOLO-only PlainProof -> ZK proof -> block helper ---------
 # Needs cargo (Rust). The C++ binaries above do NOT need it; only `--solo` calls
 # zkprove at run time. Build it when cargo is present; otherwise warn and skip so
@@ -193,6 +200,7 @@ echo ""
 echo "BUILD OK:"
 echo "  ${BUILD}/plainproof_gen   (CLI proof generator)"
 echo "  ${BUILD}/kan              (unified: --pool / --solo)"
+echo "  ${BUILD}/pearl-miner     (compat alias for legacy launchers)"
 if [ -x "${BUILD}/zkprove" ]; then
   echo "  ${BUILD}/zkprove          (solo ZK-proof + block assembly)"
 fi

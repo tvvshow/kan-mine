@@ -4,10 +4,10 @@
 // fused WMMA tensor-core) -> Merkle -> bincode PlainProof pipeline lives in
 // plainproof_gen.cpp.  Historically it was only reachable through that file's
 // main().  This header exposes it as a plain function so the unified
-// `pearl-miner` driver (pool + solo) can drive it in-process, while the
-// standalone `plainproof_gen` CLI keeps working unchanged.
+// `kan` / legacy `pearl-miner` driver (pool + solo) can drive it
+// in-process, while the standalone `plainproof_gen` CLI keeps working unchanged.
 //
-// plainproof_gen.cpp is compiled with -DPROVER_LIB inside pearl-miner (drops its
+// plainproof_gen.cpp is compiled with -DPROVER_LIB inside the miner (drops its
 // own main); the CLI build compiles it without the flag (keeps main).
 #pragma once
 #include <atomic>
