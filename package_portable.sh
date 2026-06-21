@@ -121,6 +121,76 @@ exec "$here/kan" "$@"
 LAUNCH
 chmod +x "${STAGE}/run.sh"
 
+cat > "${STAGE}/status.sh" <<'STATUS'
+#!/usr/bin/env bash
+# Human-friendly one-shot status for a portable Kan miner directory.
+# Usage:
+#   ./status.sh                  # auto-detect ../stress_24h.log, ./miner.log, /tmp/fast.log
+#   LOG=/path/to/stress.log ./status.sh
+set -u
+here="$(cd "$(dirname "$0")" && pwd)"
+log="${LOG:-}"
+if [ -z "$log" ]; then
+  for cand in "$here/../stress_24h.log" "$here/stress_24h.log" \
+              "$here/miner.log" "/tmp/fast.log"; do
+    [ -f "$cand" ] && { log="$cand"; break; }
+  done
+fi
+ver="$(cat "$here/VERSION" 2>/dev/null || echo unknown)"
+flavor="$(awk -F': ' '/^package_flavor:/ {print $2}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
+arch="$(awk -F': ' '/^arch:/ {print $2}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
+groupm="$(awk -F': ' '/^groupm:/ {print $2}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
+
+echo "=== Kan portable status ==="
+echo "dir:     $here"
+echo "version: $ver"
+echo "flavor:  ${flavor:-unknown}  arch=${arch:-unknown}  groupm=${groupm:-unknown}"
+echo "log:     ${log:-<not found>}"
+echo
+
+echo "=== process ==="
+pgrep -af "$here/(kan|run.sh)" || echo "not running from this directory"
+echo
+
+echo "=== GPU ==="
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-gpu=name,temperature.gpu,fan.speed,power.draw,power.limit,utilization.gpu,clocks.sm,clocks.mem,memory.used,memory.total \
+    --format=csv,noheader,nounits 2>/dev/null |
+  awk -F', ' '{
+    printf "gpu: %s | temp=%sC fan=%s%% power=%s/%sW util=%s%% sm=%sMHz memclk=%sMHz vram=%s/%sMiB\n",
+           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10
+  }'
+else
+  echo "nvidia-smi not found"
+fi
+echo
+
+if [ -n "$log" ] && [ -f "$log" ]; then
+  echo "=== latest hashrate table ==="
+  awk '
+    /DEVICE MODEL/{buf=$0; cap=1; next}
+    cap{buf=buf "\n" $0; if ($0 ~ /accept - ver\./){last=buf; cap=0}}
+    END{if(last!="") print last; else print "hashrate table not seen yet"}
+  ' "$log"
+  echo
+  echo "=== shares ==="
+  acc="$(grep -ic "share accepted" "$log" || true)"
+  rej="$(grep -Eic "share rejected|rejected" "$log" || true)"
+  tout="$(grep -ic "share submit timeout" "$log" || true)"
+  echo "accepted=$acc rejected=$rej submit_timeouts=$tout"
+  grep -E "share accepted|share rejected|share submit timeout" "$log" | tail -10 || true
+  echo
+  echo "=== latest perf attempts ==="
+  grep -E " info +perf +" "$log" | tail -12 || echo "no perf lines yet"
+  echo
+  echo "=== latest log tail ==="
+  tail -30 "$log"
+else
+  echo "log file not found. Set LOG=/path/to/stress_24h.log ./status.sh"
+fi
+STATUS
+chmod +x "${STAGE}/status.sh"
+
 cat > "${STAGE}/bench/ablate_a1_prebuilt.sh" <<'ABLATE'
 #!/usr/bin/env bash
 # Phase A1 (fold direct-store) A/B with NO toolchain — uses the two prebuilt
@@ -252,6 +322,7 @@ Files:
   bench/ablate_a1_prebuilt.sh   on-box A1-vs-RMW A/B, no toolchain
   lib/                bundled libssl/libcrypto/libgomp... (found via rpath)
   run.sh              launcher (driver check + forwards args to kan)
+  status.sh           readable process/GPU/hashrate/share/perf status
   VERSION             exact package version / git describe string
   BUILD_INFO.txt      build metadata for audit and support
   RELEASE_NOTES.txt   version-specific notes generated from the pushed git tag

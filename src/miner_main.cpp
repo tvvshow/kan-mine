@@ -2,6 +2,7 @@
 #include "prover.h"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -311,6 +312,7 @@ struct PoolOpts {
 };
 struct PoolState {
   std::mutex mu;
+  std::condition_variable cv;
   std::string header, target, job_id;
   long long height = 0;
   uint64_t gen = 0, seq = 0;
@@ -319,6 +321,8 @@ struct PoolState {
   std::atomic<std::atomic<bool>*> active_stop{nullptr};
   std::unordered_set<long long> submit_ids;
   std::unordered_map<long long, std::string> submit_resp;
+  uint64_t notify_count = 0;
+  uint64_t abort_count = 0;
 };
 static bool pool_send(int fd, SSL* ssl, const std::string& json) {
   std::string m = json + "\n";
@@ -338,10 +342,10 @@ static void pool_reader(int fd, SSL* ssl, PoolState* st) {
     fd_set fds; FD_ZERO(&fds); FD_SET(fd, &fds);
     struct timeval tv{0, 500000};
     int sr = select(fd + 1, &fds, nullptr, nullptr, &tv);
-    if (sr < 0) { st->stop = true; break; }
+    if (sr < 0) { st->stop = true; st->cv.notify_all(); break; }
     if (sr == 0) continue;
     ssize_t n = ssl ? SSL_read(ssl, tmp, sizeof(tmp)) : recv(fd, tmp, sizeof(tmp), 0);
-    if (n <= 0) { st->stop = true; break; }
+    if (n <= 0) { st->stop = true; st->cv.notify_all(); break; }
     buf.append(tmp, n);
     size_t nl;
     while ((nl = buf.find('\n')) != std::string::npos) {
@@ -364,26 +368,32 @@ static void pool_reader(int fd, SSL* ssl, PoolState* st) {
                            st->target==target && st->height==height);
           st->header = header; st->target = target; st->job_id = job_id; st->height = height;
           st->have_job = true;
+          st->notify_count++;
           if (changed) {
             st->gen++;
             st->seq++;
             to_abort = st->active_stop.load();
+            if (to_abort) st->abort_count++;
           }
         }
         log_linef("stratum", "new job id=%s height=%lld diff=%lld seq=%llu",
                   job_id.c_str(), height, diff, (unsigned long long)st->seq);
+        st->cv.notify_all();
         if (to_abort) to_abort->store(true);
       } else {
         long long id = 0;
         bool has_id = json_int(line, "id", id);
+        bool is_submit = false;
         {
           std::lock_guard<std::mutex> lk(st->mu);
-          bool is_submit = has_id && st->submit_ids.count(id);
+          is_submit = has_id && st->submit_ids.count(id);
           if (is_submit) st->submit_resp[id] = line;
         }
+        if (is_submit) st->cv.notify_all();
       }
     }
   }
+  st->cv.notify_all();
 }
 static int run_pool(const PoolOpts& o) {
   SSL_library_init();
@@ -427,6 +437,7 @@ static int run_pool(const PoolOpts& o) {
               o.wallet.c_str(), o.worker.c_str(), o.agent.c_str());
   }
   long long submit_id = 100;
+  uint64_t attempt_id = 0;
   std::atomic<bool> stop_attempt{false};
   std::atomic<bool> stats_req{false};
   std::thread stats_th([&]() {
@@ -464,9 +475,12 @@ static int run_pool(const PoolOpts& o) {
     P.seed = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
     MineResult R;
     stop_attempt.store(false);
+    auto attempt_t0 = std::chrono::steady_clock::now();
     st.active_stop.store(&stop_attempt);
     int rc = mine_plain_proof(P, R, &stop_attempt);
     st.active_stop.store(nullptr);
+    auto attempt_t1 = std::chrono::steady_clock::now();
+    double attempt_s = std::chrono::duration<double>(attempt_t1 - attempt_t0).count();
 
     if (R.draws > 0 && R.work_per_draw > 0.0) {
       g_total_draws.fetch_add(R.draws);
@@ -478,6 +492,29 @@ static int run_pool(const PoolOpts& o) {
       fresh = (st.gen == cur_gen && st.job_id==jid && st.header==hdr &&
                st.target==tgt && st.height==height); }
 
+    attempt_id++;
+    const char* reason = "batch";
+    if (stop_attempt.load(std::memory_order_relaxed)) reason = "job_abort";
+    else if (rc != 0) reason = "error";
+    else if (R.found && !fresh) reason = "stale_win";
+    else if (R.found) reason = "found";
+    if (strcmp(reason, "batch") != 0 || (attempt_id % 20) == 0) {
+      double ths = (R.draws > 0 && R.work_per_draw > 0.0 && attempt_s > 0.0)
+                       ? (double)R.draws * R.work_per_draw / attempt_s / 1e12
+                       : 0.0;
+      uint64_t notify_count = 0, abort_count = 0, seq = 0;
+      { std::lock_guard<std::mutex> lk(st.mu);
+        notify_count = st.notify_count;
+        abort_count = st.abort_count;
+        seq = st.seq; }
+      log_linef("perf",
+                "attempt=%llu reason=%s rc=%d fresh=%d draws=%llu elapsed=%.3fs %.2f TH/s seq=%llu notify=%llu abort=%llu",
+                (unsigned long long)attempt_id, reason, rc, fresh ? 1 : 0,
+                (unsigned long long)R.draws, attempt_s, ths,
+                (unsigned long long)seq, (unsigned long long)notify_count,
+                (unsigned long long)abort_count);
+    }
+
     if (rc == 0 && R.found && fresh) {
       long long this_id = submit_id++;
       { std::lock_guard<std::mutex> lk(st.mu); st.submit_ids.insert(this_id); }
@@ -487,22 +524,33 @@ static int run_pool(const PoolOpts& o) {
                         "\",\"plain_proof\":\"" + R.proof_b64 +
                         "\",\"hs\":" + std::to_string(hs_actual) + "}}";
       pool_send(fd, ssl, sub);
-      double wt = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      auto submit_t0 = std::chrono::steady_clock::now();
+      auto deadline = submit_t0 + std::chrono::seconds(30);
       std::string verdict;
-      while (std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - wt < 30) {
-        { std::lock_guard<std::mutex> lk(st.mu);
-          auto it = st.submit_resp.find(this_id);
-          if (it != st.submit_resp.end()) { verdict = it->second; break; } }
-        if (st.stop.load()) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      {
+        std::unique_lock<std::mutex> lk(st.mu);
+        st.cv.wait_until(lk, deadline, [&]() {
+          return st.stop.load() || st.submit_resp.find(this_id) != st.submit_resp.end();
+        });
+        auto it = st.submit_resp.find(this_id);
+        if (it != st.submit_resp.end()) {
+          verdict = it->second;
+          st.submit_resp.erase(it);
+        }
+        st.submit_ids.erase(this_id);
       }
+      double submit_s = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - submit_t0).count();
       if (!verdict.empty() && verdict.find("\"result\":true") != std::string::npos) {
         g_accepted.fetch_add(1);
         g_last_share = std::chrono::steady_clock::now();
-        log_line("GPU #0", "share accepted");
+        log_linef("GPU #0", "share accepted submit_wait=%.3fs", submit_s);
       } else if (!verdict.empty()) {
         g_rejected.fetch_add(1);
-        log_linef("GPU #0", "share rejected: %s", verdict.substr(0, 100).c_str());
+        log_linef("GPU #0", "share rejected submit_wait=%.3fs: %s",
+                  submit_s, verdict.substr(0, 100).c_str());
+      } else {
+        log_linef("GPU #0", "share submit timeout submit_wait=%.3fs", submit_s);
       }
     }
     // Continue mining regardless of result (no win, stale, or error - keep going)
