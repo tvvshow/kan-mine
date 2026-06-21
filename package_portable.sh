@@ -149,7 +149,19 @@ echo "log:     ${log:-<not found>}"
 echo
 
 echo "=== process ==="
-pgrep -af "$here/(kan|run.sh)" || echo "not running from this directory"
+found_proc=0
+for pid in $(pgrep -f 'kan .*--algo pearl|run_24h.sh|run.sh' 2>/dev/null || true); do
+  [ -r "/proc/$pid/cwd" ] || continue
+  cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  case "$cwd" in
+    "$here"|"$here"/*)
+      echo "$pid  cwd=$cwd  $cmd"
+      found_proc=1
+      ;;
+  esac
+done
+[ "$found_proc" = 1 ] || echo "not running from this directory"
 echo
 
 echo "=== GPU ==="

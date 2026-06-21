@@ -1033,14 +1033,13 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         std::vector<signed char> b_noised_t[2];
         Digest a_noise_seed_slot[2] = {};
         std::vector<int8_t> noise_a, noise_b;
-        auto ensure_cpu_mine_scratch = [&]() {
+        auto ensure_cpu_mine_scratch = [&](int slot) {
             ensure_cpu_base();
             const size_t a_len = m * k;
             const size_t b_len = n * k;
-            for (int s = 0; s < 2; s++) {
-                if (a_noised[s].size() != a_len) a_noised[s].resize(a_len);
-                if (b_noised_t[s].size() != b_len) b_noised_t[s].resize(b_len);
-            }
+            if (slot < 0 || slot > 1) slot = 0;
+            if (a_noised[slot].size() != a_len) a_noised[slot].resize(a_len);
+            if (b_noised_t[slot].size() != b_len) b_noised_t[slot].resize(b_len);
             if (noise_a.size() != a_len) noise_a.resize(a_len);
             if (noise_b.size() != b_len) noise_b.resize(b_len);
         };
@@ -1072,7 +1071,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         // shared state after the producer has moved on. Runs on the producer
         // thread (overlapping the GPU) and, once, on this thread to re-derive.
         auto produce_draw = [&](uint64_t d, int slot, bool tells) {
-            ensure_cpu_mine_scratch();
+            ensure_cpu_mine_scratch(slot);
             double ms_rng=0, ms_hash=0, ms_noise=0, ms_build=0;
             auto tic = clk::now();
             auto lap = [&](double& dst){ auto now=clk::now(); dst=std::chrono::duration<double,std::milli>(now-tic).count(); tic=now; };
