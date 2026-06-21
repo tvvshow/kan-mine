@@ -57,11 +57,21 @@ $:
           # compatibility-first; this package restores the sm_86 production
           # compile knobs used by the historical 100+ TH/s baseline.
           script: WITH_AB=0 ARCH=sm_86 GROUPM=8 KSTAGES=3 PACKAGE_FLAVOR=sm86-g8 bash package_portable.sh
+        - name: package-sm86-g4-k3
+          # Experimental sm_86 tuning artifact.  VPS testing must download this
+          # package from the Release; do NOT compile on the GPU box.
+          script: WITH_AB=0 ARCH=sm_86 GROUPM=4 KSTAGES=3 PACKAGE_FLAVOR=sm86-g4-k3 bash package_portable.sh
+        - name: package-sm86-g12-k3
+          script: WITH_AB=0 ARCH=sm_86 GROUPM=12 KSTAGES=3 PACKAGE_FLAVOR=sm86-g12-k3 bash package_portable.sh
+        - name: package-sm86-g16-k3
+          script: WITH_AB=0 ARCH=sm_86 GROUPM=16 KSTAGES=3 PACKAGE_FLAVOR=sm86-g16-k3 bash package_portable.sh
+        - name: package-sm86-g24-k3
+          script: WITH_AB=0 ARCH=sm_86 GROUPM=24 KSTAGES=3 PACKAGE_FLAVOR=sm86-g24-k3 bash package_portable.sh
         - name: create-release
           # built-in task; title defaults to the tag name, tag auto-taken from tag_push.
           type: git:release
           options:
-            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs. Assets include the generic multi-arch fatbin and an Ampere sm_86/GROUPM=8 package for RTX 3080Ti/3090. Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt and version-specific RELEASE_NOTES.txt inside."
+            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs. Assets include the generic multi-arch fatbin, the production sm_86/GROUPM=8 package, and sm_86 GROUPM tuning packages for RTX 3080Ti/3090 measurement. Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt and version-specific RELEASE_NOTES.txt inside."
             latest: true
         - name: upload-portable-package
           image: cnbcool/attachments:latest
@@ -69,3 +79,7 @@ $:
             attachments:
               - dist/kan-portable-linux-x64.tar.gz
               - dist/kan-portable-linux-x64-sm86-g8.tar.gz
+              - dist/kan-portable-linux-x64-sm86-g4-k3.tar.gz
+              - dist/kan-portable-linux-x64-sm86-g12-k3.tar.gz
+              - dist/kan-portable-linux-x64-sm86-g16-k3.tar.gz
+              - dist/kan-portable-linux-x64-sm86-g24-k3.tar.gz
