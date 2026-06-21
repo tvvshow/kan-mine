@@ -46,20 +46,26 @@ $:
           script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git curl ca-certificates libssl-dev patchelf
         - name: cutlass
           script: if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
-        - name: package
+        - name: package-generic
           # -> dist/kan-portable-linux-x64.tar.gz stable attachment alias plus a
           # versioned dist/kan-portable-linux-x64-<tag>.tar.gz. Static cudart +
           # bundled libs + multi-arch fatbin. WITH_AB=0 ships a clean miner
           # (no RMW A/B baseline binary).
           script: WITH_AB=0 bash package_portable.sh
+        - name: package-sm86-ampere
+          # Ampere/RTX 3080Ti/3090 tuned package.  The public generic package is
+          # compatibility-first; this package restores the sm_86 production
+          # compile knobs used by the historical 100+ TH/s baseline.
+          script: WITH_AB=0 ARCH=sm_86 GROUPM=8 KSTAGES=3 PACKAGE_FLAVOR=sm86-g8 bash package_portable.sh
         - name: create-release
           # built-in task; title defaults to the tag name, tag auto-taken from tag_push.
           type: git:release
           options:
-            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs, multi-arch fatbin (sm_75..sm_90 SASS + PTX; Blackwell JITs the PTX at runtime). Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt and version-specific RELEASE_NOTES.txt inside."
+            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs. Assets include the generic multi-arch fatbin and an Ampere sm_86/GROUPM=8 package for RTX 3080Ti/3090. Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt and version-specific RELEASE_NOTES.txt inside."
             latest: true
         - name: upload-portable-package
           image: cnbcool/attachments:latest
           settings:
             attachments:
               - dist/kan-portable-linux-x64.tar.gz
+              - dist/kan-portable-linux-x64-sm86-g8.tar.gz

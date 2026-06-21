@@ -117,7 +117,19 @@ g++ -O3 -std=c++17 -I"${ROOT}/src" -I"${ROOT}/blake3" -I"${CUDA_HOME}/include" -
 # Fallback: tc_block.cu (WMMA, ~30 TH/s) keeps GPU-less/CUTLASS-less builds alive.
 echo "=== fused tensor-core kernel ==="
 CUTLASS_HOME="${CUTLASS_HOME:-$HOME/cutlass}"
-GROUPM="${GROUPM:-128}"
+# GROUPM is architecture-sensitive.  The historical sm_86 production baseline
+# (3090/3080Ti) was tuned at GROUPM=8 (102+ TH/s wall on 3090).  Later
+# 4090/5090 branches use larger grouping, but making 128 the universal default
+# regresses Ampere portable builds.  Keep an explicit GROUPM env override, and
+# otherwise choose the safe default for the requested ARCH.
+if [ -n "${GROUPM:-}" ]; then
+  GROUPM="${GROUPM}"
+else
+  case "${ARCH:-}" in
+    sm_80|sm_86) GROUPM=8 ;;
+    *) GROUPM=128 ;;
+  esac
+fi
 KSTAGES="${KSTAGES:-3}"
 SMALL_TILE="${SMALL_TILE:-}"
 EXTRA_FLAGS=""

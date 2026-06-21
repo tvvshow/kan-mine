@@ -119,6 +119,24 @@ git push origin v1.2.1
 `dist/kan-portable-linux-x64.tar.gz`；稳定别名用于 CNB 附件上传，包内文件保存
 精确版本信息。
 
+### 显卡专用便携包
+
+3080 Ti / 3090 等 Ampere `sm_86` 显卡不要只看 generic 包；Release 还会上传：
+
+```text
+kan-portable-linux-x64-sm86-g8.tar.gz
+```
+
+它使用历史 100+ TH/s 生产基线的 Ampere 编译参数：
+
+```bash
+ARCH=sm_86 GROUPM=8 KSTAGES=3 WITH_AB=0 PACKAGE_FLAVOR=sm86-g8 bash package_portable.sh
+```
+
+generic 包优先兼容多架构；`sm86-g8` 包优先 3080 Ti / 3090 生产速度。包内
+`BUILD_INFO.txt` 会记录 `arch`、`groupm`、`kstages`、`package_flavor`，排查性能时
+先确认这些字段。
+
 ---
 
 ## 依赖安装

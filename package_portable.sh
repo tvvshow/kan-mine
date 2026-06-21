@@ -32,9 +32,16 @@ VERSION="${VERSION:-$(git describe --tags --dirty --always 2>/dev/null || echo d
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 BUILD_DATE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 SAFE_VERSION="$(printf '%s' "${VERSION}" | tr '/ :' '---')"
+PACKAGE_FLAVOR="${PACKAGE_FLAVOR:-}"
+SAFE_FLAVOR="$(printf '%s' "${PACKAGE_FLAVOR}" | tr '/ :' '---')"
 PKG="kan-portable-linux-x64"
-VERSIONED_TAR="${PKG}-${SAFE_VERSION}.tar.gz"
-STABLE_TAR="${PKG}.tar.gz"
+if [ -n "${SAFE_FLAVOR}" ]; then
+  VERSIONED_TAR="${PKG}-${SAFE_VERSION}-${SAFE_FLAVOR}.tar.gz"
+  STABLE_TAR="${PKG}-${SAFE_FLAVOR}.tar.gz"
+else
+  VERSIONED_TAR="${PKG}-${SAFE_VERSION}.tar.gz"
+  STABLE_TAR="${PKG}.tar.gz"
+fi
 DIST="${ROOT}/dist"
 STAGE="${DIST}/${PKG}"
 LIBDIR="${STAGE}/lib"
@@ -165,6 +172,11 @@ versioned_tar: ${VERSIONED_TAR}
 stable_tar_alias: ${STABLE_TAR}
 with_ab: ${WITH_AB}
 portable: 1
+arch: ${ARCH:-portable-fatbin}
+groupm: ${GROUPM:-build-default}
+kstages: ${KSTAGES:-build-default}
+small_tile: ${SMALL_TILE:-0}
+package_flavor: ${PACKAGE_FLAVOR:-generic}
 toolchain: CUDA 12.x portable build; static cudart/libstdc++; bundled non-glibc shared libs
 runtime_dependency: NVIDIA driver + Linux x86-64 glibc >= 2.35
 EOF
@@ -177,6 +189,7 @@ release_notes="${STAGE}/RELEASE_NOTES.txt"
   echo "Version: ${VERSION}"
   echo "Commit:  ${COMMIT}"
   echo "Built:   ${BUILD_DATE}"
+  echo "Flavor:  ${PACKAGE_FLAVOR:-generic}"
   echo
   if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null 2>&1; then
     echo "Tag notes:"
@@ -212,6 +225,10 @@ Pearl(PRL) portable miner — download & run
 Version: ${VERSION}
 Commit:  ${COMMIT}
 Built:   ${BUILD_DATE}
+Flavor:  ${PACKAGE_FLAVOR:-generic}
+Arch:    ${ARCH:-portable-fatbin}
+GROUPM:  ${GROUPM:-build-default}
+KSTAGES: ${KSTAGES:-build-default}
 
 Built on cnb (Ubuntu 22.04 / glibc 2.35 / CUDA 12.4). Runs on any Linux x86-64
 GPU host with glibc >= 2.35 and an NVIDIA driver. NO CUDA toolkit, NO CUTLASS,
