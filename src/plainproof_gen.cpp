@@ -1033,8 +1033,9 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         std::vector<signed char> b_noised_t[2];
         Digest a_noise_seed_slot[2] = {};
         std::vector<int8_t> noise_a, noise_b;
-        auto ensure_cpu_mine_scratch = [&](int slot) {
+        auto ensure_cpu_mine_scratch = [&](int slot, bool need_noised) {
             ensure_cpu_base();
+            if (!need_noised) return;
             const size_t a_len = m * k;
             const size_t b_len = n * k;
             if (slot < 0 || slot > 1) slot = 0;
@@ -1070,8 +1071,8 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         // function of (seed,d): safe to re-run for the winning draw to restore
         // shared state after the producer has moved on. Runs on the producer
         // thread (overlapping the GPU) and, once, on this thread to re-derive.
-        auto produce_draw = [&](uint64_t d, int slot, bool tells) {
-            ensure_cpu_mine_scratch(slot);
+        auto produce_draw = [&](uint64_t d, int slot, bool tells, bool need_noised) {
+            ensure_cpu_mine_scratch(slot, need_noised);
             double ms_rng=0, ms_hash=0, ms_noise=0, ms_build=0;
             auto tic = clk::now();
             auto lap = [&](double& dst){ auto now=clk::now(); dst=std::chrono::duration<double,std::milli>(now-tic).count(); tic=now; };
@@ -1113,6 +1114,15 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
             // per-row/per-col uniform noise rows -> noise_a[row]/noise_b[col].
             e_ar_t = generate_permutation_matrix(seed_a_label, a_noise_seed, k, rank);
             e_bl   = generate_permutation_matrix(seed_b_label, b_noise_seed, k, rank);
+            if (!need_noised) {
+                if (tells) {
+                    lap(ms_noise);
+                    fprintf(stderr,
+                            "CPUPREP_PROOF draw=%llu (ms): RNG=%.2f blake3=%.2f eperm=%.2f noise=skipped noised=skipped\n",
+                            (unsigned long long)d, ms_rng, ms_hash, ms_noise);
+                }
+                return;
+            }
             #pragma omp parallel for schedule(static)
             for (long row = 0; row < (long)m; row++) {
                 vector<int8_t> e_al = uniform_row(seed_a_label, a_noise_seed, (size_t)row, rank);
@@ -1242,7 +1252,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                     // seeds/perms for POSTCHECK + Merkle (the shared host vars
                     // currently hold draw N+1 from the overlapped prep).
                     // POSTCHECK is the GPU-vs-CPU equivalence gate.
-                    produce_draw(draw, 0, false);
+                    produce_draw(draw, 0, true, false);
                     found=true; win_rows=row_parts[(size_t)rt]; win_cols=col_parts[(size_t)ct];
                     if (g_miner_verbose) fprintf(stderr, "MINE WIN draw=%llu tile rt=%d ct=%d\n",
                             (unsigned long long)(draw+1), rt, ct);
@@ -1268,7 +1278,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
         // Prime the pipeline: produce draw 0 into slot 0 (synchronous).
         int cur = 0;
         bool primed = (maxdraws > 0) && !stopping();
-        if (primed) produce_draw(0, cur, breakdown);
+        if (primed) produce_draw(0, cur, breakdown, true);
 
         for (draw = 0; primed && draw < maxdraws; draw++) {
             // Cooperative abort: pool/solo set stop_flag when a newer job arrives.
@@ -1282,7 +1292,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
             int nslot = 1 - cur;
             bool have_next = (nd < maxdraws) && !stopping();
             std::thread prod;
-            if (have_next) prod = std::thread([&, nd, nslot, do_breakdown]{ produce_draw(nd, nslot, do_breakdown); });
+            if (have_next) prod = std::thread([&, nd, nslot, do_breakdown]{ produce_draw(nd, nslot, do_breakdown, true); });
 
             // (e) fused tensor-core search on the CURRENT slot (draw N). rt/ct
             // return as row_off/col_off indices mapping back via row_parts/col_parts.
@@ -1309,7 +1319,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                 // The producer already advanced shared A/Bt/e_ar_t/e_bl/seeds to
                 // draw nd; re-run draw N to restore byte-exact state for the
                 // POSTCHECK + Merkle proof assembly that follows the loop.
-                produce_draw(draw, cur, false);
+                produce_draw(draw, cur, false, true);
                 found=true; win_rows=row_parts[(size_t)rt]; win_cols=col_parts[(size_t)ct];
                 if (g_miner_verbose) fprintf(stderr, "MINE WIN draw=%llu tile rt=%d ct=%d\n",
                         (unsigned long long)(draw+1), rt, ct);
