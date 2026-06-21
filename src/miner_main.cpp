@@ -26,6 +26,10 @@
 #include <openssl/ssl.h>
 #include <cuda_runtime.h>
 
+#ifndef KAN_VERSION
+#define KAN_VERSION "dev"
+#endif
+
 extern "C" { int g_miner_verbose = 0; }  // gate per-draw prints in plainproof_gen/tc_cutlass
 extern std::atomic<uint64_t> g_live_draw_count;  // incremented per-draw in plainproof_gen
 extern double g_work_per_draw_export;  // set by plainproof_gen before draw loop starts
@@ -161,8 +165,8 @@ static void print_stats(const std::string& wallet, const std::string& pool_url) 
   fprintf(stderr, " 60s                   %10.2f TH/s                           R: %llu\n", ths_60, (unsigned long long)rej);
   fprintf(stderr, " 15m                   %10.2f TH/s                           S: 0\n", ths_15m);
   double acc_pct = (acc + rej > 0) ? 100.0 * (double)acc / (double)(acc + rej) : 0.0;
-  fprintf(stderr, "[%d days %02d:%02d:%02d]-------------------------------------[%.1f%% accept - ver. 1.0.0]\n",
-          up_d, up_h, up_m, up_sec, acc_pct);
+  fprintf(stderr, "[%d days %02d:%02d:%02d]-------------------------------------[%.1f%% accept - ver. %s]\n",
+          up_d, up_h, up_m, up_sec, acc_pct, KAN_VERSION);
   fprintf(stderr, "\n");
 }
 
@@ -299,7 +303,7 @@ struct PoolOpts {
   bool use_tls = false;
   std::string wallet = "prl1patz2mw7d28lqn33a768huhhsz3rg6e228m22wxh0v4pjh53x4qwsg2apmv";
   std::string worker = "pm";
-  std::string agent = "Kan/1.0.0";
+  std::string agent = std::string("Kan/") + KAN_VERSION;
   uint64_t batch = 1000;
   bool real_cfg = true;
   bool use_tc = true;
@@ -679,7 +683,8 @@ static int run_solo(const SoloOpts& o) {
 // main
 // ===========================================================================
 static void banner() {
-  log_line("about", "Kan/1.0.0");
+  std::string about = std::string("Kan/") + KAN_VERSION;
+  log_line("about", about.c_str());
   FILE* f = fopen("/proc/cpuinfo", "r");
   if (f) {
     char line[256], model[128] = "CPU";
@@ -836,4 +841,3 @@ int main(int argc, char** argv) {
     return run_solo(so);
   }
 }
-

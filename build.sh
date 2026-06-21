@@ -19,6 +19,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+BUILD_VERSION="${VERSION:-$(git describe --tags --dirty --always 2>/dev/null || echo dev)}"
+KAN_VERSION_DEF="-DKAN_VERSION=\"${BUILD_VERSION}\""
 
 echo "=== toolchain ==="
 nvcc --version | tail -2
@@ -103,7 +105,7 @@ g++ -O3 -std=c++17 -fopenmp -I"${ROOT}/blake3" -I"${CUDA_HOME}/include" -c "${RO
 g++ -O3 -std=c++17 -fopenmp -I"${ROOT}/blake3" -I"${CUDA_HOME}/include" -DPROVER_LIB -c "${ROOT}/src/plainproof_gen.cpp" -o prover_lib.o
 
 echo "=== host: unified miner driver (pool + solo) ==="
-g++ -O3 -std=c++17 -I"${ROOT}/src" -I"${ROOT}/blake3" -I"${CUDA_HOME}/include" -c "${ROOT}/src/miner_main.cpp" -o miner_main.o
+g++ -O3 -std=c++17 "${KAN_VERSION_DEF}" -I"${ROOT}/src" -I"${ROOT}/blake3" -I"${CUDA_HOME}/include" -c "${ROOT}/src/miner_main.cpp" -o miner_main.o
 
 # --- the ONE GPU kernel pair: CUTLASS fused search + GPU draw pipeline --------
 # tc_cutlass_v2.cu: CUTLASS 3.5.1 threadblock-level FoldMmaMultistage — IMMA
