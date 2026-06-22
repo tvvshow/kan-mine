@@ -1,0 +1,4 @@
+date,gpu,compute_cap,driver,package_version,commit,package_flavor,arch,groupm,kstages,tc_persist,samples,prep_ms_avg,prep_ms_med,search_ths_avg,search_ths_med,total_ths_avg,total_ths_med,mine_done_ths,draws,elapsed_s,found,postcheck,power_w,temp_c,sm_clock_mhz,mem_clock_mhz,notes
+2026-06-22,NVIDIA GeForce RTX 3080 Ti,8.6,595.80,v1.2.11,acd29d8,sm86-g8,sm_86,8,3,0,15,3.84,3.84,102.50,102.33,101.93,101.76,99.65,15,10.59,0,smoke_ok_1,316.37,48,1935,9501,hard_target_controlled_benchmark_rc2_found0
+2026-06-22,NVIDIA GeForce RTX 3080 Ti,8.6,595.80,v1.2.11,acd29d8,sm86-g8,sm_86,8,3,1,15,3.86,3.86,102.80,102.53,102.22,101.95,98.69,15,10.70,0,not_run_for_hard_target,332.34,51,1950,9501,persistent_timing_overlap_affects_gpuprep_fields
+2026-06-22,NVIDIA GeForce RTX 3080 Ti,8.6,595.80,v1.2.11,acd29d8,sm86-g8,sm_86,8,3,0,live_pool,,,,,,,,94.60,,,4,accepted_4_rejected_0_submit_timeout_0,347.76,67,1605,9251,persistent_supervisor_running_pool_ssl_8048_15m_97.39

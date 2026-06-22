@@ -8,11 +8,14 @@
 #                         build      -> portable multi-arch fatbin (sm_75..sm_90 SASS + PTX)
 #                         cpu-verify -> reference jackpot search -> oracle-shaped PlainProof
 #
-#   <tag> / tag_push -> build the "download & run" portable package and publish it as a
-#                       Release with the tarball attached. Push an annotated semver tag
-#                       (e.g. v1.2.1) to cut a release. The tag message is copied into
-#                       RELEASE_NOTES.txt inside the tarball, so every version ships
-#                       with its own explanation.
+#   <tag> / tag_push -> build the "download & run" portable packages and publish
+#                       them as a Release:
+#                         1. generic multi-arch compatibility package
+#                         2. sm_86 / GROUPM=8 production tuned package
+#                       Push an annotated semver tag (e.g. v1.2.1) to cut a
+#                       release. The tag message is copied into RELEASE_NOTES.txt
+#                       inside the tarballs, so every version ships with its own
+#                       explanation.
 
 main:
   push:
@@ -29,6 +32,8 @@ main:
           script:
             - nvcc --version | tail -2
             - g++ --version | head -1
+        - name: release-profile-check
+          script: bash check_release_profiles.sh
         - name: build
           script: bash build.sh
         - name: cpu-verify
@@ -46,41 +51,26 @@ $:
           script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git curl ca-certificates libssl-dev patchelf
         - name: cutlass
           script: if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
+        - name: release-profile-check
+          script: bash check_release_profiles.sh
         - name: package-generic
           # -> dist/kan-portable-linux-x64.tar.gz stable attachment alias plus a
           # versioned dist/kan-portable-linux-x64-<tag>.tar.gz. Static cudart +
           # bundled libs + multi-arch fatbin. WITH_AB=0 ships a clean miner
-          # (no RMW A/B baseline binary).
+          # (no RMW A/B baseline binary). This is the compatibility-first
+          # package for NVIDIA RTX 20 series / Turing and newer; it does not
+          # promise per-architecture optimal performance.
           script: WITH_AB=0 bash package_portable.sh
         - name: package-sm86-ampere
-          # Ampere/RTX 3080Ti/3090 tuned package.  The public generic package is
-          # compatibility-first; this package restores the sm_86 production
-          # compile knobs used by the historical 100+ TH/s baseline.
+          # Production tuned package for Ampere gaming / sm_86
+          # (RTX 3080Ti/3090 class). Keep this as the only sm_86 default release
+          # package unless GPU_PROFILES.md is updated with new verified data.
           script: WITH_AB=0 ARCH=sm_86 GROUPM=8 KSTAGES=3 PACKAGE_FLAVOR=sm86-g8 bash package_portable.sh
-        - name: package-sm86-g4-k3
-          # Experimental sm_86 tuning artifact.  VPS testing must download this
-          # package from the Release; do NOT compile on the GPU box.
-          script: WITH_AB=0 ARCH=sm_86 GROUPM=4 KSTAGES=3 PACKAGE_FLAVOR=sm86-g4-k3 bash package_portable.sh
-        - name: package-sm86-g12-k3
-          script: WITH_AB=0 ARCH=sm_86 GROUPM=12 KSTAGES=3 PACKAGE_FLAVOR=sm86-g12-k3 bash package_portable.sh
-        - name: package-sm86-g16-k3
-          script: WITH_AB=0 ARCH=sm_86 GROUPM=16 KSTAGES=3 PACKAGE_FLAVOR=sm86-g16-k3 bash package_portable.sh
-        - name: package-sm86-g24-k3
-          script: WITH_AB=0 ARCH=sm_86 GROUPM=24 KSTAGES=3 PACKAGE_FLAVOR=sm86-g24-k3 bash package_portable.sh
-        - name: package-sm86-g8-k4
-          # Pipeline-depth sweep: GROUPM=8 was still best in v1.2.12, so test
-          # whether a deeper cp.async pipeline moves sm_86 over 100 TH/s.
-          # KSTAGES=2 is intentionally omitted: FoldMmaMultistage requires >=3.
-          script: WITH_AB=0 ARCH=sm_86 GROUPM=8 KSTAGES=4 PACKAGE_FLAVOR=sm86-g8-k4 bash package_portable.sh
-        - name: package-sm86-g4-k4
-          script: WITH_AB=0 ARCH=sm_86 GROUPM=4 KSTAGES=4 PACKAGE_FLAVOR=sm86-g4-k4 bash package_portable.sh
-        - name: package-sm86-g12-k4
-          script: WITH_AB=0 ARCH=sm_86 GROUPM=12 KSTAGES=4 PACKAGE_FLAVOR=sm86-g12-k4 bash package_portable.sh
         - name: create-release
           # built-in task; title defaults to the tag name, tag auto-taken from tag_push.
           type: git:release
           options:
-            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs. Assets include the generic multi-arch fatbin, the production sm_86/GROUPM=8 package, and sm_86 GROUPM tuning packages for RTX 3080Ti/3090 measurement. Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt and version-specific RELEASE_NOTES.txt inside."
+            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs. Assets include the generic multi-arch compatibility package and the production sm_86/GROUPM=8 tuned package for RTX 3080Ti/3090 class GPUs. Experimental sm_86 GROUPM/KSTAGES sweep packages are intentionally not published as default release assets. Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt, GPU_PROFILES.md, BUILD_INFO.txt and RELEASE_NOTES.txt inside."
             latest: true
         - name: upload-portable-package
           image: cnbcool/attachments:latest
@@ -88,10 +78,4 @@ $:
             attachments:
               - dist/kan-portable-linux-x64.tar.gz
               - dist/kan-portable-linux-x64-sm86-g8.tar.gz
-              - dist/kan-portable-linux-x64-sm86-g4-k3.tar.gz
-              - dist/kan-portable-linux-x64-sm86-g12-k3.tar.gz
-              - dist/kan-portable-linux-x64-sm86-g16-k3.tar.gz
-              - dist/kan-portable-linux-x64-sm86-g24-k3.tar.gz
-              - dist/kan-portable-linux-x64-sm86-g8-k4.tar.gz
-              - dist/kan-portable-linux-x64-sm86-g4-k4.tar.gz
-              - dist/kan-portable-linux-x64-sm86-g12-k4.tar.gz
+              - install_kan.sh

@@ -12,8 +12,8 @@
 # Build host: any Linux + CUDA toolkit, NO GPU required (CUDA code compiles
 # GPU-less). Build on the OLDEST glibc you must support — the cnb runner
 # (ubuntu22.04, glibc 2.35) covers Ubuntu 22.04+ GPU containers. CUDA 12.4 nvcc
-# emits sm_75..sm_90 SASS + compute_90 PTX, so a 5090 (sm_120) JITs the PTX at
-# runtime (~336 TH/s); for native sm_120 SASS (~350) build on CUDA 13.
+# emits sm_75..sm_90 SASS + compute_90 PTX. Blackwell / sm_120 needs a CUDA 13
+# native package for best performance; CUDA 12 packages can only rely on PTX JIT.
 #
 # Usage:
 #   bash package_portable.sh                 # auto-arch (portable fatbin)
@@ -46,6 +46,21 @@ DIST="${ROOT}/dist"
 STAGE="${DIST}/${PKG}"
 LIBDIR="${STAGE}/lib"
 WITH_AB="${WITH_AB:-1}"
+
+# Mirror build.sh defaults so BUILD_INFO.txt records the actual compile-time
+# knobs instead of vague "build-default" placeholders. These are compile-time
+# parameters: target machines must select a prebuilt flavor package rather than
+# trying to change them at runtime.
+if [ -z "${GROUPM+x}" ] || [ -z "${GROUPM}" ]; then
+  case "${ARCH:-}" in
+    sm_80|sm_86) GROUPM=8 ;;
+    *) GROUPM=128 ;;
+  esac
+fi
+KSTAGES="${KSTAGES:-3}"
+EFFECTIVE_SMALL_TILE="${SMALL_TILE:-0}"
+export GROUPM KSTAGES
+
 rm -rf "${STAGE}"; mkdir -p "${LIBDIR}/../bench"
 
 echo "=== [1/5] build portable binaries ==="
@@ -66,6 +81,8 @@ cp -f build/kan build/plainproof_gen "${STAGE}/"
 cp -f build/pearl-miner "${STAGE}/pearl-miner" 2>/dev/null || cp -f build/kan "${STAGE}/pearl-miner"
 chmod +x "${STAGE}/kan" "${STAGE}/pearl-miner" "${STAGE}/plainproof_gen"
 [ -f "${STAGE}/plainproof_gen_rmw" ] && chmod +x "${STAGE}/plainproof_gen_rmw"
+[ -f "${ROOT}/GPU_PROFILES.md" ] && cp -f "${ROOT}/GPU_PROFILES.md" "${STAGE}/GPU_PROFILES.md"
+[ -f "${ROOT}/install_kan.sh" ] && cp -f "${ROOT}/install_kan.sh" "${STAGE}/install_kan.sh" && chmod +x "${STAGE}/install_kan.sh"
 
 echo "=== [2/5] bundle non-glibc / non-driver shared libs (fixpoint over ldd) ==="
 # Keep as SYSTEM (never bundle): glibc core (ABI-stable, everywhere) + the NVIDIA
@@ -111,8 +128,9 @@ echo "=== [3/5] launcher + bench + README ==="
 cat > "${STAGE}/run.sh" <<'LAUNCH'
 #!/usr/bin/env bash
 # Portable Pearl(PRL) miner. ONLY runtime dep = the NVIDIA driver (any GPU host
-# has it). rpath $ORIGIN/lib already locates the bundled libs; this wrapper just
-# checks the driver and forwards all args to ./kan.
+# has it). rpath $ORIGIN/lib already locates the bundled libs.  For pool mining
+# this wrapper also provides the production restart loop: the miner exits on
+# pool disconnect/job error, so unattended portable deployments must reconnect.
 here="$(cd "$(dirname "$0")" && pwd)"
 if ! ls /dev/nvidia0 >/dev/null 2>&1 && ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "WARNING: no NVIDIA GPU/driver detected — this is a CUDA GPU miner." >&2
@@ -130,7 +148,53 @@ if [ -z "${TC_PERSIST+x}" ]; then
   esac
 fi
 
-exec "$here/kan" "$@"
+if [ "${KAN_SHOW_BUILD_INFO:-1}" != "0" ]; then
+  ver="$(cat "$here/VERSION" 2>/dev/null || echo unknown)"
+  commit="$(awk -F': ' '/^commit:/ {print $2; exit}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
+  flavor="$(awk -F': ' '/^package_flavor:/ {print $2; exit}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
+  arch="$(awk -F': ' '/^arch:/ {print $2; exit}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
+  groupm="$(awk -F': ' '/^groupm:/ {print $2; exit}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
+  kstages="$(awk -F': ' '/^kstages:/ {print $2; exit}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
+  gpu="$(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null | head -1 || true)"
+  {
+    echo "=== Kan portable package ==="
+    echo "version=${ver} commit=${commit:-unknown}"
+    echo "flavor=${flavor:-generic} arch=${arch:-unknown} groupm=${groupm:-unknown} kstages=${kstages:-unknown}"
+    echo "TC_PERSIST=${TC_PERSIST:-<unset>} TC_TIMING=${TC_TIMING:-0} KAN_RESTART=${KAN_RESTART:-auto}"
+    [ -n "$gpu" ] && echo "gpu=${gpu}"
+    echo "============================"
+  } >&2
+fi
+
+is_pool=0
+for arg in "$@"; do
+  case "$arg" in
+    --pool|--pool=*) is_pool=1 ;;
+  esac
+done
+
+# Production default:
+#   * pool mode: restart forever on disconnect/job-error (KAN_RESTART=auto)
+#   * non-pool/help/solo modes: one-shot exec
+# Operators can force one-shot pool runs with:
+#   KAN_RESTART=0 ./run.sh --algo pearl --pool ...
+# and adjust the delay with KAN_RESTART_DELAY=15.
+restart="${KAN_RESTART:-auto}"
+case "$restart:$is_pool" in
+  1:*|true:*|yes:*|always:*|auto:1)
+    delay="${KAN_RESTART_DELAY:-15}"
+    while true; do
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] Kan starting: $here/kan $*" >&2
+      "$here/kan" "$@"
+      rc=$?
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] Kan exited (rc=$rc), restarting in ${delay}s; set KAN_RESTART=0 for one-shot." >&2
+      sleep "$delay"
+    done
+    ;;
+  *)
+    exec "$here/kan" "$@"
+    ;;
+esac
 LAUNCH
 chmod +x "${STAGE}/run.sh"
 
@@ -150,14 +214,18 @@ if [ -z "$log" ]; then
   done
 fi
 ver="$(cat "$here/VERSION" 2>/dev/null || echo unknown)"
+commit="$(awk -F': ' '/^commit:/ {print $2}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
 flavor="$(awk -F': ' '/^package_flavor:/ {print $2}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
 arch="$(awk -F': ' '/^arch:/ {print $2}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
 groupm="$(awk -F': ' '/^groupm:/ {print $2}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
+kstages="$(awk -F': ' '/^kstages:/ {print $2}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
 
 echo "=== Kan portable status ==="
 echo "dir:     $here"
 echo "version: $ver"
-echo "flavor:  ${flavor:-unknown}  arch=${arch:-unknown}  groupm=${groupm:-unknown}"
+echo "commit:  ${commit:-unknown}"
+echo "flavor:  ${flavor:-unknown}  arch=${arch:-unknown}  groupm=${groupm:-unknown}  kstages=${kstages:-unknown}"
+echo "runtime: TC_PERSIST=${TC_PERSIST:-<unset>}  TC_TIMING=${TC_TIMING:-0}  KAN_RESTART=${KAN_RESTART:-auto}"
 echo "log:     ${log:-<not found>}"
 echo
 
@@ -179,11 +247,11 @@ echo
 
 echo "=== GPU ==="
 if command -v nvidia-smi >/dev/null 2>&1; then
-  nvidia-smi --query-gpu=name,temperature.gpu,fan.speed,power.draw,power.limit,utilization.gpu,clocks.sm,clocks.mem,memory.used,memory.total \
+  nvidia-smi --query-gpu=name,compute_cap,driver_version,temperature.gpu,fan.speed,power.draw,power.limit,utilization.gpu,clocks.sm,clocks.mem,memory.used,memory.total \
     --format=csv,noheader,nounits 2>/dev/null |
   awk -F', ' '{
-    printf "gpu: %s | temp=%sC fan=%s%% power=%s/%sW util=%s%% sm=%sMHz memclk=%sMHz vram=%s/%sMiB\n",
-           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10
+    printf "gpu: %s | cc=%s driver=%s temp=%sC fan=%s%% power=%s/%sW util=%s%% sm=%sMHz memclk=%sMHz vram=%s/%sMiB\n",
+           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
   }'
 else
   echo "nvidia-smi not found"
@@ -268,11 +336,13 @@ stable_tar_alias: ${STABLE_TAR}
 with_ab: ${WITH_AB}
 portable: 1
 arch: ${ARCH:-portable-fatbin}
-groupm: ${GROUPM:-build-default}
-kstages: ${KSTAGES:-build-default}
-small_tile: ${SMALL_TILE:-0}
+groupm: ${GROUPM}
+kstages: ${KSTAGES}
+small_tile: ${EFFECTIVE_SMALL_TILE}
 package_flavor: ${PACKAGE_FLAVOR:-generic}
+package_policy: $([ -n "${PACKAGE_FLAVOR:-}" ] && echo tuned || echo generic-compatible)
 toolchain: CUDA 12.x portable build; static cudart/libstdc++; bundled non-glibc shared libs
+cuda_version: CUDA 12.x
 runtime_dependency: NVIDIA driver + Linux x86-64 glibc >= 2.35
 EOF
 
@@ -285,6 +355,31 @@ release_notes="${STAGE}/RELEASE_NOTES.txt"
   echo "Commit:  ${COMMIT}"
   echo "Built:   ${BUILD_DATE}"
   echo "Flavor:  ${PACKAGE_FLAVOR:-generic}"
+  echo
+  echo "Package profile:"
+  echo "----------------"
+  case "${PACKAGE_FLAVOR:-generic}" in
+    generic)
+      echo "Generic compatibility package for NVIDIA RTX 20 series / Turing and newer."
+      echo "Covers sm_75, sm_80, sm_86, sm_89, sm_90 SASS plus compute_90 PTX."
+      echo "Use this when no validated tuned package exists for the target GPU."
+      echo "This package prioritizes compatibility and does not promise per-architecture optimal performance."
+      ;;
+    sm86-g8)
+      echo "Production recommended tuned package for sm_86 / RTX 3080 Ti / RTX 3090 class GPUs."
+      echo "Compile-time profile: ARCH=sm_86 GROUPM=8 KSTAGES=3."
+      echo "Runtime defaults: TC_PERSIST=0 and pool-mode auto-restart, unless explicitly overridden by the operator."
+      ;;
+    sm86-*-k4)
+      echo "Experimental / known-not-for-RTX-3080Ti profile."
+      echo "KSTAGES=4 has failed smoke on RTX 3080 Ti due to dynamic shared memory limit."
+      echo "Do not use as a production package unless GPU_PROFILES.md is updated with new verified data."
+      ;;
+    *)
+      echo "Non-default flavor. Treat as Candidate/Experimental unless GPU_PROFILES.md marks it Production recommended."
+      echo "Do not make this an automatic install target without benchmark, POSTCHECK and pool accepted records."
+      ;;
+  esac
   echo
   if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null 2>&1; then
     echo "Tag notes:"
@@ -329,6 +424,19 @@ Built on cnb (Ubuntu 22.04 / glibc 2.35 / CUDA 12.4). Runs on any Linux x86-64
 GPU host with glibc >= 2.35 and an NVIDIA driver. NO CUDA toolkit, NO CUTLASS,
 NO compiler needed on this machine.
 
+Package selection:
+  kan-portable-linux-x64.tar.gz
+      Generic compatibility package for NVIDIA RTX 20 series / Turing and newer.
+      Use it when no validated tuned package exists for the target GPU.
+
+  kan-portable-linux-x64-sm86-g8.tar.gz
+      Production tuned package for sm_86 / RTX 3080 Ti / RTX 3090 class GPUs.
+      Compile-time profile: ARCH=sm_86 GROUPM=8 KSTAGES=3.
+      Runtime defaults: TC_PERSIST=0 and pool-mode auto-restart unless explicitly
+      overridden.
+
+  See GPU_PROFILES.md for the authoritative generic/tuned profile table.
+
 Quick start (pool mining):
   tar xzf ${STABLE_TAR} && cd ${PKG}
   ./run.sh --algo pearl \\
@@ -346,23 +454,31 @@ Files:
   plainproof_gen_rmw  pre-A1 baseline (present only if built WITH_AB=1)
   bench/ablate_a1_prebuilt.sh   on-box A1-vs-RMW A/B, no toolchain
   lib/                bundled libssl/libcrypto/libgomp... (found via rpath)
-  run.sh              launcher (driver check + forwards args to kan)
+  run.sh              launcher (driver check + package defaults + pool auto-restart)
   status.sh           readable process/GPU/hashrate/share/perf status
   VERSION             exact package version / git describe string
   BUILD_INFO.txt      build metadata for audit and support
   RELEASE_NOTES.txt   version-specific notes generated from the pushed git tag
+  GPU_PROFILES.md     authoritative generic/tuned GPU package profile table
+  install_kan.sh      installer/updater that selects tuned package or generic fallback
 
 GPU arch note:
   CUDA 12.4 nvcc emits sm_75..sm_90 SASS + compute_90 PTX. On Blackwell (RTX
-  5090, sm_120) the driver JITs the PTX at first launch (~336 TH/s). For native
-  sm_120 SASS (~350) rebuild the package on a CUDA 13 host with ARCH=sm_120.
+  50 series / sm_120) the driver can only JIT the PTX fallback. For best
+  Blackwell performance, use a future CUDA 13 native sm_120 package after it is
+  validated and listed in GPU_PROFILES.md.
 
 Verify it's truly portable (should list only glibc + libcuda as external):
   ldd ./kan
 
 Ampere tuning note:
-  sm_86 packages default TC_PERSIST=0 because v1.2.11/v1.2.12 VPS data showed
-  it is faster on RTX 3080Ti. Override with TC_PERSIST=1 ./run.sh ... if needed.
+  sm86-g8 defaults TC_PERSIST=0 because v1.2.11/v1.2.12 VPS data showed it is
+  faster on RTX 3080Ti. Override with TC_PERSIST=1 ./run.sh ... if needed.
+
+Restart note:
+  Pool mode auto-restarts by default because pool disconnect/job-error exits the
+  miner.  Use KAN_RESTART=0 ./run.sh ... for a one-shot run, or
+  KAN_RESTART_DELAY=5 ./run.sh ... to change the reconnect delay.
 README
 
 echo "=== [4/5] portability proof (ldd of staged kan) ==="
