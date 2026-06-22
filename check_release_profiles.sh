@@ -39,6 +39,11 @@ dist/kan-portable-linux-x64.tar.gz
 install_kan.sh
 EOF
 )"
+  # Sort both sides under LC_ALL=C so the comparison is locale-independent.
+  # (zh_CN.UTF-8 and other UTF-8 locales sort "...-sm86-g8.tar.gz" AFTER
+  # "....tar.gz" because they ignore punctuation; C locale orders by byte, where
+  # '-' < '.', putting sm86-g8 first. The expected list below is C-sorted.)
+  expected="$(printf '%s\n' "${expected}" | LC_ALL=C sort)"
   actual="$(
     awk '
       /^[[:space:]]*attachments:[[:space:]]*$/ {in_list=1; next}
@@ -48,7 +53,7 @@ EOF
         next
       }
       in_list && /^[[:space:]]*[A-Za-z0-9_-]+:/ {in_list=0}
-    ' .cnb.yml | sort
+    ' .cnb.yml | LC_ALL=C sort
   )"
 
   if [ "${actual}" != "${expected}" ]; then
