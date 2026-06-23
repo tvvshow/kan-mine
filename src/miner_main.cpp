@@ -1,8 +1,10 @@
 // miner_main.cpp — Kan: Pearl(PRL) PoUW miner
 #include "prover.h"
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +26,7 @@
 #include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -86,6 +89,7 @@ struct NVML {
   ~NVML() { if (lib) dlclose(lib); }
 };
 struct GPUInfo {
+  unsigned index = 0;
   void* handle = nullptr;
   char name[96] = "GPU";
   unsigned long long vram_mb = 0;
@@ -147,13 +151,14 @@ static void print_stats(const std::string& wallet, const std::string& pool_url) 
   } else {
     snprintf(wshort, sizeof(wshort), "%s", wallet.empty() ? "<wallet>" : wallet.c_str());
   }
+  const std::string last_share = last_m > 0 ? std::to_string(last_m) + "m" : "-";
   fprintf(stderr, "\n-----%s---------------------%s-----\n", wshort, pool_url.c_str());
   fprintf(stderr, " DEVICE MODEL              HASHRATE  TEMP  FAN POWER      EFFIC       A    R  LAST\n");
   fprintf(stderr, "----------------------------------------------------------------------------------------\n");
   if (g_gpus.empty()) {
     fprintf(stderr, " GPU #0 %-18s %.2f TH/s    --   --   ---  -------- %7llu %4llu %5s\n",
             "N/A", ths_60, (unsigned long long)acc, (unsigned long long)rej,
-            last_m > 0 ? (std::to_string(last_m)+"m").c_str() : "-");
+            last_share.c_str());
   }
   for (size_t i = 0; i < g_gpus.size(); i++) {
     unsigned temp = 0, fan = 0, power_mw = 0;
@@ -164,10 +169,10 @@ static void print_stats(const std::string& wallet, const std::string& pool_url) 
     }
     double power_w = (double)power_mw / 1000.0;
     double effic = (ths_60 > 0 && power_w > 1.0) ? ths_60 * 1000.0 / power_w : 0.0;
-    fprintf(stderr, " GPU #%zu %-18s %.2f TH/s   %3uC  %3u%%  %3.0fW  %5.1f GH/W %7llu %4llu %5s\n",
-            i, g_gpus[i].name, ths_60, temp, fan, power_w, effic,
+    fprintf(stderr, " GPU #%u %-18s %.2f TH/s   %3uC  %3u%%  %3.0fW  %5.1f GH/W %7llu %4llu %5s\n",
+            g_gpus[i].index, g_gpus[i].name, ths_60, temp, fan, power_w, effic,
             (unsigned long long)acc, (unsigned long long)rej,
-            last_m > 0 ? (std::to_string(last_m)+"m").c_str() : "-");
+            last_share.c_str());
   }
   fprintf(stderr, "----------------------------------------------------------------------------------------\n");
   fprintf(stderr, " 10s                   %10.2f TH/s            %5.0fW           A: %llu\n", ths_10, 0.0, (unsigned long long)acc);
@@ -317,6 +322,9 @@ struct PoolOpts {
   bool real_cfg = true;
   bool use_tc = true;
   bool breakdown = false;
+  int gpu_index = 0;           // CUDA device index visible in this process.
+  int physical_gpu_index = 0;  // Original machine GPU index for logs/workers.
+  int gpu_count = 1;           // Total GPUs managed by the parent process.
 };
 struct PoolState {
   std::mutex mu;
@@ -405,6 +413,25 @@ static void pool_reader(int fd, SSL* ssl, PoolState* st) {
 }
 static int run_pool(const PoolOpts& o) {
   SSL_library_init();
+  char gpu_cat[32];
+  snprintf(gpu_cat, sizeof(gpu_cat), "GPU #%d", o.physical_gpu_index);
+  cudaError_t ce = cudaSetDevice(o.gpu_index);
+  if (ce != cudaSuccess) {
+    log_linef(gpu_cat, "cudaSetDevice(%d) failed: %s",
+              o.gpu_index, cudaGetErrorString(ce));
+    return 2;
+  }
+  // The pool-facing worker name identifies the VPS / machine, not one GPU.
+  // Each GPU lane runs as its own process and opens its OWN stratum connection,
+  // but every lane authorizes as the SAME worker name so pool-side accounting
+  // aggregates the whole box instead of splitting it into gpu0/gpu1/... workers.
+  // This is per-GPU-connection fan-in by worker name — NOT one shared stratum
+  // session and NOT a parent-multiplexed single connection (that is a future
+  // item, see run_pool_parent_multigpu).
+  const std::string& worker = o.worker;
+  log_linef(gpu_cat, "selected CUDA device %d (physical GPU #%d of %d) worker=%s",
+            o.gpu_index, o.physical_gpu_index, o.gpu_count, worker.c_str());
+
   int fd = tcp_connect(o.host, o.port);
   if (fd < 0) { log_line("stratum", "connect failed"); return 2; }
   SSL_CTX* ctx = nullptr;
@@ -422,12 +449,17 @@ static int run_pool(const PoolOpts& o) {
     }
   }
   std::string proto = o.use_tls ? "stratum+tls://" : "stratum+tcp://";
-  log_linef("stratum", "connecting to %s%s:%d as %s.%s (1 GPUs, one session)",
-            proto.c_str(), o.host.c_str(), o.port, o.wallet.c_str(), o.worker.c_str());
+  // NOTE: each GPU lane opens its OWN stratum connection. When gpu_count>1 the
+  // parent has forked one lane per GPU and every lane authorizes under the same
+  // worker name, so the pool aggregates the whole box under one worker — but
+  // these are independent stratum connections, NOT a single shared session.
+  log_linef("stratum", "connecting to %s%s:%d as %s.%s (GPU %d/%d, per-GPU connection)",
+            proto.c_str(), o.host.c_str(), o.port, o.wallet.c_str(),
+            worker.c_str(), o.physical_gpu_index, o.gpu_count);
   PoolState st;
   std::thread rd(pool_reader, fd, ssl, &st);
   std::string auth = "{\"id\":1,\"method\":\"mining.authorize\",\"params\":{\"wallet\":\"" +
-                     o.wallet + "." + o.worker + "\",\"worker\":\"" + o.worker +
+                     o.wallet + "." + worker + "\",\"worker\":\"" + worker +
                      "\",\"agent\":\"" + o.agent + "\"}}";
   pool_send(fd, ssl, auth);
   double t0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -442,7 +474,7 @@ static int run_pool(const PoolOpts& o) {
       if (ctx) SSL_CTX_free(ctx);
       close(fd); return 3; }
     log_linef("stratum", "authorize: ok wallet=%s.%s agent=%s",
-              o.wallet.c_str(), o.worker.c_str(), o.agent.c_str());
+              o.wallet.c_str(), worker.c_str(), o.agent.c_str());
   }
   long long submit_id = 100;
   uint64_t attempt_id = 0;
@@ -522,17 +554,18 @@ static int run_pool(const PoolOpts& o) {
       if (!verdict.empty() && verdict.find("\"result\":true") != std::string::npos) {
         g_accepted.fetch_add(1);
         g_last_share = std::chrono::steady_clock::now();
-        log_linef("GPU #0", "share accepted submit_wait=%.3fs", submit_s);
+        log_linef(gpu_cat, "share accepted submit_wait=%.3fs", submit_s);
       } else if (!verdict.empty()) {
         g_rejected.fetch_add(1);
-        log_linef("GPU #0", "share rejected submit_wait=%.3fs: %s",
+        log_linef(gpu_cat, "share rejected submit_wait=%.3fs: %s",
                   submit_s, verdict.substr(0, 100).c_str());
       } else if (!st.stop.load()) {
-        log_linef("GPU #0", "share submit timeout submit_wait=%.3fs", submit_s);
+        log_linef(gpu_cat, "share submit timeout submit_wait=%.3fs", submit_s);
       }
     }
   });
-  log_line("stratum", "async share submit worker active");
+  log_linef("stratum", "async share submit worker active gpu=%d",
+            o.physical_gpu_index);
 
   std::thread stats_th([&]() {
     bool first_print = true;
@@ -602,8 +635,11 @@ static int run_pool(const PoolOpts& o) {
         abort_count = st.abort_count;
         seq = st.seq; }
       log_linef("perf",
-                "attempt=%llu reason=%s rc=%d fresh=%d draws=%llu elapsed=%.3fs %.2f TH/s seq=%llu notify=%llu abort=%llu",
-                (unsigned long long)attempt_id, reason, rc, fresh ? 1 : 0,
+                "gpu=%d attempt=%llu reason=%s rc=%d fresh=%d "
+                "draws=%llu elapsed=%.3fs %.2f TH/s seq=%llu "
+                "notify=%llu abort=%llu",
+                o.physical_gpu_index, (unsigned long long)attempt_id,
+                reason, rc, fresh ? 1 : 0,
                 (unsigned long long)R.draws, attempt_s, ths,
                 (unsigned long long)seq, (unsigned long long)notify_count,
                 (unsigned long long)abort_count);
@@ -834,13 +870,241 @@ static void usage() {
     "kan — Kan Pearl(PRL) PoUW miner\n\n"
     "  kan --algo pearl --pool URL --wallet ADDR[.WORKER]\n"
     "  kan --solo --node host:port --rpcuser U --rpcpass P --addr <p2tr>\n\n"
-    "pool URL:  stratum+ssl://host:port  or  stratum+tcp://host:port\n"
+    "pool URL:  stratum+ssl://host:port  or  stratum+tcp://host:port\n\n"
+    "GPU selection (pool mode):\n"
+    "  default          use ALL detected GPUs automatically (one isolated lane\n"
+    "                   process per GPU; all lanes share the same worker name so\n"
+    "                   the pool aggregates the whole machine).\n"
+    "  --devices 0,1,3  use only these physical GPU indices (subset auto-fanout).\n"
+    "  CUDA_VISIBLE_DEVICES=...\n"
+    "                   if set in the environment, the miner RESPECTS it and runs\n"
+    "                   a single lane on whatever it exposes; auto-fanout is then\n"
+    "                   DISABLED (use this to pin one GPU or integrate with an\n"
+    "                   external scheduler).\n\n"
+    "options:   --worker NAME   pool worker name (default pm)\n"
+    "           --batch N       max draws per attempt before re-checking job\n"
+    "           --breakdown     per-draw timing\n"
     "commands:  s (stats now), q (quit); table prints every 120s\n");
 }
+
+static volatile sig_atomic_t g_parent_signal = 0;
+static void parent_signal_handler(int sig) {
+  g_parent_signal = sig;
+}
+
+static int env_int(const char* name, int def) {
+  const char* v = getenv(name);
+  if (!v || !*v) return def;
+  char* end = nullptr;
+  long x = strtol(v, &end, 10);
+  if (end == v) return def;
+  return (int)x;
+}
+
+static void normalize_cuda_device_order() {
+  // CUDA defaults to FASTEST_FIRST ordering, while NVML enumerates PCI-bus order.
+  // The multi-GPU code treats user-facing indices as NVML/physical indices, so
+  // force CUDA ordinal N to mean the same physical GPU N before any CUDA query.
+  setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 1);
+}
+
+static int cpu_thread_count() {
+  long n = sysconf(_SC_NPROCESSORS_ONLN);
+  return n > 0 ? (int)n : 1;
+}
+
+static bool parse_device_list(const std::string& s, std::vector<unsigned>& out) {
+  out.clear();
+  size_t pos = 0;
+  while (pos < s.size()) {
+    while (pos < s.size() && (s[pos] == ',' || s[pos] == ' ' || s[pos] == '\t')) pos++;
+    if (pos >= s.size()) break;
+    char* end = nullptr;
+    unsigned long v = strtoul(s.c_str() + pos, &end, 10);
+    if (end == s.c_str() + pos) return false;
+    out.push_back((unsigned)v);
+    pos = (size_t)(end - s.c_str());
+    while (pos < s.size() && s[pos] != ',') {
+      if (s[pos] != ' ' && s[pos] != '\t') return false;
+      pos++;
+    }
+  }
+  for (size_t i = 0; i < out.size(); i++) {
+    for (size_t j = i + 1; j < out.size(); j++) {
+      if (out[i] == out[j]) return false;
+    }
+  }
+  return !out.empty();
+}
+
+static bool device_requested(const std::vector<unsigned>& list, unsigned idx) {
+  if (list.empty()) return true;
+  for (unsigned v : list) if (v == idx) return true;
+  return false;
+}
+
+static bool should_enable_physical_gpu(bool gpu_child, int child_phys_gpu,
+                                       const std::vector<unsigned>& requested,
+                                       unsigned idx) {
+  if (gpu_child) return (int)idx == child_phys_gpu;
+  return device_requested(requested, idx);
+}
+
+static bool physical_gpu_available(const std::vector<GPUInfo>& gpus, unsigned idx) {
+  for (const auto& gi : gpus) if (gi.index == idx) return true;
+  return false;
+}
+
+static bool parse_first_visible_device_index(const char* cvd, unsigned& out) {
+  if (!cvd || !*cvd) return false;
+  char* end = nullptr;
+  unsigned long v = strtoul(cvd, &end, 10);
+  if (end == cvd) return false;
+  if (*end != '\0' && *end != ',' && *end != ' ' && *end != '\t') return false;
+  out = (unsigned)v;
+  return true;
+}
+
+static void select_single_visible_gpu(unsigned physical_gpu) {
+  // Reuse the same isolation model as forked lanes for an explicit one-GPU
+  // selection.  After this, cudaSetDevice(0) targets the selected physical GPU.
+  std::string gpu = std::to_string(physical_gpu);
+  setenv("CUDA_VISIBLE_DEVICES", gpu.c_str(), 1);
+}
+
+// Auto multi-GPU presents one command and one pool worker name to the user and
+// the pool.  Internally the parent acts as a supervisor and spawns one isolated
+// GPU lane PROCESS per physical GPU; each lane opens its OWN stratum connection
+// and authorizes under the shared worker name (pool-side aggregation by worker,
+// not a single multiplexed session).
+// This intentionally avoids running multiple prover instances as threads in one
+// address space: tc_cutlass_v2.cu / gpu_prep.cu keep persistent device buffers
+// in file-static globals, so multi-threading would risk sharing GPU pointers
+// across devices.  Per-GPU lane processes keep those globals isolated.
+// A single parent-multiplexed stratum session with unified stats is a future
+// item and is intentionally NOT implemented here.
+static int run_pool_parent_multigpu(char** argv, const PoolOpts& base,
+                                    const std::vector<unsigned>& gpu_indices) {
+  unsigned gpu_count = (unsigned)gpu_indices.size();
+  log_linef("multigpu",
+            "supervisor: starting %u per-GPU lane(s) under one worker name "
+            "(each lane = isolated process + own stratum connection)",
+            gpu_count);
+  int host_threads = cpu_thread_count();
+  int lane_threads = (host_threads + (int)gpu_count - 1) / (int)gpu_count;
+  if (lane_threads < 1) lane_threads = 1;
+  bool user_omp = getenv("OMP_NUM_THREADS") && *getenv("OMP_NUM_THREADS");
+  if (user_omp) {
+    log_linef("multigpu", "OMP_NUM_THREADS=%s supplied by user",
+              getenv("OMP_NUM_THREADS"));
+  } else {
+    log_linef("multigpu", "auto CPU split: %d host threads / %u GPUs -> OMP_NUM_THREADS=%d per lane",
+              host_threads, gpu_count, lane_threads);
+  }
+
+  std::vector<pid_t> pids;
+  pids.reserve(gpu_count);
+
+  struct sigaction sa{};
+  sa.sa_handler = parent_signal_handler;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGTERM, &sa, nullptr);
+
+  for (unsigned lane = 0; lane < gpu_count; lane++) {
+    unsigned physical_gpu = gpu_indices[lane];
+    pid_t pid = fork();
+    if (pid < 0) {
+      log_linef("multigpu", "fork failed for GPU #%u: errno=%d",
+                physical_gpu, errno);
+      continue;
+    }
+    if (pid == 0) {
+      std::string gpu = std::to_string(physical_gpu);
+      std::string total = std::to_string(gpu_count);
+      setenv("KAN_GPU_CHILD", "1", 1);
+      setenv("KAN_GPU_PHYSICAL_INDEX", gpu.c_str(), 1);
+      setenv("KAN_GPU_COUNT", total.c_str(), 1);
+      setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 1);
+      setenv("CUDA_VISIBLE_DEVICES", gpu.c_str(), 1);
+      if (!user_omp) {
+        std::string omp = std::to_string(lane_threads);
+        setenv("OMP_NUM_THREADS", omp.c_str(), 1);
+        setenv("OMP_DYNAMIC", "FALSE", 1);
+      }
+      execvp(argv[0], argv);
+      fprintf(stderr, "execvp(%s) failed: errno=%d\n", argv[0], errno);
+      _exit(127);
+    }
+    pids.push_back(pid);
+    log_linef("multigpu", "GPU #%u lane %u/%u pid=%d worker=%s",
+              physical_gpu, lane + 1, gpu_count, (int)pid,
+              base.worker.c_str());
+  }
+
+  if (pids.empty()) {
+    log_line("multigpu", "no GPU lanes started");
+    return 2;
+  }
+
+  int rc_final = 0;
+  size_t alive = pids.size();
+  bool terminating = false;
+  while (alive > 0) {
+    if (g_parent_signal && !terminating) {
+      log_linef("multigpu", "signal %d, stopping GPU lanes",
+                (int)g_parent_signal);
+      for (pid_t p : pids) kill(p, SIGTERM);
+      terminating = true;
+      g_parent_signal = 0;
+    }
+    int status = 0;
+    pid_t w = wait(&status);
+    if (w < 0) {
+      if (errno == EINTR && g_parent_signal) {
+        log_linef("multigpu", "signal %d, stopping GPU lanes",
+                  (int)g_parent_signal);
+        for (pid_t p : pids) kill(p, SIGTERM);
+        terminating = true;
+        g_parent_signal = 0;
+        continue;
+      }
+      if (errno == ECHILD) break;
+      continue;
+    }
+    alive--;
+    if (WIFEXITED(status)) {
+      int rc = WEXITSTATUS(status);
+      log_linef("multigpu", "lane pid=%d exited rc=%d", (int)w, rc);
+      if (rc != 0 && rc_final == 0) rc_final = rc;
+    } else if (WIFSIGNALED(status)) {
+      int sig = WTERMSIG(status);
+      log_linef("multigpu", "lane pid=%d killed by signal %d", (int)w, sig);
+      if (rc_final == 0) rc_final = 128 + sig;
+    }
+    // A single dead lane means the VPS is no longer mining at full capacity.
+    // Stop the remaining lanes and let the external supervisor restart the
+    // whole miner cleanly instead of silently running degraded forever.
+    if (!terminating && alive > 0) {
+      log_line("multigpu", "lane stopped; stopping remaining GPU lanes");
+      for (pid_t p : pids) {
+        if (p != w) kill(p, SIGTERM);
+      }
+      terminating = true;
+    }
+  }
+  return rc_final;
+}
+
 int main(int argc, char** argv) {
+  normalize_cuda_device_order();
   if (argc < 2) { usage(); return 2; }
   bool pool = false, solo = false;
   PoolOpts po; SoloOpts so;
+  bool gpu_child = env_int("KAN_GPU_CHILD", 0) != 0;
+  int child_phys_gpu = env_int("KAN_GPU_PHYSICAL_INDEX", 0);
+  int child_gpu_count = env_int("KAN_GPU_COUNT", 1);
+  std::vector<unsigned> requested_devices;
   std::string pool_url;
   std::string algo;
   for (int i = 1; i < argc; i++) {
@@ -862,6 +1126,13 @@ int main(int argc, char** argv) {
     }
     else if (a == "--worker") po.worker = next();
     else if (a == "--agent") po.agent = next();
+    else if (a == "--devices") {
+      std::string d = next();
+      if (!parse_device_list(d, requested_devices)) {
+        fprintf(stderr, "invalid --devices list: %s\n", d.c_str());
+        return 2;
+      }
+    }
     else if (a == "--batch") po.batch = so.batch = strtoull(next("1000").c_str(), nullptr, 10);
     else if (a == "--cfg") { std::string c = next("real"); po.real_cfg = so.real_cfg = (c == "real"); }
     else if (a == "--tc") po.use_tc = so.use_tc = true;
@@ -885,6 +1156,28 @@ int main(int argc, char** argv) {
     return 2;
   }
   if (pool == solo) { fprintf(stderr, "choose exactly one of --pool / --solo\n"); usage(); return 2; }
+  // --devices only affects pool-mode auto-fanout. Solo mode runs a single
+  // prover lane (one node template at a time), so reject the flag there instead
+  // of silently ignoring it.
+  if (solo && !requested_devices.empty()) {
+    fprintf(stderr, "--devices is only valid in --pool mode "
+                    "(solo mode runs a single GPU lane)\n");
+    return 2;
+  }
+  // If the operator pins GPUs through the environment, respect it and refuse to
+  // also auto-fanout: CUDA_VISIBLE_DEVICES remaps CUDA ordinals, so combining it
+  // with --devices (which filters NVML/physical indices) is ambiguous. Pick one.
+  {
+    const char* cvd_arg = getenv("CUDA_VISIBLE_DEVICES");
+    if (!gpu_child && cvd_arg && *cvd_arg && !requested_devices.empty()) {
+      fprintf(stderr,
+              "--devices and CUDA_VISIBLE_DEVICES are mutually exclusive; "
+              "CUDA_VISIBLE_DEVICES=%s is already set so auto-fanout is "
+              "disabled. Drop --devices or unset CUDA_VISIBLE_DEVICES.\n",
+              cvd_arg);
+      return 2;
+    }
+  }
   if (pool) {
     if (po.wallet.empty()) {
       fprintf(stderr, "pool mode requires --wallet ADDR[.WORKER]\n");
@@ -922,12 +1215,15 @@ int main(int argc, char** argv) {
     log_linef("wallet", "%s.%s", po.wallet.c_str(), po.worker.c_str());
     log_linef("worker", "%s", po.worker.c_str());
     log_line("commands", "s (stats), q (quit); table every 120s");
+    if (gpu_child) {
+      log_linef("multigpu", "GPU lane mode physical GPU #%d of %d",
+                child_phys_gpu, child_gpu_count);
+    }
     g_nvml.init();
     if (g_nvml.ok) {
       unsigned cnt = 0;
       g_nvml.DeviceGetCount(&cnt);
       // Full driver version string from NVML
-      int nvml_drv_ver = 0;
       char drv_str[32] = "N/A";
       // Try to get driver version from CUDA API as fallback
       int cuda_drv = 0;
@@ -935,7 +1231,10 @@ int main(int argc, char** argv) {
       snprintf(drv_str, sizeof(drv_str), "%d.%d", cuda_drv / 1000, (cuda_drv % 1000) / 10);
       log_linef("detected", "%u devices - driver %s", cnt, drv_str);
       for (unsigned i = 0; i < cnt && i < 16; i++) {
+        if (!should_enable_physical_gpu(gpu_child, child_phys_gpu,
+                                        requested_devices, i)) continue;
         GPUInfo gi;
+        gi.index = i;
         g_nvml.DeviceGetHandleByIndex(i, &gi.handle);
         if (gi.handle) {
           g_nvml.DeviceGetName(gi.handle, gi.name, sizeof(gi.name));
@@ -958,11 +1257,97 @@ int main(int argc, char** argv) {
         g_gpus.push_back(gi);
       }
     } else {
-      log_line("detected", "1 devices - driver N/A");
-      log_line("GPU", "#0 GPU              N/A sm_xx bus:00 enabled");
-      g_gpus.push_back({});
+      int cuda_cnt = 0;
+      if (cudaGetDeviceCount(&cuda_cnt) != cudaSuccess || cuda_cnt < 1) cuda_cnt = 1;
+      unsigned detected_count = gpu_child ? (unsigned)child_gpu_count : (unsigned)cuda_cnt;
+      log_linef("detected", "%u devices - driver N/A", detected_count);
+      unsigned begin = gpu_child ? (unsigned)child_phys_gpu : 0;
+      unsigned end = gpu_child ? begin + 1 : detected_count;
+      for (unsigned i = begin; i < end && i < 16; i++) {
+        if (!should_enable_physical_gpu(gpu_child, child_phys_gpu,
+                                        requested_devices, i)) continue;
+        GPUInfo gi;
+        gi.index = i;
+        log_linef("GPU", "#%u GPU              N/A sm_xx bus:00 enabled", i);
+        g_gpus.push_back(gi);
+      }
+    }
+    if (!gpu_child && !requested_devices.empty()) {
+      for (unsigned req : requested_devices) {
+        if (!physical_gpu_available(g_gpus, req)) {
+          log_linef("multigpu", "requested --devices GPU #%u is not available", req);
+          return 2;
+        }
+      }
+    }
+    if (!gpu_child && !requested_devices.empty() && g_gpus.empty()) {
+      log_line("multigpu", "none of the requested --devices are available");
+      return 2;
+    }
+    if (g_gpus.empty()) {
+      GPUInfo gi;
+      gi.index = gpu_child ? (unsigned)child_phys_gpu : 0;
+      log_linef("GPU", "#%u GPU              N/A sm_xx bus:00 enabled", gi.index);
+      g_gpus.push_back(gi);
     }
     log_line("devfee", "0%");
+    if (!requested_devices.empty() && !gpu_child) {
+      std::string s;
+      for (size_t i = 0; i < requested_devices.size(); i++) {
+        if (i) s += ",";
+        s += std::to_string(requested_devices[i]);
+      }
+      log_linef("multigpu", "device filter requested: %s", s.c_str());
+    }
+    po.gpu_index = 0;
+    po.physical_gpu_index = gpu_child ? child_phys_gpu : (int)g_gpus[0].index;
+    po.gpu_count = gpu_child ? child_gpu_count : (int)g_gpus.size();
+    const char* cvd = getenv("CUDA_VISIBLE_DEVICES");
+    bool external_cvd = (!gpu_child && cvd && *cvd);
+    if (gpu_child) {
+      // Child lanes are already scoped by the parent's CUDA_VISIBLE_DEVICES.
+    } else if (external_cvd) {
+      // Under an external CUDA_VISIBLE_DEVICES this process only uses CUDA
+      // ordinal 0 (the first GPU the env var exposes). CUDA_DEVICE_ORDER=PCI_BUS_ID
+      // lets simple numeric masks map back to the same NVML physical index.
+      unsigned visible0 = 0;
+      if (parse_first_visible_device_index(cvd, visible0) &&
+          physical_gpu_available(g_gpus, visible0)) {
+        for (const auto& gi : g_gpus) {
+          if (gi.index == visible0) {
+            GPUInfo selected = gi;
+            g_gpus.assign(1, selected);
+            break;
+          }
+        }
+        po.physical_gpu_index = (int)visible0;
+      } else {
+        // UUID/MIG masks cannot be mapped to an NVML index here; keep telemetry
+        // honest instead of reporting the wrong physical GPU as active.
+        GPUInfo gi;
+        gi.index = 0;
+        snprintf(gi.name, sizeof(gi.name), "CUDA-visible");
+        g_gpus.assign(1, gi);
+        po.physical_gpu_index = 0;
+      }
+      po.gpu_count = 1;
+      log_linef("multigpu",
+                "CUDA_VISIBLE_DEVICES=%s set; respecting it, auto fanout disabled "
+                "(single lane on CUDA ordinal 0)",
+                cvd);
+    } else if (po.gpu_count > 1) {
+      std::vector<unsigned> indices;
+      for (const auto& gi : g_gpus) indices.push_back(gi.index);
+      log_linef("multigpu", "%s%u GPUs -> auto fanout (one isolated lane per GPU, shared worker=%s)",
+                requested_devices.empty() ? "auto-detected " : "selected ",
+                (unsigned)indices.size(), po.worker.c_str());
+      return run_pool_parent_multigpu(argv, po, indices);
+    } else {
+      select_single_visible_gpu((unsigned)po.physical_gpu_index);
+      log_linef("multigpu", "single GPU #%d -> one lane (no fanout)%s",
+                po.physical_gpu_index,
+                requested_devices.empty() ? "" : " (selected via --devices)");
+    }
     return run_pool(po);
   } else {
     banner();

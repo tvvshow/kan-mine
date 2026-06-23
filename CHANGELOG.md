@@ -6,7 +6,7 @@ pool accepted 的实验不标记为 production recommended。
 
 ---
 
-## v1.2.17 — production runtime cleanup / public release candidate
+## v1.2.18 — production multi-GPU portable release candidate
 
 状态：待 Linux/CUDA release workflow 构建与 GPU L2/L3 验证后发布。
 
@@ -22,11 +22,22 @@ pool accepted 的实验不标记为 production recommended。
   进入提交队列。
 - pool mode now requires an explicit `--wallet ADDR[.WORKER]`; public packages
   no longer carry a real default wallet address.
+- **Single-machine multi-GPU**：pool 模式将单机单卡和单机多卡列为正式生产
+  运行能力。未设置 `CUDA_VISIBLE_DEVICES` 时自动使用所有检测到的 GPU
+  （parent supervisor + 每 GPU 一个隔离 lane 进程，各自独立 stratum 连接，
+  以同一 worker 名聚合）。新增 `--devices 0,1,3` 选择物理 GPU 子集；外部
+  `CUDA_VISIBLE_DEVICES` 时 miner 尊重它并禁用 auto fanout。`--devices` 与
+  `CUDA_VISIBLE_DEVICES` 互斥；`--devices` 仅 pool 模式有效。任一 lane 异常
+  退出时 supervisor 停止其余 lane 整体退出，交给 `run.sh` 自动重启。
+  诚实声明：统一父进程 stats / 单一共享 stratum session 仍是未来项，未完成。
 
 ### Packaging / operator docs
 
 - portable package `README.txt` / `RELEASE_NOTES.txt` 增加 runtime behavior
-  说明：pool auto-restart、async submit、stale proof abort。
+  说明：pool auto-restart、async submit、stale proof abort、multi-GPU auto fanout。
+- portable `run.sh` 启动 banner 增强：检测到多卡时明确提示 multi-GPU auto
+  fanout 默认启用，并说明 `--devices` / `CUDA_VISIBLE_DEVICES` 限制方式；
+  不改变现有 `KAN_RESTART` pool auto-restart 行为。
 - `status.sh` 增加 runtime event 摘要：
   - `async_submit_worker_seen`
   - `stale_proof_aborts`
@@ -66,13 +77,22 @@ L3: pool accepted > 0, rejected not abnormal, submit_timeout no storm
 推荐 tag message：
 
 ```text
-v1.2.17 — production runtime cleanup
+v1.2.18 — production multi-GPU portable release
 
 - pool: async share submit worker prevents submit_wait from blocking mining
 - proof: abort stale proof assembly when a newer pool job arrives
-- docs: public production profile table and RTX 5090 generic fallback baseline
+- runtime: single-machine single-GPU and multi-GPU auto fanout with --devices scoping
 - package: include CHANGELOG, runtime behavior notes, status runtime events
 ```
+
+---
+
+## v1.2.17 — production validation baseline
+
+- Switched production smoke tests to real Pearl config so CI validates the release
+  path against the same dimensions used on mainnet.
+- Prepared the v1.2.17 release pipeline and GPU validation gates that v1.2.18
+  builds on.
 
 ---
 

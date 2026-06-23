@@ -113,6 +113,18 @@ async share submit:
 stale proof early-abort:
   如果新 job 在 win/proof 期间到达，过期 proof 会在 CPU rederive /
   POSTCHECK / Merkle 阶段之间提前退出，不提交 stale proof。
+
+multi-GPU auto fanout:
+  pool 模式支持单机单卡和单机多卡，属于正式生产运行能力。
+  未设置 CUDA_VISIBLE_DEVICES 时，父进程作为 supervisor 自动检测并使用
+  所有 GPU，为每张物理 GPU fork 一个隔离 lane 进程；每个 lane 各自建立
+  一条 stratum 连接，并以同一 worker 名认证，矿池按 worker 聚合整机。
+  --devices 选择物理 GPU 子集；外部设置 CUDA_VISIBLE_DEVICES 时 miner
+  尊重它并禁用 auto fanout（单 lane）。--devices 与 CUDA_VISIBLE_DEVICES 互斥。
+  说明：这是 parent supervisor + per-GPU isolated lane 模型；单一 stratum
+  session / 统一父进程 stats 是未来项，尚未完成。
+  multi-GPU 不改变下方 GPU profile 选包矩阵：每个 lane 仍按本文件的架构
+  profile 选择编译期/运行期参数。
 ```
 
 这些策略是 live pool wall-clock 优化；进入 production 的最低要求仍然是：

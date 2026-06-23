@@ -161,13 +161,28 @@ if [ "${KAN_SHOW_BUILD_INFO:-1}" != "0" ]; then
   arch="$(awk -F': ' '/^arch:/ {print $2; exit}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
   groupm="$(awk -F': ' '/^groupm:/ {print $2; exit}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
   kstages="$(awk -F': ' '/^kstages:/ {print $2; exit}' "$here/BUILD_INFO.txt" 2>/dev/null || true)"
-  gpu="$(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null | head -1 || true)"
+  gpu_list="$(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null || true)"
+  gpu="$(printf '%s\n' "$gpu_list" | head -1)"
+  gpu_count="$(printf '%s\n' "$gpu_list" | grep -c . || true)"
   {
     echo "=== Kan portable package ==="
     echo "version=${ver} commit=${commit:-unknown}"
     echo "flavor=${flavor:-generic} arch=${arch:-unknown} groupm=${groupm:-unknown} kstages=${kstages:-unknown}"
     echo "TC_PERSIST=${TC_PERSIST:-<unset>} TC_TIMING=${TC_TIMING:-0} KAN_RESTART=${KAN_RESTART:-auto}"
     [ -n "$gpu" ] && echo "gpu=${gpu}"
+    # Multi-GPU is a production runtime capability: pool mode auto-uses ALL
+    # detected GPUs (one isolated lane per GPU, shared worker name).  Tell the
+    # operator how to scope it without reading the docs.
+    if [ -n "${gpu_count:-}" ] && [ "${gpu_count}" -gt 1 ] 2>/dev/null; then
+      if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        echo "gpus=${gpu_count} detected; CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} set -> single-lane, auto fanout DISABLED"
+      else
+        echo "gpus=${gpu_count} detected; pool mode auto multi-GPU fanout ENABLED (one lane/GPU, shared worker)"
+        echo "  scope it with: --devices 0,1 (subset) or CUDA_VISIBLE_DEVICES=0 ./run.sh ... (single, disables fanout)"
+      fi
+    elif [ -n "${gpu_count:-}" ] && [ "${gpu_count}" = "1" ]; then
+      echo "gpus=1 detected; single-GPU lane"
+    fi
     echo "============================"
   } >&2
 fi
@@ -181,6 +196,7 @@ done
 
 # Production default:
 #   * pool mode: restart forever on disconnect/job-error (KAN_RESTART=auto)
+#   * deliberate SIGINT/SIGTERM exits (130/143): stop instead of relaunching
 #   * non-pool/help/solo modes: one-shot exec
 # Operators can force one-shot pool runs with:
 #   KAN_RESTART=0 ./run.sh --algo pearl --pool ...
@@ -193,6 +209,10 @@ case "$restart:$is_pool" in
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] Kan starting: $here/kan $*" >&2
       "$here/kan" "$@"
       rc=$?
+      if [ "$rc" = "130" ] || [ "$rc" = "143" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Kan stopped by signal (rc=$rc); not restarting." >&2
+        exit "$rc"
+      fi
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] Kan exited (rc=$rc), restarting in ${delay}s; set KAN_RESTART=0 for one-shot." >&2
       sleep "$delay"
     done
@@ -412,6 +432,14 @@ release_notes="${STAGE}/RELEASE_NOTES.txt"
   echo "If a newer pool job arrives while a proof is being prepared, stale proof"
   echo "assembly is aborted before wasting CPU on a proof that cannot be submitted."
   echo
+  echo "Single-card and multi-card single-machine pool mining are both supported."
+  echo "With no GPU scoping the miner auto-uses ALL detected GPUs: one isolated"
+  echo "lane process per GPU, each with its own stratum connection under the same"
+  echo "worker name (pool aggregates by worker). Scope with --devices 0,1 for a"
+  echo "subset, or set CUDA_VISIBLE_DEVICES to pin a single GPU (which disables"
+  echo "auto fanout). A single shared stratum session with unified parent stats"
+  echo "is a future item, not yet shipped."
+  echo
   if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null 2>&1; then
     echo "Tag notes:"
     echo "----------"
@@ -520,6 +548,20 @@ Pool runtime note:
   idle while waiting for the pool response.  If a newer job arrives while a
   winning proof is being prepared, stale proof assembly is aborted and the miner
   continues on the fresh job.
+
+Multi-GPU note (single machine):
+  Pool mode supports single-card AND multi-card hosts as a production runtime
+  capability.  With no GPU scoping, the miner auto-detects ALL GPUs and runs one
+  isolated lane process per GPU (each lane opens its own stratum connection and
+  authorizes under the SAME worker name, so the pool aggregates the whole box).
+  Scope the GPUs with either:
+    --devices 0,1            mine only these physical GPU indices (subset fanout)
+    CUDA_VISIBLE_DEVICES=0 ./run.sh ...
+                             pin one GPU; this RESPECTS the env var and DISABLES
+                             auto fanout (one lane only).
+  --devices and CUDA_VISIBLE_DEVICES are mutually exclusive.
+  Note: this is a parent supervisor + per-GPU lane model.  A single shared
+  stratum session with unified parent stats is a future item, not yet shipped.
 README
 
 echo "=== [4/5] portability proof (ldd of staged kan) ==="

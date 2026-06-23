@@ -4,6 +4,7 @@
 
 - 矿池挖矿（LuckyPool / Kryptex）
 - Solo 挖矿（pearld RPC）
+- 单机单卡 + 单机多卡：pool 模式默认自动使用所有检测到的 GPU（每 GPU 一个独立 lane 进程）
 - GPU 全流程：RNG + blake3 哈希 + 噪声生成 + 搜索均在 GPU 完成
 - 实时算力显示（15 秒首表，500ms 采样）
 - NVML 硬件监控（温度 / 风扇 / 功耗 / 能效）
@@ -144,10 +145,10 @@ cd kan-portable-linux-x64
 # 默认根据 nvidia-smi 检测 GPU：
 #   sm_86 -> kan-portable-linux-x64-sm86-g8.tar.gz
 #   其他 / 未调优架构 -> kan-portable-linux-x64.tar.gz
-VERSION=v1.2.17 ./install_kan.sh
+VERSION=v1.2.18 ./install_kan.sh
 
 # 如 release 地址不是默认 CNB 格式，可显式指定：
-RELEASE_BASE_URL=https://example/releases/v1.2.17 ./install_kan.sh
+RELEASE_BASE_URL=https://example/releases/v1.2.18 ./install_kan.sh
 ```
 
 发版前可先做不依赖 GPU 的静态检查：
@@ -192,8 +193,8 @@ git push origin HEAD:gpu-verify
 
 ```bash
 # 在 main 通过 build/cpu_test 后，创建带说明的 tag 即可触发 Release
-git tag -a v1.2.17 -m "v1.2.17 — production release: async submit, stale-proof abort, docs/profile refresh"
-git push origin v1.2.17
+git tag -a v1.2.18 -m "v1.2.18 — production release: multi-GPU portable runtime, async submit, stale-proof abort"
+git push origin v1.2.18
 ```
 
 `package_portable.sh` 会同时产出版本化文件名和稳定上传别名，例如：
@@ -369,6 +370,54 @@ nohup ./build/kan --algo pearl \
 tail -f kan.log
 ```
 
+### 单机多卡（多 GPU）
+
+单机单卡和单机多卡都是正式生产运行能力。矿池模式默认行为：
+
+```text
+未设置 CUDA_VISIBLE_DEVICES 时：
+  自动检测并使用所有 GPU。父进程作为 supervisor，
+  为每张物理 GPU fork 一个隔离的 lane 进程；
+  每个 lane 各自建立一条 stratum 连接，
+  并以同一个 worker 名认证 —— 矿池按 worker 聚合整机。
+
+--devices 0,1,3：
+  只在指定的物理 GPU 子集上 fanout（其余 GPU 不参与）。
+
+CUDA_VISIBLE_DEVICES=0 ./run.sh ...（外部设置）：
+  miner 尊重该环境变量，只在它暴露的 GPU 上运行单个 lane，
+  自动 fanout 被禁用。用于把 miner 固定到某张卡或与外部调度器集成。
+```
+
+```bash
+# 单机所有 GPU（默认自动 fanout）
+./build/kan --algo pearl \
+  --pool stratum+tcp://prl.kryptex.network:7048 \
+  --wallet prl1qyouraddress.rig01
+
+# 只用 GPU 0 和 2
+./build/kan --algo pearl --devices 0,2 \
+  --pool stratum+tcp://prl.kryptex.network:7048 \
+  --wallet prl1qyouraddress.rig01
+
+# 用环境变量固定单卡（禁用 fanout）
+CUDA_VISIBLE_DEVICES=1 ./build/kan --algo pearl \
+  --pool stratum+tcp://prl.kryptex.network:7048 \
+  --wallet prl1qyouraddress.rig01
+```
+
+注意：
+
+- `--devices` 与 `CUDA_VISIBLE_DEVICES` 互斥，同时设置会报错退出。
+- `--devices` 仅在 `--pool` 模式有效；solo 模式只运行单个 lane。
+- 当前多 GPU 实现是 **parent supervisor + per-GPU isolated lane process**；
+  矿池侧用同一 worker 名聚合，但**不是单一 stratum session**。
+  统一的父进程 stats / 单 stratum session 是未来项，尚未完成。
+- 任意一个 lane 异常退出时，supervisor 会停止其余 lane 并整体退出，交给
+  `run.sh` 的 `KAN_RESTART` 自动重启（避免静默降级运行）。
+
+---
+
 ### Solo 模式
 
 Solo 挖矿需要本地运行 pearld 节点，且需要 `zkprove` 工具将 PlainProof 转换为 ZK 证明。
@@ -395,6 +444,7 @@ Solo 挖矿需要本地运行 pearld 节点，且需要 `zkprove` 工具将 Plai
 | `--wallet ADDR[.WORKER]` | PRL 钱包地址，可带矿工名 | 必填 |
 | `--worker NAME` | 矿工名（也可合并在 wallet 中用 `.` 分隔） | `pm` |
 | `--agent STRING` | 自定义 agent 标识 | `Kan/1.0.0` |
+| `--devices LIST` | 选择物理 GPU 子集（如 `0,1,3`）；不设置时自动使用所有 GPU。与 `CUDA_VISIBLE_DEVICES` 互斥 | 全部 GPU |
 | `--batch N` | 每轮最大 draw 数（新 job 前最多搜索 N 次） | `1000` |
 | `--breakdown` | 打印每 draw 的详细计时 | 关闭 |
 
@@ -500,6 +550,11 @@ stale proof early-abort:
   如果新 job 在 win/proof 期间到达，过期 proof 会在 CPU rederive、
   POSTCHECK 或 Merkle 阶段之间提前退出，避免为不可提交的 stale share
   继续消耗 CPU。
+
+multi-GPU auto fanout:
+  pool 模式下未设置 CUDA_VISIBLE_DEVICES 时自动使用所有 GPU；
+  每张 GPU 一个隔离 lane 进程 + 独立 stratum 连接 + 同一 worker 名聚合。
+  --devices 选子集；外部 CUDA_VISIBLE_DEVICES 则禁用 fanout。
 ```
 
 日志中可见：

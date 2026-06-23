@@ -84,14 +84,14 @@ check_file "ci_gpu_verify.sh"
 check_file ".cnb/web_trigger.yml"
 check_file "run_test.sh"
 
-echo "[1/5] bash syntax"
+echo "[1/6] bash syntax"
 bash -n package_portable.sh
 bash -n install_kan.sh
 bash -n check_release_profiles.sh
 bash -n ci_gpu_verify.sh
 bash -n run_test.sh
 
-echo "[2/5] release matrix assets"
+echo "[2/6] release matrix assets"
 expect_contains ".cnb.yml" "dist/kan-portable-linux-x64.tar.gz"
 expect_contains ".cnb.yml" "dist/kan-portable-linux-x64-sm86-g8.tar.gz"
 expect_contains ".cnb.yml" "install_kan.sh"
@@ -108,7 +108,7 @@ for forbidden in \
   expect_not_contains ".cnb.yml" "$forbidden"
 done
 
-echo "[3/5] profile docs"
+echo "[3/6] profile docs"
 expect_contains "GPU_PROFILES.md" "kan-portable-linux-x64-sm86-g8.tar.gz"
 expect_contains "GPU_PROFILES.md" "GROUPM:    8"
 expect_contains "GPU_PROFILES.md" "KSTAGES:   3"
@@ -128,7 +128,7 @@ expect_contains ".cnb/web_trigger.yml" "GPU 验证"
 expect_not_contains "src/miner_main.cpp" "prl1patz"
 expect_not_contains "package_portable.sh" "prl1patz"
 
-echo "[4/5] install_kan selection matrix"
+echo "[4/6] install_kan selection matrix"
 [ "$(dry_pkg sm_75)" = "kan-portable-linux-x64.tar.gz" ] || fail "sm_75 should fallback generic"
 [ "$(dry_pkg sm_70)" = "kan-portable-linux-x64.tar.gz" ] || fail "sm_70 should select generic but remain unsupported"
 [ "$(dry_pkg sm_80)" = "kan-portable-linux-x64.tar.gz" ] || fail "sm_80 should fallback generic"
@@ -138,7 +138,7 @@ echo "[4/5] install_kan selection matrix"
 [ "$(dry_pkg sm_120)" = "kan-portable-linux-x64.tar.gz" ] || fail "sm_120 should fallback generic until CUDA 13 native package"
 [ "$(dry_pkg unknown)" = "kan-portable-linux-x64.tar.gz" ] || fail "unknown should fallback generic"
 
-echo "[5/5] package metadata generation hooks"
+echo "[5/6] package metadata generation hooks"
 expect_contains "package_portable.sh" "GPU_PROFILES.md"
 expect_contains "package_portable.sh" "install_kan.sh"
 expect_contains "package_portable.sh" "package_policy:"
@@ -163,5 +163,22 @@ expect_contains "run_test.sh" "POSTCHECK"
 expect_contains "src/miner_main.cpp" "async share submit worker active"
 expect_contains "src/miner_main.cpp" "pool mode requires --wallet"
 expect_contains "src/plainproof_gen.cpp" "MINE proof abort"
+
+echo "[6/6] single-machine multi-GPU release hooks"
+# Multi-GPU is a production runtime capability: the release docs, the portable
+# launcher banner, and the miner itself must keep these hooks aligned so a
+# release cannot silently drop the documented single/multi-GPU behavior.
+expect_contains "src/miner_main.cpp" "--devices"
+expect_contains "src/miner_main.cpp" "auto fanout disabled"
+expect_contains "src/miner_main.cpp" "per-GPU connection"
+expect_contains "src/miner_main.cpp" "mutually exclusive"
+expect_contains "package_portable.sh" "auto multi-GPU fanout ENABLED"
+expect_contains "package_portable.sh" "CUDA_VISIBLE_DEVICES"
+expect_contains "package_portable.sh" "Multi-GPU note"
+expect_contains "README.md" "单机多卡"
+expect_contains "README.md" "CUDA_VISIBLE_DEVICES"
+expect_contains "README.md" "per-GPU isolated lane process"
+expect_contains "GPU_PROFILES.md" "multi-GPU auto fanout"
+expect_contains "CHANGELOG.md" "multi-GPU auto fanout"
 
 echo "OK: release profile checks passed"
