@@ -26,6 +26,7 @@
 #include <chrono>
 #include <atomic>
 #include <thread>
+#include <utility>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -813,6 +814,9 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
     uint64_t maxdraws = P.maxdraws;
     std::string header_hex_override = P.header_hex;  // "" => golden default header
     std::string target_hex = P.target_hex;
+    auto stop_requested = [&]() -> bool {
+        return stop_flag && stop_flag->load(std::memory_order_relaxed);
+    };
 
     // -----------------------------------------------------------------------
     // Config selection. GOLDEN (default) = small CPU-winnable toy instance used
@@ -1093,7 +1097,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
             return seconds > 0.0 ? (double)draws_done * work_per_draw / seconds / 1e12 : 0.0;
         };
         auto stopping = [&]() -> bool {
-            return stop_flag && stop_flag->load(std::memory_order_relaxed);
+            return stop_requested();
         };
 
         // ONE canonical production path (stages a-d) -> shared A/Bt/a_padded/
@@ -1291,6 +1295,10 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                 }
                 g_live_draw_count.fetch_add(1, std::memory_order_relaxed);
                 if (ok==1 && rt>=0 && ct>=0) {
+                    // A newer pool job may have arrived while this draw was in
+                    // flight.  Do not spend hundreds of ms re-deriving A/Bt and
+                    // building a proof that miner_main will discard as stale.
+                    if (stopping()) { found = true; break; }
                     // Re-derive draw N fully on the CPU: restores A/Bt/padded/
                     // seeds/perms for POSTCHECK + Merkle (the shared host vars
                     // currently hold draw N+1 from the overlapped prep).
@@ -1359,6 +1367,10 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
 
             g_live_draw_count.fetch_add(1, std::memory_order_relaxed);
             if (ok==1 && rt>=0 && ct>=0) {
+                // A newer pool job may have arrived while this draw was in
+                // flight.  Avoid the expensive stale-proof re-derive; the
+                // common stop check below exits before proof assembly.
+                if (stopping()) { found = true; break; }
                 // The producer already advanced shared A/Bt/e_ar_t/e_bl/seeds to
                 // draw nd; re-run draw N to restore byte-exact state for the
                 // POSTCHECK + Merkle proof assembly that follows the loop.
@@ -1477,10 +1489,18 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
     }
     }
 
+    auto abort_stale_proof = [&](const char* stage) -> bool {
+        if (!(mine && stop_requested())) return false;
+        if (g_miner_verbose)
+            fprintf(stderr, "MINE proof abort: stop requested %s; skipping stale proof\n", stage);
+        return true;
+    };
+
     if (!found) {
         if (g_miner_verbose) fprintf(stderr, "No winning tile found with seed %llu\n", (unsigned long long)seed);
         return 2;
     }
+    if (abort_stale_proof("after win")) return 2;
 
     if (g_miner_verbose) {
         fprintf(stderr, "WIN rows=[");
@@ -1538,6 +1558,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
             return 4;
         }
     }
+    if (abort_stale_proof("after POSTCHECK")) return 2;
 
     // Build Merkle proofs
     const uint8_t* a_merkle_data = nullptr;
@@ -1548,8 +1569,10 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
     matrix_bytes(Bt, bt_padded, &bt_merkle_data, &bt_merkle_len);
     MerkleTree tree_a(a_merkle_data, a_merkle_len, job_key);
     proof_lap(ms_merkle_a_tree);
+    if (abort_stale_proof("after A Merkle tree")) return 2;
     MerkleTree tree_bt(bt_merkle_data, bt_merkle_len, job_key);
     proof_lap(ms_merkle_bt_tree);
+    if (abort_stale_proof("after Bt Merkle tree")) return 2;
     vector<size_t> a_leaf_idx = compute_leaf_indices_from_rows(win_rows, m, k);
     vector<size_t> bt_leaf_idx = compute_leaf_indices_from_rows(win_cols, n, k);
     proof_lap(ms_leaf_idx);

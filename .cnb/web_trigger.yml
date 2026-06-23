@@ -1,0 +1,58 @@
+branch:
+  - reg: ^main$
+    buttons:
+      - name: GPU 验证
+        description: "申请 CNB GPU runner，执行 build/run_test/POSTCHECK/portable package smoke"
+        event: web_trigger_gpu_verify
+        isDefault: false
+        inputs:
+          GPU_VERIFY_MINE_DRAWS:
+            name: hard-target draws
+            description: "controlled hard-target timing sample 的 draw 数；不要求命中。"
+            type: input
+            required: true
+            default: "20"
+          GPU_VERIFY_PACKAGE_SMOKE:
+            name: package smoke
+            description: "是否构建 generic portable 包并在同一 GPU 上做 POSTCHECK smoke。"
+            type: switch
+            required: true
+            default: "1"
+            options:
+              - name: 开启
+                value: "1"
+                description: "推荐；覆盖发布包真实运行路径。"
+              - name: 关闭
+                value: "0"
+                description: "只验证源码 build/run_test/POSTCHECK，耗时更短。"
+          GPU_VERIFY_POOL_SECONDS:
+            name: pool seconds
+            description: "可选 live pool smoke 秒数；0 表示不连接矿池。"
+            type: input
+            required: true
+            default: "0"
+          GPU_VERIFY_REQUIRE_ACCEPTED:
+            name: require accepted
+            description: "pool smoke 时是否强制要求观察到 share accepted。"
+            type: switch
+            required: true
+            default: "0"
+            options:
+              - name: 不强制
+                value: "0"
+                description: "推荐；短时间 smoke 只要求能启动并连接。"
+              - name: 强制
+                value: "1"
+                description: "用于长时间 L3 验收，未 accepted 则失败。"
+          KAN_WALLET:
+            name: wallet
+            description: "仅当 pool seconds > 0 时填写；格式 PRL_ADDRESS[.WORKER]。"
+            type: input
+            required: false
+            default: ""
+          KAN_POOL_URL:
+            name: pool url
+            description: "仅当 pool seconds > 0 时使用。"
+            type: input
+            required: false
+            default: "stratum+tcp://prl.kryptex.network:7048"

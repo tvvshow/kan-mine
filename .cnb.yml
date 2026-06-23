@@ -16,6 +16,21 @@
 #                       release. The tag message is copied into RELEASE_NOTES.txt
 #                       inside the tarballs, so every version ships with its own
 #                       explanation.
+#
+#   main / web_trigger_gpu_verify
+#                    -> ON-DEMAND CNB GPU runner. This is the L2 release gate for
+#                       the generic package on the GPU CNB assigns (typically
+#                       L40/H20-class shared datacenter GPU):
+#                         build with CUTLASS -> run_test.sh -> real-cfg POSTCHECK
+#                         -> portable package build -> package POSTCHECK.
+#                       It does not replace sm_86 validation unless the runner is
+#                       actually sm_86.
+#
+#   gpu-verify / push
+#                    -> Same GPU validation as above, but auto-triggered by:
+#                         git push origin HEAD:gpu-verify
+#                       This lets release validation consume CNB's free GPU
+#                       without relying on a browser click.
 
 main:
   push:
@@ -38,6 +53,39 @@ main:
           script: bash build.sh
         - name: cpu-verify
           script: bash cpu_test.sh
+
+  web_trigger_gpu_verify:
+    - name: cnb-gpu-verify
+      runner:
+        # CNB public GPU tags (docs, 2026): cnb:arch:amd64:gpu, :L40, :H20.
+        # Use the default GPU pool here because this repository can request a
+        # GPU directly; the validation script detects the actual compute
+        # capability and refuses unsupported sm_70/Volta.
+        tags: cnb:arch:amd64:gpu
+      docker:
+        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      stages:
+        - name: deps
+          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git curl ca-certificates libssl-dev patchelf
+        - name: cutlass
+          script: if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
+        - name: gpu-verify
+          script: bash ci_gpu_verify.sh
+
+gpu-verify:
+  push:
+    - name: cnb-gpu-verify
+      runner:
+        tags: cnb:arch:amd64:gpu
+      docker:
+        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      stages:
+        - name: deps
+          script: apt-get update -y && apt-get install -y --no-install-recommends gcc g++ make git curl ca-certificates libssl-dev patchelf
+        - name: cutlass
+          script: if [ ! -d ~/cutlass ]; then git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 ~/cutlass; fi
+        - name: gpu-verify
+          script: bash ci_gpu_verify.sh
 
 # Tag-driven Release. The Release must exist before attachments can upload, so the
 # built-in git:release task runs FIRST, then cnbcool/attachments uploads the tarball.
@@ -70,7 +118,7 @@ $:
           # built-in task; title defaults to the tag name, tag auto-taken from tag_push.
           type: git:release
           options:
-            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs. Assets include the generic multi-arch compatibility package and the production sm_86/GROUPM=8 tuned package for RTX 3080Ti/3090 class GPUs. Experimental sm_86 GROUPM/KSTAGES sweep packages are intentionally not published as default release assets. Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt, GPU_PROFILES.md, BUILD_INFO.txt and RELEASE_NOTES.txt inside."
+            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs. Assets include the generic multi-arch compatibility package and the production sm_86/GROUPM=8 tuned package for RTX 3080Ti/3090 class GPUs. Pool mode includes run.sh auto-restart plus async share submit so submit_wait does not block the next mining attempt. Experimental sm_86 GROUPM/KSTAGES sweep packages are intentionally not published as default release assets. Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt, CHANGELOG.md, GPU_PROFILES.md, BUILD_INFO.txt and RELEASE_NOTES.txt inside."
             latest: true
         - name: upload-portable-package
           image: cnbcool/attachments:latest

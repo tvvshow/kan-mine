@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include <fcntl.h>
 #include <termios.h>
@@ -138,7 +140,13 @@ static void print_stats(const std::string& wallet, const std::string& pool_url) 
   int last_m = (int)(last_s / 60.0);
   uint64_t acc = g_accepted.load(), rej = g_rejected.load();
   double ths_10 = window_ths(10.0), ths_60 = window_ths(60.0), ths_15m = window_ths(900.0);
-  char wshort[32]; snprintf(wshort, sizeof(wshort), "%.10s...%.4s", wallet.c_str(), wallet.c_str()+wallet.size()-4);
+  char wshort[32];
+  if (wallet.size() > 14) {
+    snprintf(wshort, sizeof(wshort), "%.10s...%.4s", wallet.c_str(),
+             wallet.c_str() + wallet.size() - 4);
+  } else {
+    snprintf(wshort, sizeof(wshort), "%s", wallet.empty() ? "<wallet>" : wallet.c_str());
+  }
   fprintf(stderr, "\n-----%s---------------------%s-----\n", wshort, pool_url.c_str());
   fprintf(stderr, " DEVICE MODEL              HASHRATE  TEMP  FAN POWER      EFFIC       A    R  LAST\n");
   fprintf(stderr, "----------------------------------------------------------------------------------------\n");
@@ -302,7 +310,7 @@ struct PoolOpts {
   std::string host = "prl.kryptex.network";
   int port = 7048;
   bool use_tls = false;
-  std::string wallet = "prl1patz2mw7d28lqn33a768huhhsz3rg6e228m22wxh0v4pjh53x4qwsg2apmv";
+  std::string wallet;
   std::string worker = "pm";
   std::string agent = std::string("Kan/") + KAN_VERSION;
   uint64_t batch = 1000;
@@ -440,6 +448,92 @@ static int run_pool(const PoolOpts& o) {
   uint64_t attempt_id = 0;
   std::atomic<bool> stop_attempt{false};
   std::atomic<bool> stats_req{false};
+
+  // Submit responses take ~0.7s on the observed Kryptex pool path.  Waiting for
+  // that response on the mining thread leaves the GPU idle after every found
+  // proof.  Keep proof generation synchronous for now (correctness-critical),
+  // but move the network submit+verdict wait to one worker so the main loop can
+  // immediately start the next mining attempt after queueing a fresh share.
+  struct SubmitJob {
+    long long id = 0;
+    std::string job_id;
+    std::string proof_b64;
+    long long hs_actual = 0;
+  };
+  std::mutex submit_mu;
+  std::condition_variable submit_cv;
+  std::deque<SubmitJob> submit_q;
+  bool submit_stop = false;
+  std::mutex send_mu;
+  std::thread submit_th([&]() {
+    while (true) {
+      SubmitJob job;
+      {
+        std::unique_lock<std::mutex> lk(submit_mu);
+        submit_cv.wait(lk, [&]() { return submit_stop || !submit_q.empty(); });
+        if (submit_stop) break;
+        job = std::move(submit_q.front());
+        submit_q.pop_front();
+      }
+
+      {
+        std::lock_guard<std::mutex> lk(st.mu);
+        st.submit_ids.insert(job.id);
+      }
+
+      std::string sub = "{\"id\":" + std::to_string(job.id) +
+                        ",\"method\":\"mining.submit\",\"params\":{\"job_id\":\"" +
+                        job.job_id + "\",\"plain_proof\":\"" + job.proof_b64 +
+                        "\",\"hs\":" + std::to_string(job.hs_actual) + "}}";
+      bool sent = false;
+      {
+        std::lock_guard<std::mutex> lk(send_mu);
+        sent = pool_send(fd, ssl, sub);
+      }
+      if (!sent) {
+        {
+          std::lock_guard<std::mutex> lk(st.mu);
+          st.submit_ids.erase(job.id);
+        }
+        log_line("stratum", "share submit send failed");
+        st.stop = true;
+        st.cv.notify_all();
+        continue;
+      }
+
+      auto submit_t0 = std::chrono::steady_clock::now();
+      auto deadline = submit_t0 + std::chrono::seconds(30);
+      std::string verdict;
+      {
+        std::unique_lock<std::mutex> lk(st.mu);
+        st.cv.wait_until(lk, deadline, [&]() {
+          return st.stop.load() ||
+                 st.submit_resp.find(job.id) != st.submit_resp.end();
+        });
+        auto it = st.submit_resp.find(job.id);
+        if (it != st.submit_resp.end()) {
+          verdict = it->second;
+          st.submit_resp.erase(it);
+        }
+        st.submit_ids.erase(job.id);
+      }
+      double submit_s = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - submit_t0).count();
+      if (!verdict.empty() && verdict.find("\"result\":true") != std::string::npos) {
+        g_accepted.fetch_add(1);
+        g_last_share = std::chrono::steady_clock::now();
+        log_linef("GPU #0", "share accepted submit_wait=%.3fs", submit_s);
+      } else if (!verdict.empty()) {
+        g_rejected.fetch_add(1);
+        log_linef("GPU #0", "share rejected submit_wait=%.3fs: %s",
+                  submit_s, verdict.substr(0, 100).c_str());
+      } else if (!st.stop.load()) {
+        log_linef("GPU #0", "share submit timeout submit_wait=%.3fs", submit_s);
+      }
+    }
+  });
+  log_line("stratum", "async share submit worker active");
+
   std::thread stats_th([&]() {
     bool first_print = true;
     auto last_print = std::chrono::steady_clock::now();
@@ -516,47 +610,28 @@ static int run_pool(const PoolOpts& o) {
     }
 
     if (rc == 0 && R.found && fresh) {
-      long long this_id = submit_id++;
-      { std::lock_guard<std::mutex> lk(st.mu); st.submit_ids.insert(this_id); }
-      long long hs_actual = (long long)(R.draws * R.work_per_draw / R.elapsed_s);
-      std::string sub = "{\"id\":" + std::to_string(this_id) +
-                        ",\"method\":\"mining.submit\",\"params\":{\"job_id\":\"" + jid +
-                        "\",\"plain_proof\":\"" + R.proof_b64 +
-                        "\",\"hs\":" + std::to_string(hs_actual) + "}}";
-      pool_send(fd, ssl, sub);
-      auto submit_t0 = std::chrono::steady_clock::now();
-      auto deadline = submit_t0 + std::chrono::seconds(30);
-      std::string verdict;
+      SubmitJob job;
+      job.id = submit_id++;
+      job.job_id = jid;
+      job.proof_b64 = std::move(R.proof_b64);
+      job.hs_actual = (long long)(R.draws * R.work_per_draw / R.elapsed_s);
       {
-        std::unique_lock<std::mutex> lk(st.mu);
-        st.cv.wait_until(lk, deadline, [&]() {
-          return st.stop.load() || st.submit_resp.find(this_id) != st.submit_resp.end();
-        });
-        auto it = st.submit_resp.find(this_id);
-        if (it != st.submit_resp.end()) {
-          verdict = it->second;
-          st.submit_resp.erase(it);
-        }
-        st.submit_ids.erase(this_id);
+        std::lock_guard<std::mutex> lk(submit_mu);
+        submit_q.push_back(std::move(job));
       }
-      double submit_s = std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - submit_t0).count();
-      if (!verdict.empty() && verdict.find("\"result\":true") != std::string::npos) {
-        g_accepted.fetch_add(1);
-        g_last_share = std::chrono::steady_clock::now();
-        log_linef("GPU #0", "share accepted submit_wait=%.3fs", submit_s);
-      } else if (!verdict.empty()) {
-        g_rejected.fetch_add(1);
-        log_linef("GPU #0", "share rejected submit_wait=%.3fs: %s",
-                  submit_s, verdict.substr(0, 100).c_str());
-      } else {
-        log_linef("GPU #0", "share submit timeout submit_wait=%.3fs", submit_s);
-      }
+      submit_cv.notify_one();
     }
     // Continue mining regardless of result (no win, stale, or error - keep going)
   }
   st.stop = true;
+  st.cv.notify_all();
+  {
+    std::lock_guard<std::mutex> lk(submit_mu);
+    submit_stop = true;
+  }
+  submit_cv.notify_all();
   if (stats_th.joinable()) stats_th.join();
+  if (submit_th.joinable()) submit_th.join();
   if (rd.joinable()) rd.join();
   if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
   if (ctx) SSL_CTX_free(ctx);
@@ -811,6 +886,11 @@ int main(int argc, char** argv) {
   }
   if (pool == solo) { fprintf(stderr, "choose exactly one of --pool / --solo\n"); usage(); return 2; }
   if (pool) {
+    if (po.wallet.empty()) {
+      fprintf(stderr, "pool mode requires --wallet ADDR[.WORKER]\n");
+      usage();
+      return 2;
+    }
     if (!pool_url.empty()) {
       if (pool_url.rfind("stratum+ssl://", 0) == 0) {
         po.use_tls = true;

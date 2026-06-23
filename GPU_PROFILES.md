@@ -1,7 +1,7 @@
 # GPU Profiles
 
-日期：2026-06-22  
-范围：`peral/` production miner、portable release、NVIDIA GPU package selection  
+日期：2026-06-22
+范围：`peral/` production miner、portable release、NVIDIA GPU package selection
 性质：GPU 架构 profile 权威表；供 release matrix、install script、README、benchmark 记录统一引用
 
 ---
@@ -16,6 +16,10 @@
 支持 NVIDIA Turing / RTX 20 系及以上 GPU，
 包括家用卡、商用卡和数据中心卡。
 ```
+
+当前 production release 的实际 CUDA fatbin 从 `sm_75` 开始。Volta / `sm_70`
+（V100/V100S）不在当前 production 支持范围内；不要把“有 Tensor Core”误解为
+可以运行本项目的 Sm80 风格 int8 CUTLASS 生产内核。
 
 生产发布必须同时区分：
 
@@ -91,6 +95,35 @@ agent
 ```
 
 其中 `TC_PERSIST` 属于 profile 相关运行期默认值。不同架构不能互相套用。
+
+### 2.3 生产运行期策略
+
+以下行为属于所有 production package 的通用运行期策略，不改变 GPU profile
+选择矩阵，也不改变 proof 格式：
+
+```text
+pool auto-restart:
+  portable run.sh 在 pool 模式默认 KAN_RESTART=auto；
+  断连或异常退出后自动重启/重连。
+
+async share submit:
+  fresh share proof 生成后由 submit worker 发送并等待矿池响应；
+  mining 主循环不等待 submit_wait 网络延迟。
+
+stale proof early-abort:
+  如果新 job 在 win/proof 期间到达，过期 proof 会在 CPU rederive /
+  POSTCHECK / Merkle 阶段之间提前退出，不提交 stale proof。
+```
+
+这些策略是 live pool wall-clock 优化；进入 production 的最低要求仍然是：
+
+```text
+POSTCHECK ok=1
+pool accepted > 0
+rejected / stale 不异常
+submit_timeout 无风暴
+controlled benchmark 不退化
+```
 
 ---
 
@@ -184,6 +217,7 @@ Not recommended for production
 
 | Arch | 代表 GPU | 推荐 package | 编译 ARCH | GROUPM | KSTAGES | 默认 TC_PERSIST | 状态 | 备注 |
 |---|---|---|---|---:|---:|---:|---|---|
+| `sm_70` | V100 / V100S / Volta | 不支持当前 release | N/A | N/A | N/A | N/A | 不支持 | portable fatbin 不含 `sm_70`；生产内核不是 Volta 路径 |
 | `generic` | NVIDIA 20 系以上大多数 GPU | `kan-portable-linux-x64.tar.gz` | multi-arch fatbin | build default / generic | 3 | package default | 生产兼容包 | 能跑优先，不承诺最优 |
 | `sm_75` | RTX 20 系 / Turing | generic；tuned TBD | `sm_75` | TBD | 3 | TBD | 待测 | 需要兼容性、正确性、pool accepted 验证 |
 | `sm_80` | A100 / Ampere datacenter | generic；tuned TBD | `sm_80` | TBD | 3 | TBD | 待测 | 不可直接套用 sm_86 参数 |
@@ -285,6 +319,41 @@ MINE done  ≈ 97.74 TH/s
 ---
 
 ## 6. 待补齐 profile
+
+### 6.0 `sm_70` / V100 / V100S / Volta
+
+当前定位：
+
+```text
+不属于当前 production release 支持范围。
+```
+
+原因：
+
+```text
+1. portable fatbin 只包含 sm_75、sm_80、sm_86、sm_89、sm_90 SASS
+   以及 compute_90 PTX；
+2. 当前 production kernel `tc_cutlass_v2.cu` 使用 Sm80 风格 CUTLASS
+   int8 Tensor-Core / cp.async 路径；
+3. V100/V100S 的 Volta Tensor Core 路径不同，不能通过 fallback generic
+   视为已支持。
+```
+
+推荐当前部署：
+
+```text
+不要把 V100/V100S 用作 production validation GPU；
+不要用它验证 sm86-g8 或 sm120 generic fallback；
+如果安装脚本 fallback generic 后运行失败，应记录为 unsupported GPU，
+而不是 production regression。
+```
+
+若未来需要支持：
+
+```text
+需要单独 sm_70 kernel / CUTLASS Volta path、POSTCHECK、controlled benchmark、
+official verifier / pool accepted 和长时间稳定性验证。
+```
 
 ### 6.1 `sm_75` / RTX 20 系 / Turing
 
@@ -405,6 +474,42 @@ CUDA 12 portable 包不包含 native sm_120 SASS；
 最佳性能需要 CUDA 13 构建 native sm_120 package。
 ```
 
+当前 generic fallback baseline：
+
+```text
+2026-06-22 / RTX 5090 / sm_120 / driver 595.80 / v1.2.15 generic:
+  package:   kan-portable-linux-x64.tar.gz
+  arch:      portable-fatbin
+  GROUPM:    128
+  KSTAGES:   3
+  path:      CUDA 12 generic fatbin / compute_90 PTX fallback
+
+  controlled search_avg ≈ 327.82 TH/s
+  controlled total_avg  ≈ 324.91 TH/s
+  controlled MINE done  ≈ 306.86 TH/s
+
+  live 60s              ≈ 300.36 TH/s
+  live early 15m        ≈ 292.73 TH/s
+  accepted/rejected     = 17 / 0
+  submit_timeout        = 0
+  submit_wait_avg       ≈ 0.80s
+
+  record:
+    bench/results/2026-06-22_rtx5090_sm120_vps.md
+    bench/results/2026-06-22_rtx5090_sm120_vps.csv
+    bench/results/2026-06-23_rtx5090_sm120_vps106.md
+    bench/results/2026-06-23_rtx5090_sm120_vps106.csv
+```
+
+结论：
+
+```text
+v1.2.15 generic fallback 在 RTX 5090 上健康可运行，但不是 tuned sm_120
+生产 profile。不得把该 fallback 误标为 Blackwell 最优；sm_120 自动选包
+仍应 fallback generic，直到 CUDA 13 native package 通过 POSTCHECK、
+controlled benchmark、live pool accepted 和长时间稳定性验证。
+```
+
 需建立：
 
 ```text
@@ -435,6 +540,13 @@ CUDA 12 portable 包不包含 native sm_120 SASS；
 
 ```bash
 case "$SM" in
+  sm_70)
+    # Volta / V100 / V100S is not covered by current production packages.
+    # Installer may still select generic for dry-run/download consistency, but
+    # operators must treat runtime launch failure as unsupported GPU, not a
+    # production regression.
+    pkg="kan-portable-linux-x64.tar.gz"
+    ;;
   sm_86)
     pkg="kan-portable-linux-x64-sm86-g8.tar.gz"
     ;;

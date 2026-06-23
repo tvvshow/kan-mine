@@ -1,12 +1,14 @@
 # Kan
 
-**Kan** — 高性能 Pearl (PRL) PoUW 挖矿软件。基于 CUTLASS int8 Tensor-Core 内核，RTX 4090 达 **190+ TH/s**，RTX 3090 达 **106+ TH/s**。
+**Kan** — 高性能 Pearl (PRL) PoUW 挖矿软件。基于 CUTLASS int8 Tensor-Core 内核，RTX 3090 (sm_86) 实测 **106+ TH/s**（随 release 发布 tuned 包）。RTX 4090 / 5090 更高算力来自实验分支，尚未随正式 release 发布——详见下方[性能参考](#性能参考)。
 
 - 矿池挖矿（LuckyPool / Kryptex）
 - Solo 挖矿（pearld RPC）
 - GPU 全流程：RNG + blake3 哈希 + 噪声生成 + 搜索均在 GPU 完成
 - 实时算力显示（15 秒首表，500ms 采样）
 - NVML 硬件监控（温度 / 风扇 / 功耗 / 能效）
+- pool share 异步提交：网络 `submit_wait` 不阻塞下一轮 mining
+- stale proof early-abort：新 job 到达后跳过不可提交的过期 proof
 - 零开发费
 
 ---
@@ -34,7 +36,7 @@
 
 | 项目 | 要求 |
 |------|------|
-| **GPU** | NVIDIA Tensor-Core 显卡（RTX 20 系及以上，Compute Capability ≥ 7.0） |
+| **GPU** | NVIDIA Turing / RTX 20 系及以上，Compute Capability ≥ 7.5；当前 production 包覆盖 `sm_75` 起 |
 | **显存** | ≥ 4 GB（实配使用约 2 GB） |
 | **CUDA** | 12.x（已在 12.8 上测试通过） |
 | **系统** | Linux x86_64（已在 Ubuntu 22.04 上测试通过） |
@@ -47,6 +49,7 @@
 
 | GPU / 架构 | 当前 release 定位 | 推荐包 |
 |-----|------|------|
+| V100 / V100S / `sm_70` | **不属于当前 production 支持范围**；portable 包不含 `sm_70` SASS/PTX | 不推荐 / 不支持 |
 | RTX 20 系 / `sm_75` | generic 兼容目标；tuned profile 待测 | `kan-portable-linux-x64.tar.gz` |
 | A100 / `sm_80` | generic 兼容目标；tuned profile 待测 | `kan-portable-linux-x64.tar.gz` |
 | RTX 3080 Ti / RTX 3090 / `sm_86` | 已实测 production tuned profile | `kan-portable-linux-x64-sm86-g8.tar.gz` |
@@ -57,6 +60,10 @@
 > 不能把 `sm_86` 的 `GROUPM=8 / KSTAGES=3 / TC_PERSIST=0` 结论直接套用到
 > `sm_75`、`sm_80`、`sm_89`、`sm_90` 或 `sm_120`。每个 tuned profile 都需要
 > benchmark、POSTCHECK 和 pool accepted 记录后才能成为默认推荐。
+>
+> Volta / `sm_70`（例如 V100/V100S）虽然是 Tensor-Core GPU，但当前
+> `tc_cutlass_v2.cu` 生产内核和 portable fatbin 面向 `sm_75+` / Sm80 风格
+> int8 Tensor-Core 路径；`sm_70` 不在当前 release 覆盖范围内。
 
 ---
 
@@ -112,8 +119,10 @@ kan-portable-linux-x64-sm86-g8.tar.gz
 - `plainproof_gen`：离线 proof / kernel benchmark；
 - `run.sh`：检查 NVIDIA 驱动、设置 package 默认运行参数，并在 pool 模式默认
   自动重启/重连；
+- `status.sh`：进程、GPU、hashrate、share、perf 和 runtime event 快照；
 - `VERSION`、`BUILD_INFO.txt`、`RELEASE_NOTES.txt`：版本号、构建信息和该
   tag 的版本说明。
+- `CHANGELOG.md`：公开生产变更记录。
 - `GPU_PROFILES.md`：generic / tuned GPU profile 权威表。
 - `install_kan.sh`：按 GPU profile 选择 tuned 包或 fallback generic 的安装/更新脚本。
 
@@ -126,7 +135,7 @@ cd kan-portable-linux-x64
 ./run.sh --algo pearl \
   --pool stratum+tcp://prl.kryptex.network:7048 \
   --wallet 你的PRL地址.矿工名 \
-  --batch 500 --cfg real --tc
+  --batch 1000 --cfg real --tc
 ```
 
 或者使用安装脚本自动选包：
@@ -135,10 +144,10 @@ cd kan-portable-linux-x64
 # 默认根据 nvidia-smi 检测 GPU：
 #   sm_86 -> kan-portable-linux-x64-sm86-g8.tar.gz
 #   其他 / 未调优架构 -> kan-portable-linux-x64.tar.gz
-VERSION=v1.2.15 ./install_kan.sh
+VERSION=v1.2.17 ./install_kan.sh
 
 # 如 release 地址不是默认 CNB 格式，可显式指定：
-RELEASE_BASE_URL=https://example/releases/v1.2.15 ./install_kan.sh
+RELEASE_BASE_URL=https://example/releases/v1.2.17 ./install_kan.sh
 ```
 
 发版前可先做不依赖 GPU 的静态检查：
@@ -151,12 +160,40 @@ bash check_release_profiles.sh
 `install_kan.sh` 选包矩阵正确，以及 portable 元数据生成钩子存在。
 完整 L0-L3 测试流程见 [`PRODUCTION_GPU_TEST_PLAN.md`](PRODUCTION_GPU_TEST_PLAN.md)。
 
+如果要直接使用 CNB 的 GPU runner 做发布前 L2 验证，可在 `main` 分支详情页点击
+`.cnb/web_trigger.yml` 暴露的 **GPU 验证** 按钮。它会触发
+`web_trigger_gpu_verify` 流水线，申请 `cnb:arch:amd64:gpu` runner，并执行：
+
+```text
+check_release_profiles.sh
+build.sh
+run_test.sh
+real-cfg easy-target POSTCHECK ok=1
+generic portable package build
+generic portable package POSTCHECK ok=1
+```
+
+这个 CNB GPU 验证默认用于 **generic package / 当前分配 GPU** 的 L2 correctness
+gate。若 CNB 分配的是 L40 / H20 等 datacenter GPU，它不能替代 RTX 3080 Ti /
+3090 上的 `sm86-g8` tuned profile 实机性能验收；只有当 runner 实际是 `sm_86`
+时，才可作为 sm86-g8 runtime 验证依据。可选的 live pool smoke 只有在手动设置
+`GPU_VERIFY_POOL_SECONDS>0` 且提供 `KAN_WALLET` 时才会运行。
+
+如果不想通过网页按钮，也可以把当前 commit 推到专用验证分支自动触发同一套 GPU
+流水线：
+
+```bash
+git push origin HEAD:gpu-verify
+```
+
+该分支只用于 CNB GPU 验证，不作为发布分支；验证通过后再按 tag 流程发 Release。
+
 发版约定：
 
 ```bash
 # 在 main 通过 build/cpu_test 后，创建带说明的 tag 即可触发 Release
-git tag -a v1.2.1 -m "v1.2.1 — portable release: 说明本版变更、性能、兼容性"
-git push origin v1.2.1
+git tag -a v1.2.17 -m "v1.2.17 — production release: async submit, stale-proof abort, docs/profile refresh"
+git push origin v1.2.17
 ```
 
 `package_portable.sh` 会同时产出版本化文件名和稳定上传别名，例如：
@@ -404,7 +441,7 @@ Kan 的日志格式与 lpminer 兼容，包含以下内容：
 11:08:59  info   cpu            AMD EPYC 7542 32-Core Processor (16 threads)
 11:08:59  info   algo           pearl
 11:08:59  info   pool           stratum+tcp://prl.kryptex.network:7048
-11:08:59  info   wallet         prl1patz...apmv.pm
+11:08:59  info   wallet         <PRL_ADDRESS>.pm
 11:08:59  info   worker         pm
 11:08:59  info   commands       s (stats), q (quit); table every 120s
 11:08:59  info   detected       1 devices - driver 12.8
@@ -418,7 +455,7 @@ Kan 的日志格式与 lpminer 兼容，包含以下内容：
 ### 统计表（首次 15 秒后显示，之后每 120 秒）
 
 ```
------prl1patz2m...apmv---------------------stratum+tcp://prl.kryptex.network:7048-----
+-----<PRL_ADDRESS>...pm--------------------stratum+tcp://prl.kryptex.network:7048-----
  DEVICE MODEL              HASHRATE  TEMP  FAN POWER      EFFIC       A    R  LAST
 ----------------------------------------------------------------------------------------
  GPU #0 RTX 4090           197.00 TH/s    70C   52%  452W  435.5 GH/W       0    0     -
@@ -447,6 +484,34 @@ Kan 的日志格式与 lpminer 兼容，包含以下内容：
 11:09:31  info   GPU #0         share rejected: ...    ← 份额被拒绝（罕见）
 ```
 
+### Pool runtime 行为
+
+生产 pool 模式默认包含两层运行时保护：
+
+```text
+run.sh auto-restart:
+  KAN_RESTART=auto 时，pool 断连或进程退出后自动重启/重连。
+
+async share submit:
+  fresh share proof 生成后先入队，由 submit worker 发送并等待矿池响应；
+  mining 主循环立即进入下一轮，不再被 submit_wait 网络延迟阻塞。
+
+stale proof early-abort:
+  如果新 job 在 win/proof 期间到达，过期 proof 会在 CPU rederive、
+  POSTCHECK 或 Merkle 阶段之间提前退出，避免为不可提交的 stale share
+  继续消耗 CPU。
+```
+
+日志中可见：
+
+```text
+stratum        async share submit worker active
+GPU #0         share accepted submit_wait=...
+perf           attempt=... reason=job_abort ...
+```
+
+`submit_wait` 本身仍表示矿池响应耗时；优化点是 mining loop 不再等待该响应。
+
 ---
 
 ## 性能参考
@@ -463,19 +528,20 @@ Kan 的日志格式与 lpminer 兼容，包含以下内容：
 | GPU-resident pipeline | GPU 端 RNG + blake3 树哈希 + 噪声生成 | 106.5 wall |
 | async overlap | search(N) 与 prep(N+1) 重叠执行 | 106.5 wall |
 
-### 各卡端到端算力
+### Release / baseline 性能参考
 
-| GPU | 核心算力 | 端到端算力 | 每 draw 耗时 | 每 share 间隔 |
-|-----|---------|-----------|------------|-------------|
-| RTX 5090 | 354 TH/s | — | ~199ms | ~30s |
-| RTX 4090 | 260 TH/s | 190-220 TH/s | ~270ms | ~40s |
-| RTX 3090 | 112 TH/s | 106 TH/s | ~650ms | ~90s |
+| GPU / 架构 | 包定位 | 核心/controlled | live / 端到端 | 记录 |
+|-----|------|------|------|------|
+| RTX 3080 Ti / RTX 3090 / `sm_86` | 已发布 `sm86-g8` production tuned package | 约 102-106 TH/s | 约 100+ TH/s | [`bench/results/2026-06-22_rtx3080ti_sm86_vps.md`](bench/results/2026-06-22_rtx3080ti_sm86_vps.md) |
+| RTX 5090 / `sm_120` | 当前 `v1.2.15` generic fallback baseline，非 tuned profile | controlled total avg 约 319-325 TH/s | live 60s 约 287-300 TH/s | [`2026-06-22`](bench/results/2026-06-22_rtx5090_sm120_vps.md), [`2026-06-23`](bench/results/2026-06-23_rtx5090_sm120_vps106.md) |
+| RTX 4090 / L40 / `sm_89` | generic 兼容；历史数据待整理成正式 profile | 历史实验约 260 TH/s | 历史实验约 190-220 TH/s | 待整理 |
 
-> 实际收益取决于网络难度和矿池分配。以上为算力参考。
+> 实际收益取决于网络难度、矿池分配、submit 等待、job abort 和 found/proof 路径。
+> 表中只有带 `bench/results/` 记录的数字可作为当前公开 release 的可追溯依据。
 >
-> **算法已贴近硬件天花板**：5090 内核 354 TH/s = 该卡 dense int8 GEMM roofline(382) 的 93%。
-> dense int8 是协议写死的精度（不能用 FP4/稀疏），各卡已跑在 76-93% 峰值，无 2× 空间。
-> 详见 [`BRANCHES.md`](BRANCHES.md) §3。
+> RTX 5090 / `sm_120` 当前公开包仍是 CUDA 12 generic PTX fallback；最佳性能需要
+> CUDA 13 native `sm_120` package 通过 POSTCHECK、controlled benchmark 和 live
+> pool accepted 验证后，才能升级为自动选择的 tuned production package。
 
 ---
 

@@ -47,6 +47,11 @@ STAGE="${DIST}/${PKG}"
 LIBDIR="${STAGE}/lib"
 WITH_AB="${WITH_AB:-1}"
 
+NVCC_VERSION="$(nvcc --version 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//' || true)"
+CUDA_VERSION="$(printf '%s\n' "${NVCC_VERSION}" | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p')"
+[ -n "${NVCC_VERSION}" ] || NVCC_VERSION="unknown"
+[ -n "${CUDA_VERSION}" ] || CUDA_VERSION="unknown"
+
 # Mirror build.sh defaults so BUILD_INFO.txt records the actual compile-time
 # knobs instead of vague "build-default" placeholders. These are compile-time
 # parameters: target machines must select a prebuilt flavor package rather than
@@ -82,6 +87,7 @@ cp -f build/pearl-miner "${STAGE}/pearl-miner" 2>/dev/null || cp -f build/kan "$
 chmod +x "${STAGE}/kan" "${STAGE}/pearl-miner" "${STAGE}/plainproof_gen"
 [ -f "${STAGE}/plainproof_gen_rmw" ] && chmod +x "${STAGE}/plainproof_gen_rmw"
 [ -f "${ROOT}/GPU_PROFILES.md" ] && cp -f "${ROOT}/GPU_PROFILES.md" "${STAGE}/GPU_PROFILES.md"
+[ -f "${ROOT}/CHANGELOG.md" ] && cp -f "${ROOT}/CHANGELOG.md" "${STAGE}/CHANGELOG.md"
 [ -f "${ROOT}/install_kan.sh" ] && cp -f "${ROOT}/install_kan.sh" "${STAGE}/install_kan.sh" && chmod +x "${STAGE}/install_kan.sh"
 
 echo "=== [2/5] bundle non-glibc / non-driver shared libs (fixpoint over ldd) ==="
@@ -202,14 +208,15 @@ cat > "${STAGE}/status.sh" <<'STATUS'
 #!/usr/bin/env bash
 # Human-friendly one-shot status for a portable Kan miner directory.
 # Usage:
-#   ./status.sh                  # auto-detect ../stress_24h.log, ./miner.log, /tmp/fast.log
+#   ./status.sh                  # auto-detect common package/local logs
 #   LOG=/path/to/stress.log ./status.sh
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 log="${LOG:-}"
 if [ -z "$log" ]; then
-  for cand in "$here/../stress_24h.log" "$here/stress_24h.log" \
-              "$here/miner.log" "/tmp/fast.log"; do
+  for cand in "$here/live_current.log" "$here/miner.log" \
+              "$here/stress_24h.log" "$here/../stress_24h.log" \
+              "/tmp/fast.log"; do
     [ -f "$cand" ] && { log="$cand"; break; }
   done
 fi
@@ -272,6 +279,12 @@ if [ -n "$log" ] && [ -f "$log" ]; then
   tout="$(grep -ic "share submit timeout" "$log" || true)"
   echo "accepted=$acc rejected=$rej submit_timeouts=$tout"
   grep -E "share accepted|share rejected|share submit timeout" "$log" | tail -10 || true
+  echo
+  echo "=== runtime events ==="
+  async="$(grep -ic "async share submit worker active" "$log" || true)"
+  stale_abort="$(grep -ic "MINE proof abort" "$log" || true)"
+  echo "async_submit_worker_seen=$async stale_proof_aborts=$stale_abort"
+  grep -E "async share submit worker active|MINE proof abort" "$log" | tail -10 || true
   echo
   echo "=== latest perf attempts ==="
   grep -E " info +perf +" "$log" | tail -12 || echo "no perf lines yet"
@@ -341,8 +354,9 @@ kstages: ${KSTAGES}
 small_tile: ${EFFECTIVE_SMALL_TILE}
 package_flavor: ${PACKAGE_FLAVOR:-generic}
 package_policy: $([ -n "${PACKAGE_FLAVOR:-}" ] && echo tuned || echo generic-compatible)
-toolchain: CUDA 12.x portable build; static cudart/libstdc++; bundled non-glibc shared libs
-cuda_version: CUDA 12.x
+toolchain: CUDA ${CUDA_VERSION} portable build; static cudart/libstdc++; bundled non-glibc shared libs
+cuda_version: ${CUDA_VERSION}
+nvcc_version: ${NVCC_VERSION}
 runtime_dependency: NVIDIA driver + Linux x86-64 glibc >= 2.35
 EOF
 
@@ -362,6 +376,7 @@ release_notes="${STAGE}/RELEASE_NOTES.txt"
     generic)
       echo "Generic compatibility package for NVIDIA RTX 20 series / Turing and newer."
       echo "Covers sm_75, sm_80, sm_86, sm_89, sm_90 SASS plus compute_90 PTX."
+      echo "Volta / sm_70 (V100/V100S) is not covered by this production package."
       echo "Use this when no validated tuned package exists for the target GPU."
       echo "This package prioritizes compatibility and does not promise per-architecture optimal performance."
       ;;
@@ -369,6 +384,12 @@ release_notes="${STAGE}/RELEASE_NOTES.txt"
       echo "Production recommended tuned package for sm_86 / RTX 3080 Ti / RTX 3090 class GPUs."
       echo "Compile-time profile: ARCH=sm_86 GROUPM=8 KSTAGES=3."
       echo "Runtime defaults: TC_PERSIST=0 and pool-mode auto-restart, unless explicitly overridden by the operator."
+      ;;
+    sm120-*)
+      echo "Candidate tuned package for sm_120 / RTX 50 series / Blackwell GPUs."
+      echo "Compile-time profile: ARCH=${ARCH:-unknown} GROUPM=${GROUPM} KSTAGES=${KSTAGES}."
+      echo "Status: Candidate/Experimental until GPU_PROFILES.md records POSTCHECK, benchmark, and pool accepted data."
+      echo "Do not make this an automatic install target before it beats the generic fallback in documented live testing."
       ;;
     sm86-*-k4)
       echo "Experimental / known-not-for-RTX-3080Ti profile."
@@ -380,6 +401,16 @@ release_notes="${STAGE}/RELEASE_NOTES.txt"
       echo "Do not make this an automatic install target without benchmark, POSTCHECK and pool accepted records."
       ;;
   esac
+  echo
+  echo "Runtime behavior:"
+  echo "-----------------"
+  echo "Pool mode uses the portable run.sh auto-restart loop by default (KAN_RESTART=auto)."
+  echo "Pool mode requires an explicit --wallet ADDR[.WORKER]; public packages do not"
+  echo "carry a real default wallet address."
+  echo "The miner queues fresh found shares to an async submit worker so network"
+  echo "submit_wait does not block the next mining attempt."
+  echo "If a newer pool job arrives while a proof is being prepared, stale proof"
+  echo "assembly is aborted before wasting CPU on a proof that cannot be submitted."
   echo
   if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null 2>&1; then
     echo "Tag notes:"
@@ -408,7 +439,7 @@ release_notes="${STAGE}/RELEASE_NOTES.txt"
   echo "Unpack ${STABLE_TAR} or ${VERSIONED_TAR}, cd ${PKG}, then run ./run.sh."
 } > "${release_notes}"
 
-WALLET="prl1patz2mw7d28lqn33a768huhhsz3rg6e228m22wxh0v4pjh53x4qwsg2apmv.pm"
+WALLET="<PRL_ADDRESS>.pm"
 cat > "${STAGE}/README.txt" <<README
 Pearl(PRL) portable miner — download & run
 ===========================================
@@ -420,13 +451,14 @@ Arch:    ${ARCH:-portable-fatbin}
 GROUPM:  ${GROUPM:-build-default}
 KSTAGES: ${KSTAGES:-build-default}
 
-Built on cnb (Ubuntu 22.04 / glibc 2.35 / CUDA 12.4). Runs on any Linux x86-64
-GPU host with glibc >= 2.35 and an NVIDIA driver. NO CUDA toolkit, NO CUTLASS,
-NO compiler needed on this machine.
+Built by the release workflow / build worker with CUDA ${CUDA_VERSION}
+(${NVCC_VERSION}). Runs on any Linux x86-64 GPU host with glibc >= 2.35 and an
+NVIDIA driver. NO CUDA toolkit, NO CUTLASS, NO compiler needed on this machine.
 
 Package selection:
   kan-portable-linux-x64.tar.gz
-      Generic compatibility package for NVIDIA RTX 20 series / Turing and newer.
+      Generic compatibility package for NVIDIA RTX 20 series / Turing and newer
+      (sm_75+). Volta / sm_70 (V100/V100S) is not covered.
       Use it when no validated tuned package exists for the target GPU.
 
   kan-portable-linux-x64-sm86-g8.tar.gz
@@ -442,7 +474,7 @@ Quick start (pool mining):
   ./run.sh --algo pearl \\
     --pool stratum+tcp://prl.kryptex.network:7048 \\
     --wallet ${WALLET} \\
-    --worker pm --batch 500 --cfg real --tc
+    --worker pm --batch 1000 --cfg real --tc
 
 Kernel benchmark (no pool):
   ./plainproof_gen --cfg real --mine 15 --tc --breakdown
@@ -459,14 +491,16 @@ Files:
   VERSION             exact package version / git describe string
   BUILD_INFO.txt      build metadata for audit and support
   RELEASE_NOTES.txt   version-specific notes generated from the pushed git tag
+  CHANGELOG.md         public changelog for production operators
   GPU_PROFILES.md     authoritative generic/tuned GPU package profile table
   install_kan.sh      installer/updater that selects tuned package or generic fallback
 
 GPU arch note:
-  CUDA 12.4 nvcc emits sm_75..sm_90 SASS + compute_90 PTX. On Blackwell (RTX
-  50 series / sm_120) the driver can only JIT the PTX fallback. For best
-  Blackwell performance, use a future CUDA 13 native sm_120 package after it is
-  validated and listed in GPU_PROFILES.md.
+  CUDA 12.4 nvcc emits sm_75..sm_90 SASS + compute_90 PTX. Volta / sm_70
+  (V100/V100S) is not included in the production fatbin and is not a supported
+  production target. On Blackwell (RTX 50 series / sm_120) the driver can only
+  JIT the PTX fallback. For best Blackwell performance, use a future CUDA 13
+  native sm_120 package after it is validated and listed in GPU_PROFILES.md.
 
 Verify it's truly portable (should list only glibc + libcuda as external):
   ldd ./kan
@@ -479,6 +513,13 @@ Restart note:
   Pool mode auto-restarts by default because pool disconnect/job-error exits the
   miner.  Use KAN_RESTART=0 ./run.sh ... for a one-shot run, or
   KAN_RESTART_DELAY=5 ./run.sh ... to change the reconnect delay.
+
+Pool runtime note:
+  Pool mode requires an explicit --wallet <PRL_ADDRESS>[.WORKER].
+  Found shares are submitted by an async worker, so the mining loop does not
+  idle while waiting for the pool response.  If a newer job arrives while a
+  winning proof is being prepared, stale proof assembly is aborted and the miner
+  continues on the fresh job.
 README
 
 echo "=== [4/5] portability proof (ldd of staged kan) ==="

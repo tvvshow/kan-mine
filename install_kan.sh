@@ -19,6 +19,7 @@
 #   RELEASE_BASE_URL=https://example/releases/v1.2.15 ./install_kan.sh
 #   FORCE_PKG=kan-portable-linux-x64.tar.gz ./install_kan.sh
 #   DRY_RUN=1 GPU_SM_OVERRIDE=sm_86 ./install_kan.sh
+#   DRY_RUN=1 GPU_SM_OVERRIDE=sm_70 ./install_kan.sh  # Volta/V100: unsupported production GPU
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://cnb.cool/wuyueyi/peral}"
@@ -136,6 +137,13 @@ main() {
   echo "base url: ${RELEASE_BASE_URL}"
   echo "dest:     ${DEST}"
   echo "package:  ${pkg}"
+  case "${sm}" in
+    sm_70)
+      echo
+      echo "WARNING: sm_70 / Volta (V100/V100S) is not supported by current production packages." >&2
+      echo "         The portable fatbin starts at sm_75; generic fallback is not expected to run." >&2
+      ;;
+  esac
   echo
 
   if [ "${DRY_RUN:-0}" = "1" ]; then
@@ -183,7 +191,7 @@ main() {
   echo "Install OK."
   echo "Run:"
   echo "  cd ${DEST}"
-  echo "  ./run.sh --algo pearl --pool stratum+tcp://prl.kryptex.network:7048 --wallet <PRL_ADDRESS.WORKER> --batch 500 --cfg real --tc"
+  echo "  ./run.sh --algo pearl --pool stratum+tcp://prl.kryptex.network:7048 --wallet <PRL_ADDRESS.WORKER> --batch 1000 --cfg real --tc"
   echo
   echo "Status:"
   echo "  cd ${DEST} && ./status.sh"

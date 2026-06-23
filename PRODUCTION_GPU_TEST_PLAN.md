@@ -1,7 +1,7 @@
 # Production GPU Test Plan
 
-日期：2026-06-22  
-范围：`peral/` production portable packages、GPU profile、release 验收  
+日期：2026-06-22
+范围：`peral/` production portable packages、GPU profile、release 验收
 性质：从无 GPU 静态检查到 VPS 真机 benchmark / pool accepted 的分层测试清单
 
 ---
@@ -17,8 +17,8 @@ L2: GPU smoke / correctness checks
 L3: live pool / benchmark acceptance checks
 ```
 
-当前本地 Windows 环境已能执行 L0；由于本地没有 `nvcc` / NVIDIA GPU，L1-L3
-需要 Linux CUDA 构建环境或 GPU VPS。
+当前本地 Windows 环境已能执行 L0；L1-L2 可通过 CNB 的 on-demand GPU runner
+完成，L3 仍建议使用目标生产 GPU / VPS 做长时间 live pool 验收。
 
 ---
 
@@ -49,12 +49,24 @@ bash check_release_profiles.sh
    sm_86 -> sm86-g8
    sm_75/sm_80/sm_89/sm_90/sm_120/unknown -> generic
 6. package_portable.sh 包含 BUILD_INFO / GPU_PROFILES / install_kan / TC_PERSIST / GPU compute_cap 打印钩子。
+7. production runtime hooks 存在：
+   - async share submit worker；
+   - stale proof early-abort；
+   - status.sh runtime event 统计。
 ```
 
 通过条件：
 
 ```text
 OK: release profile checks passed
+```
+
+L0 同时检查 CNB GPU 验证入口存在：
+
+```text
+.cnb.yml: web_trigger_gpu_verify
+.cnb/web_trigger.yml: GPU 验证按钮
+ci_gpu_verify.sh: CNB GPU L2 验证脚本
 ```
 
 ---
@@ -132,6 +144,70 @@ portable: 1
 
 ## 4. L2：GPU smoke / correctness checks
 
+### 4.1 CNB on-demand GPU runner（推荐的快速 L2）
+
+CNB 仓库可直接申请 GPU runner。`main` 分支详情页上的 **GPU 验证** 按钮会触发：
+
+```text
+main / web_trigger_gpu_verify
+runner: cnb:arch:amd64:gpu
+image:  nvidia/cuda:12.4.1-devel-ubuntu22.04
+script: bash ci_gpu_verify.sh
+```
+
+也可以不经过网页按钮，直接推送同一 commit 到专用验证分支：
+
+```bash
+git push origin HEAD:gpu-verify
+```
+
+该分支的 `push` 事件会运行同样的 `ci_gpu_verify.sh`。推荐在发布前使用这种方式
+留下可追溯的 CNB GPU 验证记录。
+
+默认执行：
+
+```text
+1. nvidia-smi / compute capability 检测；
+2. bash check_release_profiles.sh；
+3. bash build.sh；
+4. bash run_test.sh；
+5. real-cfg easy-target POSTCHECK ok=1；
+6. hard-target controlled timing sample（默认 20 draws，不要求命中）；
+7. WITH_AB=0 bash package_portable.sh；
+8. 解压 generic portable package；
+9. package 内 plainproof_gen real-cfg easy-target POSTCHECK ok=1。
+```
+
+触发按钮参数：
+
+```text
+GPU_VERIFY_MINE_DRAWS       默认 20
+GPU_VERIFY_PACKAGE_SMOKE    默认 1
+GPU_VERIFY_POOL_SECONDS     默认 0，不连接矿池
+GPU_VERIFY_REQUIRE_ACCEPTED 默认 0
+KAN_WALLET                  仅 pool smoke 时需要
+KAN_POOL_URL                默认 stratum+tcp://prl.kryptex.network:7048
+```
+
+通过条件：
+
+```text
+CNB GPU VERIFY PASS
+POSTCHECK ok=1
+无 CUDA launch error
+无 smem attr invalid argument
+```
+
+注意：
+
+```text
+CNB L40/H20-class GPU runner 适合验证 generic package / 当前分配 GPU 的
+correctness 和 runtime launch。它不能替代 RTX 3080 Ti / RTX 3090 上的
+sm86-g8 tuned profile 性能验收，除非 CNB 实际分配到 sm_86 GPU。
+```
+
+### 4.2 下载 release 包到 GPU VPS 验证
+
 环境：
 
 ```text
@@ -161,6 +237,15 @@ BUILD_INFO:
   package_flavor: sm86-g8
 run.sh:
   TC_PERSIST=0
+```
+
+不支持 GPU 说明：
+
+```text
+V100 / V100S / sm_70 / Volta 不属于当前 production release 覆盖范围。
+当前 portable package 不含 sm_70 SASS/PTX；它不能替代 sm86-g8 或 sm120
+generic fallback 的生产验证。若安装脚本 fallback generic 后运行失败，应记录为
+unsupported GPU，而不是 release regression。
 ```
 
 generic fallback 期望：
@@ -247,7 +332,7 @@ cd ~/kan
 nohup ./run.sh --algo pearl \
   --pool stratum+ssl://prl.kryptex.network:8048 \
   --wallet <PRL_ADDRESS.WORKER_OR_ADDRESS> \
-  --batch 500 --cfg real --tc >/tmp/fast.log 2>&1 &
+  --batch 1000 --cfg real --tc >/tmp/fast.log 2>&1 &
 
 # Optional:
 #   KAN_RESTART=0       one-shot debug run; do not auto-restart
@@ -269,8 +354,11 @@ tail -f /tmp/fast.log
 3. accepted share 正常出现；
 4. rejected 不异常；
 5. 无 submit timeout 风暴；
-6. 短期 15-30 分钟内稳定，之后持续运行直到新版本替换或用户要求停止；
-7. sm86 live pool 接近 93-96 TH/s 历史区间，或解释偏差。
+6. 日志出现 async share submit worker active；
+7. found 后 mining loop 不因 submit_wait 阻塞；
+8. 如 job 在 proof 期间更新，允许出现 MINE proof abort，且不应被计为 correctness failure；
+9. 短期 15-30 分钟内稳定，之后持续运行直到新版本替换或用户要求停止；
+10. sm86 live pool 接近 93-96 TH/s 历史区间，或解释偏差。
 ```
 
 持续运行状态采样：
@@ -314,6 +402,11 @@ tail -f /tmp/fast.log
 不修改生产 miner 源码；
 日志写到 /tmp/fast.log 或 /tmp/kan_*.log；
 测试完成后汇总 BUILD_INFO、GPU 状态、POSTCHECK、hashrate、accepted/rejected。
+同时汇总：
+  - async_submit_worker_seen；
+  - stale_proof_aborts；
+  - submit_wait avg；
+  - found/job_abort attempt TH/s。
 ```
 
 ---

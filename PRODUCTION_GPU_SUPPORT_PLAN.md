@@ -17,6 +17,10 @@
 支持 NVIDIA Turing / RTX 20 系及以上 GPU，包括家用卡、商用卡和数据中心卡。
 ```
 
+实际 production fatbin 从 `sm_75` 开始覆盖。Volta / `sm_70`
+（V100/V100S）不是当前 production 目标；当前 Sm80 风格 int8 CUTLASS 内核
+不能用 V100S 作为生产验证依据。
+
 生产版本需要同时满足：
 
 ```text
@@ -132,6 +136,7 @@ compute_90 PTX
 
 | 架构 | 代表 GPU | 当前定位 |
 |---|---|---|
+| `sm_70` | V100 / V100S / Volta | 不支持当前 release；需要单独 Volta kernel/profile |
 | `sm_75` | RTX 20 系 / Turing | generic 兼容，tuned profile 待测 |
 | `sm_80` | A100 / Ampere datacenter | generic 兼容，tuned profile 待测 |
 | `sm_86` | RTX 30 系 / 3080 Ti / 3090 | tuned profile 已明确 |
@@ -726,4 +731,3 @@ sm_120
 6. 开始 sm89 / sm75 / sm80 / sm90 / sm120 profile 补齐；
 7. 同时推进 sm86 live gap / kernel 微优化。
 ```
-

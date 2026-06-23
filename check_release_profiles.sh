@@ -69,7 +69,7 @@ EOF
 dry_pkg() {
   local sm="$1"
   DRY_RUN=1 GPU_SM_OVERRIDE="$sm" VERSION=vCHECK bash ./install_kan.sh \
-    | awk -F':  +' '/^package:/ {print $2; exit}'
+    2>/dev/null | awk -F':  +' '/^package:/ {print $2; exit}'
 }
 
 echo "=== release profile static checks ==="
@@ -79,11 +79,15 @@ check_file "package_portable.sh"
 check_file "install_kan.sh"
 check_file "GPU_PROFILES.md"
 check_file "README.md"
+check_file "CHANGELOG.md"
+check_file "ci_gpu_verify.sh"
+check_file ".cnb/web_trigger.yml"
 
 echo "[1/5] bash syntax"
 bash -n package_portable.sh
 bash -n install_kan.sh
 bash -n check_release_profiles.sh
+bash -n ci_gpu_verify.sh
 
 echo "[2/5] release matrix assets"
 expect_contains ".cnb.yml" "dist/kan-portable-linux-x64.tar.gz"
@@ -109,9 +113,22 @@ expect_contains "GPU_PROFILES.md" "KSTAGES:   3"
 expect_contains "GPU_PROFILES.md" "runtime:   TC_PERSIST=0"
 expect_contains "README.md" "generic compatibility package"
 expect_contains "README.md" "tuned production package"
+expect_contains "README.md" "async share submit"
+expect_contains "README.md" "V100/V100S"
+expect_contains "README.md" "sm_70"
+expect_contains "GPU_PROFILES.md" "async share submit"
+expect_contains "GPU_PROFILES.md" "stale proof early-abort"
+expect_contains "GPU_PROFILES.md" 'Volta / `sm_70`'
+expect_contains ".cnb.yml" "web_trigger_gpu_verify"
+expect_contains ".cnb.yml" "gpu-verify:"
+expect_contains ".cnb.yml" "cnb:arch:amd64:gpu"
+expect_contains ".cnb/web_trigger.yml" "GPU 验证"
+expect_not_contains "src/miner_main.cpp" "prl1patz"
+expect_not_contains "package_portable.sh" "prl1patz"
 
 echo "[4/5] install_kan selection matrix"
 [ "$(dry_pkg sm_75)" = "kan-portable-linux-x64.tar.gz" ] || fail "sm_75 should fallback generic"
+[ "$(dry_pkg sm_70)" = "kan-portable-linux-x64.tar.gz" ] || fail "sm_70 should select generic but remain unsupported"
 [ "$(dry_pkg sm_80)" = "kan-portable-linux-x64.tar.gz" ] || fail "sm_80 should fallback generic"
 [ "$(dry_pkg sm_86)" = "kan-portable-linux-x64-sm86-g8.tar.gz" ] || fail "sm_86 should select sm86-g8"
 [ "$(dry_pkg sm_89)" = "kan-portable-linux-x64.tar.gz" ] || fail "sm_89 should fallback generic"
@@ -125,8 +142,22 @@ expect_contains "package_portable.sh" "install_kan.sh"
 expect_contains "package_portable.sh" "package_policy:"
 expect_contains "package_portable.sh" "TC_PERSIST="
 expect_contains "package_portable.sh" "compute_cap"
+expect_contains "package_portable.sh" "cuda_version:"
+expect_contains "package_portable.sh" "nvcc_version:"
 expect_contains "package_portable.sh" "KAN_RESTART="
 expect_contains "package_portable.sh" "KAN_RESTART_DELAY"
 expect_contains "package_portable.sh" "pool-mode auto-restart"
+expect_contains "package_portable.sh" "live_current.log"
+expect_contains "package_portable.sh" "async share submit"
+expect_contains "package_portable.sh" "MINE proof abort"
+expect_contains "package_portable.sh" "CHANGELOG.md"
+expect_contains "package_portable.sh" "requires an explicit --wallet"
+expect_contains "package_portable.sh" "Volta / sm_70"
+expect_contains "install_kan.sh" "sm_70 / Volta"
+expect_contains "ci_gpu_verify.sh" "POSTCHECK"
+expect_contains "ci_gpu_verify.sh" "GPU_VERIFY_POOL_SECONDS"
+expect_contains "src/miner_main.cpp" "async share submit worker active"
+expect_contains "src/miner_main.cpp" "pool mode requires --wallet"
+expect_contains "src/plainproof_gen.cpp" "MINE proof abort"
 
 echo "OK: release profile checks passed"
