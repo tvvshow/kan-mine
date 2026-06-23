@@ -11,11 +11,10 @@
 正式生产版本不能只围绕 RTX 3080 Ti 做单点优化。RTX 3080 Ti 只是
 `sm_86 / Ampere gaming` profile 的一个代表样本。
 
-项目正式生产目标应定义为：
-
-```text
-支持 NVIDIA Turing / RTX 20 系及以上 GPU，包括家用卡、商用卡和数据中心卡。
-```
+项目正式生产目标应定义为逐步覆盖 NVIDIA Ampere / Ada / Hopper / Blackwell
+以及经实机验证的 Turing fallback。当前 production 推荐从 `sm_86` 起；`sm_75`
+(Turing / RTX 20 系) 在 generic fatbin 中保留用于兼容性试跑，但在缺少
+POSTCHECK + pool accepted 记录前只标为 experimental fallback。
 
 实际 production fatbin 从 `sm_75` 开始覆盖。Volta / `sm_70`
 （V100/V100S）不是当前 production 目标；当前 Sm80 风格 int8 CUTLASS 内核
@@ -24,7 +23,7 @@
 生产版本需要同时满足：
 
 ```text
-1. generic portable 包保证 NVIDIA 20 系以上大多数 GPU 可运行；
+1. generic portable 包保证 NVIDIA Ampere/Ada/Hopper 以及部分 Turing fallback 可尝试运行；
 2. tuned portable 包为已实测主力架构固化最优参数；
 3. 目标机器不现场编译，只下载对应 release 包运行；
 4. 每个 tuned profile 都有 benchmark / correctness / pool accepted 记录；
@@ -137,7 +136,7 @@ compute_90 PTX
 | 架构 | 代表 GPU | 当前定位 |
 |---|---|---|
 | `sm_70` | V100 / V100S / Volta | 不支持当前 release；需要单独 Volta kernel/profile |
-| `sm_75` | RTX 20 系 / Turing | generic 兼容，tuned profile 待测 |
+| `sm_75` | RTX 20 系 / Turing | generic experimental fallback，tuned profile 待测；缺少实机 accepted 前不承诺 production 支持 |
 | `sm_80` | A100 / Ampere datacenter | generic 兼容，tuned profile 待测 |
 | `sm_86` | RTX 30 系 / 3080 Ti / 3090 | tuned profile 已明确 |
 | `sm_89` | RTX 40 系 / Ada / L40 | generic 兼容，需整理 tuned profile |
@@ -326,8 +325,8 @@ kan-portable-linux-x64.tar.gz
 
 ```text
 最大兼容；
-NVIDIA 20 系以上大多数 GPU 可运行；
-不承诺最优性能。
+Ampere/Ada/Hopper 以及 Turing experimental fallback 可尝试运行；
+不承诺最优性能，未验证架构不承诺 production 支持。
 ```
 
 #### sm86 production tuned package

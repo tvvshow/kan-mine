@@ -10,12 +10,10 @@
 
 本文件定义 `peral/` 正式生产版本的 GPU profile 体系。
 
-正式目标不是只支持 RTX 3080 Ti，而是：
-
-```text
-支持 NVIDIA Turing / RTX 20 系及以上 GPU，
-包括家用卡、商用卡和数据中心卡。
-```
+正式目标是逐步覆盖 NVIDIA Ampere / Ada / Hopper / Blackwell 以及经验证的 Turing
+fallback，而不是只支持 RTX 3080 Ti。当前 production 推荐从 `sm_86` 开始；`sm_75`
+(Turing / RTX 20 系) 保留在 generic fatbin 中用于兼容性试跑，但在缺少实机
+POSTCHECK + pool accepted 记录前只能标为 experimental fallback。
 
 当前 production release 的实际 CUDA fatbin 从 `sm_75` 开始。Volta / `sm_70`
 （V100/V100S）不在当前 production 支持范围内；不要把“有 Tensor Core”误解为
@@ -152,9 +150,10 @@ kan-portable-linux-x64.tar.gz
 定位：
 
 ```text
-NVIDIA 20 系以上大多数 GPU 的兼容包；
+NVIDIA Ampere / Ada / Hopper 以及部分 Turing fallback 的兼容包；
 能运行优先；
-不承诺最优性能。
+不承诺最优性能；
+`sm_75` 在获得正式实机记录前属于 experimental fallback。
 ```
 
 当前 generic 覆盖目标：
@@ -230,8 +229,8 @@ Not recommended for production
 | Arch | 代表 GPU | 推荐 package | 编译 ARCH | GROUPM | KSTAGES | 默认 TC_PERSIST | 状态 | 备注 |
 |---|---|---|---|---:|---:|---:|---|---|
 | `sm_70` | V100 / V100S / Volta | 不支持当前 release | N/A | N/A | N/A | N/A | 不支持 | portable fatbin 不含 `sm_70`；生产内核不是 Volta 路径 |
-| `generic` | NVIDIA 20 系以上大多数 GPU | `kan-portable-linux-x64.tar.gz` | multi-arch fatbin | build default / generic | 3 | package default | 生产兼容包 | 能跑优先，不承诺最优 |
-| `sm_75` | RTX 20 系 / Turing | generic；tuned TBD | `sm_75` | TBD | 3 | TBD | 待测 | 需要兼容性、正确性、pool accepted 验证 |
+| `generic` | Ampere/Ada/Hopper + Turing experimental fallback | `kan-portable-linux-x64.tar.gz` | multi-arch fatbin | build default / generic | 3 | package default | 生产兼容包；sm75 experimental | 能跑优先，不承诺最优 |
+| `sm_75` | RTX 20 系 / Turing | generic experimental fallback；tuned TBD | `sm_75` | TBD | 3 | TBD | **未验证 / 可能不支持** | 需要兼容性、正确性、pool accepted 验证；若 shared-memory 超限则视为 unsupported |
 | `sm_80` | A100 / Ampere datacenter | generic；tuned TBD | `sm_80` | TBD | 3 | TBD | 待测 | 不可直接套用 sm_86 参数 |
 | `sm_86` | RTX 30 系 / RTX 3080 Ti / RTX 3090 | `kan-portable-linux-x64-sm86-g8.tar.gz` | `sm_86` | 8 | 3 | 0 | 已实测；生产推荐 | 当前唯一明确 production tuned profile |
 | `sm_89` | RTX 40 系 / RTX 4090 / L40 / Ada | generic；tuned TBD | `sm_89` | TBD | 3 | TBD | 需整理历史数据 | 4090 kernel 强但 wall gap 明显；L40 persistent 可能有正收益 |

@@ -5,7 +5,7 @@
 #   main / push      -> FREE GPU-less runner. CUDA compiles without a GPU and the
 #                       solver's reference path runs on CPU, so every commit is fully
 #                       built AND correctness-verified at zero GPU cost:
-#                         build      -> portable multi-arch fatbin (sm_75..sm_90 SASS + PTX)
+#                         build      -> portable multi-arch fatbin (sm_75 experimental fallback, sm_80..sm_90 SASS + PTX)
 #                         cpu-verify -> reference jackpot search -> oracle-shaped PlainProof
 #
 #   <tag> / tag_push -> build the "download & run" portable packages and publish
@@ -106,7 +106,7 @@ $:
           # versioned dist/kan-portable-linux-x64-<tag>.tar.gz. Static cudart +
           # bundled libs + multi-arch fatbin. WITH_AB=0 ships a clean miner
           # (no RMW A/B baseline binary). This is the compatibility-first
-          # package for NVIDIA RTX 20 series / Turing and newer; it does not
+          # package for Ampere/Ada/Hopper plus experimental Turing fallback; it does not
           # promise per-architecture optimal performance.
           script: WITH_AB=0 bash package_portable.sh
         - name: package-sm86-ampere
@@ -114,11 +114,13 @@ $:
           # (RTX 3080Ti/3090 class). Keep this as the only sm_86 default release
           # package unless GPU_PROFILES.md is updated with new verified data.
           script: WITH_AB=0 ARCH=sm_86 GROUPM=8 KSTAGES=3 PACKAGE_FLAVOR=sm86-g8 bash package_portable.sh
+        - name: checksums
+          script: cp install_kan.sh dist/install_kan.sh && (cd dist && sha256sum kan-portable-linux-x64.tar.gz kan-portable-linux-x64-sm86-g8.tar.gz install_kan.sh > SHA256SUMS)
         - name: create-release
           # built-in task; title defaults to the tag name, tag auto-taken from tag_push.
           type: git:release
           options:
-            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs. Assets include the generic multi-arch compatibility package and the production sm_86/GROUPM=8 tuned package for RTX 3080Ti/3090 class GPUs. Pool mode includes run.sh auto-restart plus async share submit so submit_wait does not block the next mining attempt. Experimental sm_86 GROUPM/KSTAGES sweep packages are intentionally not published as default release assets. Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt, CHANGELOG.md, GPU_PROFILES.md, BUILD_INFO.txt and RELEASE_NOTES.txt inside."
+            description: "Download-&-run portable Pearl(PRL) miner. Static cudart + bundled libs. Assets include the generic multi-arch compatibility package, SHA256SUMS, and the production sm_86/GROUPM=8 tuned package for RTX 3080Ti/3090 class GPUs. Pool mode includes run.sh auto-restart plus async share submit so submit_wait does not block the next mining attempt. Optional systemd/logrotate templates are included inside the portable package. Experimental sm_86 GROUPM/KSTAGES sweep packages are intentionally not published as default release assets. Only runtime dependency is the NVIDIA driver - no CUDA toolkit, no CUTLASS, no compiler on the target. Unpack and run ./run.sh; see README.txt, CHANGELOG.md, GPU_PROFILES.md, BUILD_INFO.txt and RELEASE_NOTES.txt inside."
             latest: true
         - name: upload-portable-package
           image: cnbcool/attachments:latest
@@ -126,4 +128,5 @@ $:
             attachments:
               - dist/kan-portable-linux-x64.tar.gz
               - dist/kan-portable-linux-x64-sm86-g8.tar.gz
+              - dist/SHA256SUMS
               - install_kan.sh

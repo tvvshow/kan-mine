@@ -89,6 +89,9 @@ chmod +x "${STAGE}/kan" "${STAGE}/pearl-miner" "${STAGE}/plainproof_gen"
 [ -f "${ROOT}/GPU_PROFILES.md" ] && cp -f "${ROOT}/GPU_PROFILES.md" "${STAGE}/GPU_PROFILES.md"
 [ -f "${ROOT}/CHANGELOG.md" ] && cp -f "${ROOT}/CHANGELOG.md" "${STAGE}/CHANGELOG.md"
 [ -f "${ROOT}/install_kan.sh" ] && cp -f "${ROOT}/install_kan.sh" "${STAGE}/install_kan.sh" && chmod +x "${STAGE}/install_kan.sh"
+[ -f "${ROOT}/install_service.sh" ] && cp -f "${ROOT}/install_service.sh" "${STAGE}/install_service.sh" && chmod +x "${STAGE}/install_service.sh"
+[ -f "${ROOT}/kan.service" ] && cp -f "${ROOT}/kan.service" "${STAGE}/kan.service"
+[ -f "${ROOT}/kan.logrotate" ] && cp -f "${ROOT}/kan.logrotate" "${STAGE}/kan.logrotate"
 
 echo "=== [2/5] bundle non-glibc / non-driver shared libs (fixpoint over ldd) ==="
 # Keep as SYSTEM (never bundle): glibc core (ABI-stable, everywhere) + the NVIDIA
@@ -394,9 +397,10 @@ release_notes="${STAGE}/RELEASE_NOTES.txt"
   echo "----------------"
   case "${PACKAGE_FLAVOR:-generic}" in
     generic)
-      echo "Generic compatibility package for NVIDIA RTX 20 series / Turing and newer."
+      echo "Generic compatibility package for NVIDIA Ampere/Ada/Hopper plus experimental Turing fallback."
       echo "Covers sm_75, sm_80, sm_86, sm_89, sm_90 SASS plus compute_90 PTX."
       echo "Volta / sm_70 (V100/V100S) is not covered by this production package."
+      echo "Turing / sm_75 remains experimental until a real POSTCHECK + pool accepted record exists."
       echo "Use this when no validated tuned package exists for the target GPU."
       echo "This package prioritizes compatibility and does not promise per-architecture optimal performance."
       ;;
@@ -439,6 +443,11 @@ release_notes="${STAGE}/RELEASE_NOTES.txt"
   echo "subset, or set CUDA_VISIBLE_DEVICES to pin a single GPU (which disables"
   echo "auto fanout). A single shared stratum session with unified parent stats"
   echo "is a future item, not yet shipped."
+  echo
+  echo "Install as a systemd service (optional):"
+  echo "---------------------------------------"
+  echo "Run sudo -E ./install_service.sh from the unpacked package directory, then"
+  echo "edit kan.env and start the service with systemctl enable --now kan."
   echo
   if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null 2>&1; then
     echo "Tag notes:"
@@ -485,8 +494,9 @@ NVIDIA driver. NO CUDA toolkit, NO CUTLASS, NO compiler needed on this machine.
 
 Package selection:
   kan-portable-linux-x64.tar.gz
-      Generic compatibility package for NVIDIA RTX 20 series / Turing and newer
-      (sm_75+). Volta / sm_70 (V100/V100S) is not covered.
+      Generic compatibility package for Ampere/Ada/Hopper plus experimental
+      Turing / sm_75 fallback. Volta / sm_70 (V100/V100S) is not covered.
+      Turing remains experimental until real POSTCHECK + pool accepted records exist.
       Use it when no validated tuned package exists for the target GPU.
 
   kan-portable-linux-x64-sm86-g8.tar.gz
@@ -522,6 +532,9 @@ Files:
   CHANGELOG.md         public changelog for production operators
   GPU_PROFILES.md     authoritative generic/tuned GPU package profile table
   install_kan.sh      installer/updater that selects tuned package or generic fallback
+  install_service.sh  optional systemd service installer (creates kan.env)
+  kan.service         systemd unit template used by install_service.sh
+  kan.logrotate       logrotate template used by install_service.sh
 
 GPU arch note:
   CUDA 12.4 nvcc emits sm_75..sm_90 SASS + compute_90 PTX. Volta / sm_70
@@ -573,7 +586,14 @@ echo "    missed bundle — add it to package_portable.sh."
 echo "=== [5/5] tar ==="
 ( cd "${DIST}" && tar czf "${VERSIONED_TAR}" "${PKG}" )
 cp -f "${DIST}/${VERSIONED_TAR}" "${DIST}/${STABLE_TAR}"
-ls -la "${DIST}/${VERSIONED_TAR}" "${DIST}/${STABLE_TAR}"
+(
+  cd "${DIST}"
+  touch SHA256SUMS
+  grep -Fv "  ${VERSIONED_TAR}" SHA256SUMS | grep -Fv "  ${STABLE_TAR}" > SHA256SUMS.tmp || true
+  sha256sum "${VERSIONED_TAR}" "${STABLE_TAR}" >> SHA256SUMS.tmp
+  mv SHA256SUMS.tmp SHA256SUMS
+)
+ls -la "${DIST}/${VERSIONED_TAR}" "${DIST}/${STABLE_TAR}" "${DIST}/SHA256SUMS"
 du -sh "${STAGE}" | awk '{print "  unpacked size: "$1}'
 echo "PORTABLE PACKAGE OK -> dist/${VERSIONED_TAR}"
 echo "STABLE CI ALIAS      -> dist/${STABLE_TAR}"

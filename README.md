@@ -37,7 +37,7 @@
 
 | 项目 | 要求 |
 |------|------|
-| **GPU** | NVIDIA Turing / RTX 20 系及以上，Compute Capability ≥ 7.5；当前 production 包覆盖 `sm_75` 起 |
+| **GPU** | NVIDIA Ampere / RTX 30 系及以上为当前 production 推荐；Turing / RTX 20 系 (`sm_75`) 仅保留 generic experimental fallback，需实机验证 |
 | **显存** | ≥ 4 GB（实配使用约 2 GB） |
 | **CUDA** | 12.x（已在 12.8 上测试通过） |
 | **系统** | Linux x86_64（已在 Ubuntu 22.04 上测试通过） |
@@ -51,7 +51,7 @@
 | GPU / 架构 | 当前 release 定位 | 推荐包 |
 |-----|------|------|
 | V100 / V100S / `sm_70` | **不属于当前 production 支持范围**；portable 包不含 `sm_70` SASS/PTX | 不推荐 / 不支持 |
-| RTX 20 系 / `sm_75` | generic 兼容目标；tuned profile 待测 | `kan-portable-linux-x64.tar.gz` |
+| RTX 20 系 / `sm_75` | **experimental fallback**；generic fatbin 含 `sm_75`，但当前没有 production accepted 记录，部分 Turing 机器可能因 shared-memory 限制失败 | 可尝试 `kan-portable-linux-x64.tar.gz`，失败则视为暂不支持 |
 | A100 / `sm_80` | generic 兼容目标；tuned profile 待测 | `kan-portable-linux-x64.tar.gz` |
 | RTX 3080 Ti / RTX 3090 / `sm_86` | 已实测 production tuned profile | `kan-portable-linux-x64-sm86-g8.tar.gz` |
 | RTX 4090 / L40 / `sm_89` | generic 兼容；历史数据待整理成正式 profile | `kan-portable-linux-x64.tar.gz` |
@@ -104,8 +104,8 @@ export CUTLASS_HOME=~/cutlass
 ```text
 kan-portable-linux-x64.tar.gz
   generic compatibility package
-  面向 NVIDIA RTX 20 系 / Turing 及以上大多数 GPU；
-  能运行优先，不承诺单架构最优性能。
+  面向 NVIDIA Ampere / Ada / Hopper 以及部分 Turing fallback；
+  能运行优先，不承诺单架构最优性能，`sm_75` 当前为 experimental。
 
 kan-portable-linux-x64-sm86-g8.tar.gz
   tuned production package
@@ -126,6 +126,9 @@ kan-portable-linux-x64-sm86-g8.tar.gz
 - `CHANGELOG.md`：公开生产变更记录。
 - `GPU_PROFILES.md`：generic / tuned GPU profile 权威表。
 - `install_kan.sh`：按 GPU profile 选择 tuned 包或 fallback generic 的安装/更新脚本。
+- `install_service.sh`、`kan.service`、`kan.logrotate`：可选 systemd/logrotate 生产部署模板。
+
+Release 附件还包含 `SHA256SUMS`，用于校验下载到同一目录下的 tarball / `install_kan.sh`。
 
 矿机上只需要 NVIDIA 驱动和 Linux x86-64 / glibc ≥ 2.35：
 
@@ -145,10 +148,10 @@ cd kan-portable-linux-x64
 # 默认根据 nvidia-smi 检测 GPU：
 #   sm_86 -> kan-portable-linux-x64-sm86-g8.tar.gz
 #   其他 / 未调优架构 -> kan-portable-linux-x64.tar.gz
-VERSION=v1.2.18 ./install_kan.sh
+VERSION=v1.2.19 ./install_kan.sh
 
 # 如 release 地址不是默认 CNB 格式，可显式指定：
-RELEASE_BASE_URL=https://example/releases/v1.2.18 ./install_kan.sh
+RELEASE_BASE_URL=https://example/releases/v1.2.19 ./install_kan.sh
 ```
 
 发版前可先做不依赖 GPU 的静态检查：
@@ -193,8 +196,8 @@ git push origin HEAD:gpu-verify
 
 ```bash
 # 在 main 通过 build/cpu_test 后，创建带说明的 tag 即可触发 Release
-git tag -a v1.2.18 -m "v1.2.18 — production release: multi-GPU portable runtime, async submit, stale-proof abort"
-git push origin v1.2.18
+git tag -a v1.2.19 -m "v1.2.19 — production release: operator polish, checksums, service templates"
+git push origin v1.2.19
 ```
 
 `package_portable.sh` 会同时产出版本化文件名和稳定上传别名，例如：
@@ -206,7 +209,12 @@ dist/kan-portable-linux-x64-<version>-sm86-g8.tar.gz
 dist/kan-portable-linux-x64-sm86-g8.tar.gz
 ```
 
-稳定别名用于 CNB 附件上传，包内文件保存精确版本信息。
+稳定别名用于 CNB 附件上传，包内文件保存精确版本信息。Release 同时上传
+`SHA256SUMS`，下载后可验证：
+
+```bash
+sha256sum -c SHA256SUMS
+```
 
 ### 显卡专用便携包
 
@@ -415,6 +423,30 @@ CUDA_VISIBLE_DEVICES=1 ./build/kan --algo pearl \
   统一的父进程 stats / 单 stratum session 是未来项，尚未完成。
 - 任意一个 lane 异常退出时，supervisor 会停止其余 lane 并整体退出，交给
   `run.sh` 的 `KAN_RESTART` 自动重启（避免静默降级运行）。
+
+---
+
+### systemd 服务部署（可选）
+
+便携包内带有 service/logrotate 模板，适合长期生产运行：
+
+```bash
+cd ~/kan
+sudo -E ./install_service.sh
+sudo editor ~/kan/kan.env   # 设置 KAN_WALLET / KAN_WORKER / KAN_DEVICES
+sudo systemctl enable --now kan
+journalctl -u kan -f
+```
+
+`kan.env` 中可设置：
+
+```text
+KAN_POOL=stratum+tcp://prl.kryptex.network:7048
+KAN_WALLET=<PRL_ADDRESS>
+KAN_WORKER=rig01
+KAN_DEVICES=0,1        # 可选；不设置则自动全卡 fanout
+CUDA_VISIBLE_DEVICES=0 # 可选；与 KAN_DEVICES 二选一
+```
 
 ---
 

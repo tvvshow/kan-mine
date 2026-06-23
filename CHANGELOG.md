@@ -6,9 +6,34 @@ pool accepted 的实验不标记为 production recommended。
 
 ---
 
-## v1.2.18 — production multi-GPU portable release candidate
+## v1.2.19 — operator polish / checksum / service candidate
 
-状态：待 Linux/CUDA release workflow 构建与 GPU L2/L3 验证后发布。
+状态：待 Linux/CUDA release workflow 构建与 GPU L2 验证后发布。
+
+### Packaging / operator experience
+
+- Release matrix 增加 `SHA256SUMS` 附件；`package_portable.sh` 生成 tarball
+  校验和，CNB tag pipeline 在上传前统一生成 generic、sm86-g8 与
+  `install_kan.sh` 的 checksum。
+- `install_kan.sh` 增加 CLI 参数：`--version`、`--dest`、`--base-url`、
+  `--force-generic`、`--force-sm86-g8`、`--force-package`、`--gpu-sm`、
+  `--dry-run`、`--no-status`；同时增加 glibc 版本提示、SHA256SUMS 校验和
+  安装后 `status.sh` 快照。
+- 便携包新增可选 systemd/logrotate 生产部署模板：`install_service.sh`、
+  `kan.service`、`kan.logrotate`。默认生成 `kan.env`，由 operator 填写
+  `KAN_WALLET` 后启用服务。
+
+### GPU support wording
+
+- 将 `sm_75` / Turing 从“production compatibility”降级为
+  **experimental fallback**：generic fatbin 仍包含 `sm_75`，但在缺少
+  POSTCHECK + pool accepted 实机记录前，不再承诺 production 支持。
+
+---
+
+## v1.2.18 — production multi-GPU portable release
+
+状态：已发布；main、gpu-verify 与 tag release build 均通过，generic / sm86-g8 / install 脚本资产已上传。
 
 ### Production runtime
 
@@ -56,8 +81,9 @@ pool accepted 的实验不标记为 production recommended。
   - generic compatibility package；
   - `sm86-g8` production tuned package；
   - RTX 5090 / `sm_120` CUDA 12 generic PTX fallback baseline。
-- 文档按实际 fatbin/kernel 修正硬件范围：当前 production release 从 `sm_75`
-  开始覆盖；V100/V100S / Volta / `sm_70` 不属于当前支持范围。
+- 文档按实际 fatbin/kernel 修正硬件范围：Volta / `sm_70` 不属于当前支持范围；
+  `sm_75` / Turing 仅作为 generic experimental fallback，正式 production 推荐从
+  已验证的 `sm_86` tuned package 起。
 - RTX 5090 / `sm_120` 不自动选择 tuned 包；CUDA 13 native `sm_120` package
   只有在完成 POSTCHECK、controlled benchmark、live pool accepted 和稳定性验证后
   才能升级为 production recommended。

@@ -34,6 +34,7 @@ expect_not_contains() {
 assert_release_attachments_exact() {
   local expected actual
   expected="$(cat <<'EOF'
+dist/SHA256SUMS
 dist/kan-portable-linux-x64-sm86-g8.tar.gz
 dist/kan-portable-linux-x64.tar.gz
 install_kan.sh
@@ -83,6 +84,10 @@ check_file "CHANGELOG.md"
 check_file "ci_gpu_verify.sh"
 check_file ".cnb/web_trigger.yml"
 check_file "run_test.sh"
+check_file "PRODUCTION_GPU_SUPPORT_PLAN.md"
+check_file "install_service.sh"
+check_file "kan.service"
+check_file "kan.logrotate"
 
 echo "[1/6] bash syntax"
 bash -n package_portable.sh
@@ -90,10 +95,14 @@ bash -n install_kan.sh
 bash -n check_release_profiles.sh
 bash -n ci_gpu_verify.sh
 bash -n run_test.sh
+bash -n install_service.sh
 
 echo "[2/6] release matrix assets"
 expect_contains ".cnb.yml" "dist/kan-portable-linux-x64.tar.gz"
 expect_contains ".cnb.yml" "dist/kan-portable-linux-x64-sm86-g8.tar.gz"
+expect_contains ".cnb.yml" "dist/SHA256SUMS"
+expect_contains ".cnb.yml" "cd dist && sha256sum kan-portable-linux-x64.tar.gz"
+expect_contains ".cnb.yml" "install_kan.sh > SHA256SUMS"
 expect_contains ".cnb.yml" "install_kan.sh"
 assert_release_attachments_exact
 
@@ -120,6 +129,12 @@ expect_contains "README.md" "V100/V100S"
 expect_contains "README.md" "sm_70"
 expect_contains "GPU_PROFILES.md" "async share submit"
 expect_contains "GPU_PROFILES.md" "stale proof early-abort"
+expect_contains "README.md" "sm_75"
+expect_contains "README.md" "experimental fallback"
+expect_contains "GPU_PROFILES.md" "sm75 experimental"
+expect_contains "PRODUCTION_GPU_SUPPORT_PLAN.md" "experimental fallback"
+expect_contains "PRODUCTION_GPU_SUPPORT_PLAN.md" "不承诺 production 支持"
+expect_contains "GPU_PROFILES.md" "shared-memory"
 expect_contains "GPU_PROFILES.md" 'Volta / `sm_70`'
 expect_contains ".cnb.yml" "web_trigger_gpu_verify"
 expect_contains ".cnb.yml" "gpu-verify:"
@@ -155,6 +170,19 @@ expect_contains "package_portable.sh" "MINE proof abort"
 expect_contains "package_portable.sh" "CHANGELOG.md"
 expect_contains "package_portable.sh" "requires an explicit --wallet"
 expect_contains "package_portable.sh" "Volta / sm_70"
+expect_contains "package_portable.sh" "SHA256SUMS"
+expect_contains "package_portable.sh" "install_service.sh"
+expect_contains "package_portable.sh" "kan.service"
+expect_contains "package_portable.sh" "kan.logrotate"
+expect_contains "install_kan.sh" "--force-generic"
+expect_contains "install_kan.sh" "--dry-run"
+expect_contains "install_kan.sh" "SHA256SUMS"
+expect_contains "install_kan.sh" "glibc"
+expect_contains "install_service.sh" "systemctl daemon-reload"
+expect_contains "kan.service" "EnvironmentFile=__KAN_ENV__"
+expect_contains "kan.service" "ExecStartPre="
+expect_contains "kan.service" "Restart=on-failure"
+expect_contains "kan.logrotate" "copytruncate"
 expect_contains "install_kan.sh" "sm_70 / Volta"
 expect_contains "ci_gpu_verify.sh" "POSTCHECK"
 expect_contains "ci_gpu_verify.sh" "GPU_VERIFY_POOL_SECONDS"

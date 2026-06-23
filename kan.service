@@ -1,0 +1,22 @@
+[Unit]
+Description=Kan Pearl(PRL) portable miner
+Documentation=https://cnb.cool/wuyueyi/peral
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__KAN_USER__
+Group=__KAN_GROUP__
+WorkingDirectory=__KAN_DIR__
+EnvironmentFile=__KAN_ENV__
+ExecStartPre=/bin/bash -lc 'test -n "${KAN_WALLET:-}" || { echo "KAN_WALLET is empty in __KAN_ENV__" >&2; exit 2; }'
+ExecStart=/bin/bash -lc 'args=(--algo pearl --pool "$KAN_POOL" --wallet "$KAN_WALLET" --worker "${KAN_WORKER:-rig01}" --batch "${KAN_BATCH:-1000}"); if [ -n "${KAN_DEVICES:-}" ]; then args+=(--devices "$KAN_DEVICES"); fi; exec ./run.sh "${args[@]}" ${KAN_EXTRA_ARGS:-}'
+Restart=on-failure
+RestartSec=20
+KillSignal=SIGINT
+TimeoutStopSec=90
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+__KAN_DIR__/miner.log __KAN_DIR__/live_current.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su __KAN_USER__ __KAN_GROUP__
+}
