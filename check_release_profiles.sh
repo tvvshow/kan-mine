@@ -82,12 +82,14 @@ check_file "README.md"
 check_file "CHANGELOG.md"
 check_file "ci_gpu_verify.sh"
 check_file ".cnb/web_trigger.yml"
+check_file "run_test.sh"
 
 echo "[1/5] bash syntax"
 bash -n package_portable.sh
 bash -n install_kan.sh
 bash -n check_release_profiles.sh
 bash -n ci_gpu_verify.sh
+bash -n run_test.sh
 
 echo "[2/5] release matrix assets"
 expect_contains ".cnb.yml" "dist/kan-portable-linux-x64.tar.gz"
@@ -156,6 +158,8 @@ expect_contains "package_portable.sh" "Volta / sm_70"
 expect_contains "install_kan.sh" "sm_70 / Volta"
 expect_contains "ci_gpu_verify.sh" "POSTCHECK"
 expect_contains "ci_gpu_verify.sh" "GPU_VERIFY_POOL_SECONDS"
+expect_contains "run_test.sh" "--cfg real"
+expect_contains "run_test.sh" "POSTCHECK"
 expect_contains "src/miner_main.cpp" "async share submit worker active"
 expect_contains "src/miner_main.cpp" "pool mode requires --wallet"
 expect_contains "src/plainproof_gen.cpp" "MINE proof abort"
