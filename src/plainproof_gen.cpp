@@ -45,6 +45,7 @@ std::atomic<uint64_t> g_live_draw_count{0};
 // Exported work_per_draw so stats thread can show hashrate before first batch returns
 double g_work_per_draw_export = 0;
 
+#include "platform.h"   // KAN_WEAK / KAN_NO_ASYNC_SEARCH
 #include "prover.h"
 
 using std::vector;
@@ -775,30 +776,35 @@ extern "C" int tc_jackpot_search(
 // that link other kernels (tc_block, sweep harnesses) still resolve; the mine
 // loop only takes the GPU path when all three symbols are present.
 extern "C" int tc_alloc_bufs(int m,int n,int k,int h,int w,int nrow_off,int ncol_off,
-                             signed char** dA, signed char** dBt) __attribute__((weak));
+                             signed char** dA, signed char** dBt) KAN_WEAK;
 extern "C" int gpu_prep_phase1(
     signed char* dA, signed char* dBt, int m,int n,int k,
     uint64_t seed, uint64_t draw, const unsigned char* job_key32,
     unsigned char* hash_a32, unsigned char* hash_b32,
-    double* ms_rng, double* ms_hash) __attribute__((weak));
+    double* ms_rng, double* ms_hash) KAN_WEAK;
 extern "C" int gpu_prep_phase2(
     signed char* dA, signed char* dBt, int m,int n,int k,int rank,
     const unsigned char* a_noise_seed32, const unsigned char* b_noise_seed32,
     const unsigned char* label_a32, const unsigned char* label_b32,
     const unsigned int* perm_a, const unsigned int* perm_b,
-    double* ms_noise) __attribute__((weak));
+    double* ms_noise) KAN_WEAK;
 // Async split of tc_jackpot_search (tc_cutlass_v2.cu): launch queues
 // gather+search on a non-blocking stream and returns; wait blocks for the
 // result. Lets prep(N+1) run on its own stream UNDER search(N) — the search
 // only reads the gathered panels, never dA/dBt, so prep can overwrite them
-// once the gathers are done (event-ordered inside gpu_prep). WEAK: builds
-// linking tc_block fall back to the synchronous tc_jackpot_search.
+// once the gathers are done (event-ordered inside gpu_prep).
+// These symbols are CUTLASS-only; builds that don't link tc_cutlass_v2 define
+// KAN_NO_ASYNC_SEARCH so the references vanish entirely (no weak needed, which
+// MSVC lacks). When undefined (CUTLASS build), KAN_WEAK lets other kernel .o's
+// still link without them.
+#ifndef KAN_NO_ASYNC_SEARCH
 extern "C" int tc_search_launch(
     int m,int n,int k,int rank,
     const int* pat_rows, const int* pat_cols, int h,int w,
     const int* row_off, int nrow_off, const int* col_off, int ncol_off,
-    const unsigned char* a_noise_seed32, const unsigned char* bound_le32) __attribute__((weak));
-extern "C" int tc_search_wait(int* out_rt, int* out_ct) __attribute__((weak));
+    const unsigned char* a_noise_seed32, const unsigned char* bound_le32) KAN_WEAK;
+extern "C" int tc_search_wait(int* out_rt, int* out_ct) KAN_WEAK;
+#endif
 
 int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop_flag) {
     R.found = false;
@@ -1253,9 +1259,13 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                 return 0;
             };
 
+#ifndef KAN_NO_ASYNC_SEARCH
             const bool async_split = (tc_search_launch && tc_search_wait);
             if (async_split && g_miner_verbose)
                 fprintf(stderr, "MINE: async search/prep overlap ACTIVE (prep N+1 under search N)\n");
+#else
+            const bool async_split = false;   // this build has no CUTLASS async split
+#endif
 
             // Prime: prep draw 0 (GPU idle, runs at full speed).
             if (maxdraws > 0 && !stopping() && gpu_prep_draw(0)) return 2;
@@ -1263,6 +1273,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                 if (stopping()) { if (g_miner_verbose) fprintf(stderr, "MINE abort: stop requested at draw=%llu\n", (unsigned long long)draw); break; }
 
                 int rt=-1, ct=-1, ok;
+#ifndef KAN_NO_ASYNC_SEARCH
                 if (async_split) {
                     // Software pipeline: queue search(N) async; while it runs,
                     // prep draw N+1 into dA/dBt on the prep stream (gathers of
@@ -1283,6 +1294,8 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                     }
                     ok = tc_search_wait(&rt, &ct);
                 } else {
+#else
+                {
                     ok = tc_jackpot_search(nullptr, nullptr,   // data already in dA/dBt
                                            (int)m,(int)n,(int)k,(int)rank,
                                            pat_rows.data(),pat_cols.data(),hh,ww,
@@ -1293,6 +1306,7 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                     uint64_t nd = draw + 1;
                     if (ok == 0 && nd < maxdraws && !stopping() && gpu_prep_draw(nd)) return 2;
                 }
+#endif
                 g_live_draw_count.fetch_add(1, std::memory_order_relaxed);
                 if (ok==1 && rt>=0 && ct>=0) {
                     // A newer pool job may have arrived while this draw was in

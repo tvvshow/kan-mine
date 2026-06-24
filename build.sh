@@ -102,8 +102,26 @@ echo "=== host: prover core ==="
 #   prover_lib.o     : -DPROVER_LIB drops main() -> linked into pearl-miner
 # (-I CUDA include: plainproof_gen.cpp includes gpu_draw.h -> cuda_runtime.h;
 #  not every box has CUDA headers on g++'s default include path.)
-g++ -O3 -std=c++17 -fopenmp -I"${ROOT}/blake3" -I"${CUDA_HOME}/include" -c "${ROOT}/src/plainproof_gen.cpp" -o plainproof_gen.o
-g++ -O3 -std=c++17 -fopenmp -I"${ROOT}/blake3" -I"${CUDA_HOME}/include" -DPROVER_LIB -c "${ROOT}/src/plainproof_gen.cpp" -o prover_lib.o
+# Kernel selection must run BEFORE the host compiles so ASYNC_DEF is known:
+# CUTLASS builds keep the async search/prep split; WMMA builds set
+# -DKAN_NO_ASYNC_SEARCH so plainproof_gen + gpu_prep drop the CUTLASS-only
+# tc_search_launch / tc_gather_done_event references (no weak needed, MSVC-friendly).
+KERNEL="${KERNEL:-auto}"
+if [ "${KERNEL}" = "auto" ]; then
+  case "${ARCH:-}" in
+    sm_70|sm_72|sm_75) KERNEL=wmma ;;
+    *) if [ -d "${CUTLASS_HOME:-$HOME/cutlass}/include/cutlass" ]; then KERNEL=cutlass; else KERNEL=wmma; fi ;;
+  esac
+fi
+CUTLASS_HOME="${CUTLASS_HOME:-$HOME/cutlass}"
+if [ "${KERNEL}" = "cutlass" ] && [ ! -d "${CUTLASS_HOME}/include/cutlass" ]; then
+  echo "  WARNING: KERNEL=cutlass but CUTLASS headers not at ${CUTLASS_HOME} -> wmma fallback"
+  KERNEL=wmma
+fi
+ASYNC_DEF=""
+[ "${KERNEL}" = "wmma" ] && ASYNC_DEF="-DKAN_NO_ASYNC_SEARCH"
+g++ -O3 -std=c++17 -fopenmp ${ASYNC_DEF} -I"${ROOT}/src" -I"${ROOT}/blake3" -I"${CUDA_HOME}/include" -c "${ROOT}/src/plainproof_gen.cpp" -o plainproof_gen.o
+g++ -O3 -std=c++17 -fopenmp ${ASYNC_DEF} -I"${ROOT}/src" -I"${ROOT}/blake3" -I"${CUDA_HOME}/include" -DPROVER_LIB -c "${ROOT}/src/plainproof_gen.cpp" -o prover_lib.o
 
 echo "=== host: unified miner driver (pool + solo) ==="
 g++ -O3 -std=c++17 "${KAN_VERSION_DEF}" -I"${ROOT}/src" -I"${ROOT}/blake3" -I"${CUDA_HOME}/include" -c "${ROOT}/src/miner_main.cpp" -o miner_main.o
@@ -119,7 +137,7 @@ g++ -O3 -std=c++17 "${KAN_VERSION_DEF}" -I"${ROOT}/src" -I"${ROOT}/blake3" -I"${
 # Needs the CUTLASS headers (header-only): CUTLASS_HOME or ~/cutlass.
 # Fallback: tc_block.cu (WMMA, ~30 TH/s) keeps GPU-less/CUTLASS-less builds alive.
 echo "=== fused tensor-core kernel ==="
-CUTLASS_HOME="${CUTLASS_HOME:-$HOME/cutlass}"
+# (CUTLASS_HOME and KERNEL already resolved above, before the host compiles.)
 # GROUPM is architecture-sensitive.  The historical sm_86 production baseline
 # (3090/3080Ti) was tuned at GROUPM=8 (102+ TH/s wall on 3090).  Later
 # 4090/5090 branches use larger grouping, but making 128 the universal default
@@ -140,36 +158,18 @@ EXTRA_FLAGS=""
 # Arbitrary extra nvcc flags passthrough (A/B benchmarking + profiling switches),
 # e.g. NVCC_EXTRA="-DFOLD_RMW_ALWAYS" or "-DPROFILE_NOFOLD". Empty in production.
 EXTRA_FLAGS="${EXTRA_FLAGS} ${NVCC_EXTRA:-}"
-# Kernel selection. The production CUTLASS kernel (tc_cutlass_v2) is an Sm80 path:
-# it needs cp.async (sm_80+) and ~89 KB dynamic shared memory, so it CANNOT target
-# Turing/Volta — sm_75/sm_70 cap dynamic smem at 64 KB and have no cp.async. The
-# WMMA kernel (tc_block.cu: int8 16x16x16, 32 KB *static* smem, and
-# __pipeline_memcpy_async that degrades to a synchronous copy pre-sm_80) DOES run
-# on Turing sm_75. KERNEL picks the path:
-#   auto (default): pre-Ampere ARCH (sm_70/72/75) -> wmma;
-#                   else cutlass if headers present, else wmma fallback
-#   wmma          : force tc_block (the only Turing/sm_75-capable int8 path)
-#   cutlass       : force tc_cutlass_v2 (auto-downgrades to wmma if headers absent)
-KERNEL="${KERNEL:-auto}"
-if [ "${KERNEL}" = "auto" ]; then
-  case "${ARCH:-}" in
-    sm_70|sm_72|sm_75) KERNEL=wmma ;;
-    *) if [ -d "${CUTLASS_HOME}/include/cutlass" ]; then KERNEL=cutlass; else KERNEL=wmma; fi ;;
-  esac
-fi
-if [ "${KERNEL}" = "cutlass" ] && [ ! -d "${CUTLASS_HOME}/include/cutlass" ]; then
-  echo "  WARNING: KERNEL=cutlass but CUTLASS headers not at ${CUTLASS_HOME} -> wmma fallback"
-  KERNEL=wmma
-fi
+# Kernel selection (KERNEL / CUTLASS_HOME / ASYNC_DEF) already ran above, before
+# the host compiles. Here we only emit BUILD_KERNEL for packaging and compile the
+# chosen kernel. See the earlier block for the auto/wmma/cutlass logic.
 echo "${KERNEL}" > "${BUILD}/BUILD_KERNEL"   # packaging reads this for BUILD_INFO
 
 if [ "${KERNEL}" = "cutlass" ]; then
   echo "  CUTLASS at ${CUTLASS_HOME} -> tc_cutlass_v2 (GROUPM=${GROUPM} KSTAGES=${KSTAGES}${SMALL_TILE:+ SMALL_TILE}) + gpu_prep [LIVE 102+ TH/s]"
   echo "  (persistent grid is the DEFAULT now; disable at runtime with TC_PERSIST=0 ./build/kan ...)"
   # shellcheck disable=SC2086
-  nvcc -O3 ${GENCODE} -std=c++17 -DGROUPM=${GROUPM} -DKSTAGES=${KSTAGES} ${EXTRA_FLAGS} -I"${CUTLASS_HOME}/include" -c "${ROOT}/src/tc_cutlass_v2.cu" -o tc_kernel.o
+  nvcc -O3 ${GENCODE} -std=c++17 -DGROUPM=${GROUPM} -DKSTAGES=${KSTAGES} ${EXTRA_FLAGS} -I"${ROOT}/src" -I"${CUTLASS_HOME}/include" -c "${ROOT}/src/tc_cutlass_v2.cu" -o tc_kernel.o
   # shellcheck disable=SC2086
-  nvcc -O3 ${GENCODE} -std=c++17 -c "${ROOT}/src/gpu_prep.cu"
+  nvcc -O3 ${GENCODE} -std=c++17 -I"${ROOT}/src" -c "${ROOT}/src/gpu_prep.cu"
   TC_OBJ="tc_kernel.o gpu_prep.o"
 else
   # WMMA path: the Turing/sm_75-capable int8 kernel. Also the fallback when CUTLASS
@@ -182,14 +182,17 @@ else
   fi
   echo "  WMMA kernel -> tc_block.cu (int8 16x16x16, 32 KB static smem) + gpu_prep (GPU draw pipeline)"
   echo "  (this is the Turing/sm_75-capable path; the CUTLASS Sm80 kernel cannot run on sm_75)"
+  # (ASYNC_DEF was set to -DKAN_NO_ASYNC_SEARCH above.)
   # shellcheck disable=SC2086
-  nvcc -O3 ${GENCODE} -std=c++17 -c "${ROOT}/src/tc_block.cu" -o tc_kernel.o
+  nvcc -O3 ${GENCODE} -std=c++17 -DKAN_NO_ASYNC_SEARCH -I"${ROOT}/src" -c "${ROOT}/src/tc_block.cu" -o tc_kernel.o
   # gpu_prep.cu is plain CUDA (no cp.async / no tensor cores) so it runs on Turing
   # too. Linking it lets plainproof_gen take the GPU-resident RNG+hash+noise path
   # (tc_alloc_bufs is defined in tc_block.cu), killing the ~2.7 s/draw CPU prep that
-  # otherwise serializes multi-GPU rigs sharing one host CPU.
+  # otherwise serializes multi-GPU rigs sharing one host CPU. KAN_NO_ASYNC_SEARCH
+  # drops the CUTLASS-only tc_search_launch/tc_gather_done_event references (no weak
+  # needed, MSVC-friendly).
   # shellcheck disable=SC2086
-  nvcc -O3 ${GENCODE} -std=c++17 -c "${ROOT}/src/gpu_prep.cu"
+  nvcc -O3 ${GENCODE} -std=c++17 -DKAN_NO_ASYNC_SEARCH -I"${ROOT}/src" -c "${ROOT}/src/gpu_prep.cu"
   TC_OBJ="tc_kernel.o gpu_prep.o"
 fi
 

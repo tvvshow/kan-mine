@@ -30,6 +30,7 @@
 //
 // Build: nvcc -O3 -arch=sm_86 -std=c++17 -c src/gpu_prep.cu -o build/gpu_prep.o
 #include <cuda_runtime.h>
+#include "platform.h"   // KAN_WEAK / KAN_NO_ASYNC_SEARCH
 #include <cstdint>
 #include <cstdio>
 
@@ -219,8 +220,11 @@ static bool ensure_prep_stream() {
 // Recorded by tc_search_launch right after the gather kernels (the last
 // READERS of dA/dBt for draw N). Phase1 orders its dA/dBt writes behind it so
 // prep(N+1) can run under search(N) without clobbering the gathers' input.
-// WEAK: harnesses that link gpu_prep without tc_cutlass_v2 still build.
-extern "C" void* tc_gather_done_event() __attribute__((weak));
+// Only tc_cutlass_v2 defines it; builds without the async split define
+// KAN_NO_ASYNC_SEARCH so the reference vanishes (no weak needed, which MSVC lacks).
+#ifndef KAN_NO_ASYNC_SEARCH
+extern "C" void* tc_gather_done_event() KAN_WEAK;
+#endif
 
 static bool ensure_prep_bufs(size_t max_chunks, int k) {
   if (g_prep.ok) return true;
@@ -265,10 +269,12 @@ extern "C" int gpu_prep_phase1(
   if (!ensure_prep_bufs(ach > bch ? ach : bch, k)) return -1;
   if (!ensure_prep_stream()) return -1;
   // Don't write dA/dBt until search(N)'s gathers have read them.
+#ifndef KAN_NO_ASYNC_SEARCH
   if (tc_gather_done_event) {
     cudaEvent_t ge = (cudaEvent_t)tc_gather_done_event();
     if (ge) cudaStreamWaitEvent(g_prep_stream, ge, 0);
   }
+#endif
 
   uint32_t kw[8];
   for (int i=0;i<8;i++)
