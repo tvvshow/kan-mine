@@ -40,7 +40,7 @@ static void log_line(const char* cat, const char* msg) {
   fprintf(stderr, "%02d:%02d:%02d  info   %-14s %s\n",
           lt->tm_hour, lt->tm_min, lt->tm_sec, cat, msg);
 }
-static void log_linef(const char* cat, const char* fmt, ...) __attribute__((format(printf,2,3)));
+static void log_linef(const char* cat, const char* fmt, ...) KAN_FORMAT_PRINTF(2,3);
 static void log_linef(const char* cat, const char* fmt, ...) {
   char buf[2048];
   va_list ap;

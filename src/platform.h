@@ -11,6 +11,18 @@
 #ifndef KAN_PLATFORM_H
 #define KAN_PLATFORM_H
 
+// Portable attribute macros. MSVC has no GNU weak and no format-checking attribute;
+// Linux/clang get the real ones. (The optional-link gpu_prep/tc_search_launch symbols
+// are additionally gated by compile-time flags KAN_HAS_ASYNC_SEARCH /
+// KAN_HAS_GATHER_EVENT so WMMA builds don't reference CUTLASS-only symbols at all.)
+#if defined(_WIN32)
+  #define KAN_WEAK
+  #define KAN_FORMAT_PRINTF(a,b)
+#else
+  #define KAN_WEAK              __attribute__((weak))
+  #define KAN_FORMAT_PRINTF(a,b) __attribute__((format(printf,a,b)))
+#endif
+
 #if defined(_WIN32)
 // ---------------------------------------------------------------------------
 // Windows
