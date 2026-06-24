@@ -11,19 +11,21 @@
 正式生产版本不能只围绕 RTX 3080 Ti 做单点优化。RTX 3080 Ti 只是
 `sm_86 / Ampere gaming` profile 的一个代表样本。
 
-项目正式生产目标应定义为逐步覆盖 NVIDIA Ampere / Ada / Hopper / Blackwell
-以及经实机验证的 Turing fallback。当前 production 推荐从 `sm_86` 起；`sm_75`
-(Turing / RTX 20 系) 在 generic fatbin 中保留用于兼容性试跑，但在缺少
-POSTCHECK + pool accepted 记录前只标为 experimental fallback。
+项目正式生产目标应定义为逐步覆盖 NVIDIA Ampere / Ada / Hopper / Blackwell。
+generic（CUTLASS）production 支持从 `sm_80` fatbin / `sm_86` tuned profile 起。
+`sm_75`(Turing / RTX 20 系) 的 generic CUTLASS 内核因 shared-memory 要求
+（需 ~89KB，Turing 每 block 上限 64KB）且无 cp.async 无法启动，改由专用 WMMA
+便携包 `kan-portable-linux-x64-sm75.tar.gz` 覆盖（tc_block，32KB 静态 shared
+memory，RTX 2080 Ti 实测 POSTCHECK ok=1，Candidate）。
 
-实际 production fatbin 从 `sm_75` 开始覆盖。Volta / `sm_70`
+generic（CUTLASS）fatbin 从 `sm_80` 开始覆盖。Volta / `sm_70`
 （V100/V100S）不是当前 production 目标；当前 Sm80 风格 int8 CUTLASS 内核
 不能用 V100S 作为生产验证依据。
 
 生产版本需要同时满足：
 
 ```text
-1. generic portable 包保证 NVIDIA Ampere/Ada/Hopper 以及部分 Turing fallback 可尝试运行；
+1. generic portable 包保证 NVIDIA Ampere/Ada/Hopper 以及 Blackwell PTX fallback 可尝试运行；
 2. tuned portable 包为已实测主力架构固化最优参数；
 3. 目标机器不现场编译，只下载对应 release 包运行；
 4. 每个 tuned profile 都有 benchmark / correctness / pool accepted 记录；
@@ -136,7 +138,7 @@ compute_90 PTX
 | 架构 | 代表 GPU | 当前定位 |
 |---|---|---|
 | `sm_70` | V100 / V100S / Volta | 不支持当前 release；需要单独 Volta kernel/profile |
-| `sm_75` | RTX 20 系 / Turing | generic experimental fallback，tuned profile 待测；缺少实机 accepted 前不承诺 production 支持 |
+| `sm_75` | RTX 20 系 / Turing | 专用 WMMA 包 `kan-portable-linux-x64-sm75.tar.gz`（Candidate）；generic CUTLASS 包无法在 Turing 启动 |
 | `sm_80` | A100 / Ampere datacenter | generic 兼容，tuned profile 待测 |
 | `sm_86` | RTX 30 系 / 3080 Ti / 3090 | tuned profile 已明确 |
 | `sm_89` | RTX 40 系 / Ada / L40 | generic 兼容，需整理 tuned profile |
@@ -204,19 +206,25 @@ kernel 微优化争取 1-3%
 状态：
 
 ```text
-generic 兼容目标；
-tuned profile 未完成。
+专用 WMMA 包支持（Candidate）。
+包名：kan-portable-linux-x64-sm75.tar.gz
+编译：ARCH=sm_75 KERNEL=wmma（强制 tc_block WMMA 内核）。
+generic CUTLASS 包无法在 Turing 启动（cp.async + ~89KB shared memory）。
 ```
 
-需要验证：
+已验证（2026-06-24，2x RTX 2080 Ti）：
 
 ```text
-1. CUTLASS path 是否稳定；
-2. real cfg 显存是否足够；
-3. POSTCHECK ok=1；
-4. pool accepted；
-5. 是否需要独立 GROUPM / TC_PERSIST；
-6. 是否存在性能过低但正确运行的情况。
+build OK，BUILD_KERNEL=wmma；POSTCHECK ok=1；run_test.sh SMOKE PASS；
+内核约 20 TH/s（低于 Ampere，属预期）。
+```
+
+仍需补齐：
+
+```text
+1. live pool accepted（Turing 实机）；
+2. 2 卡 fanout 稳定性；
+3. bench/results 正式记录。
 ```
 
 ### 4.3 sm_80 / A100 / Ampere datacenter
@@ -325,7 +333,7 @@ kan-portable-linux-x64.tar.gz
 
 ```text
 最大兼容；
-Ampere/Ada/Hopper 以及 Turing experimental fallback 可尝试运行；
+Ampere/Ada/Hopper 以及 Blackwell PTX fallback 可尝试运行；
 不承诺最优性能，未验证架构不承诺 production 支持。
 ```
 

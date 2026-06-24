@@ -12,7 +12,7 @@
 # Build host: any Linux + CUDA toolkit, NO GPU required (CUDA code compiles
 # GPU-less). Build on the OLDEST glibc you must support — the cnb runner
 # (ubuntu22.04, glibc 2.35) covers Ubuntu 22.04+ GPU containers. CUDA 12.4 nvcc
-# emits sm_75..sm_90 SASS + compute_90 PTX. Blackwell / sm_120 needs a CUDA 13
+# emits sm_80..sm_90 SASS + compute_90 PTX. Blackwell / sm_120 needs a CUDA 13
 # native package for best performance; CUDA 12 packages can only rely on PTX JIT.
 #
 # Usage:
@@ -372,6 +372,7 @@ stable_tar_alias: ${STABLE_TAR}
 with_ab: ${WITH_AB}
 portable: 1
 arch: ${ARCH:-portable-fatbin}
+kernel: $(cat "${ROOT}/build/BUILD_KERNEL" 2>/dev/null || echo unknown)
 groupm: ${GROUPM}
 kstages: ${KSTAGES}
 small_tile: ${EFFECTIVE_SMALL_TILE}
@@ -397,10 +398,9 @@ release_notes="${STAGE}/RELEASE_NOTES.txt"
   echo "----------------"
   case "${PACKAGE_FLAVOR:-generic}" in
     generic)
-      echo "Generic compatibility package for NVIDIA Ampere/Ada/Hopper plus experimental Turing fallback."
-      echo "Covers sm_75, sm_80, sm_86, sm_89, sm_90 SASS plus compute_90 PTX."
-      echo "Volta / sm_70 (V100/V100S) is not covered by this production package."
-      echo "Turing / sm_75 remains experimental until a real POSTCHECK + pool accepted record exists."
+      echo "Generic compatibility package for NVIDIA Ampere/Ada/Hopper plus Blackwell PTX fallback."
+      echo "Covers sm_80, sm_86, sm_89, sm_90 SASS plus compute_90 PTX."
+      echo "Volta / sm_70 (V100/V100S) is not covered. Turing / sm_75 (RTX 20) uses the separate sm75 WMMA package."
       echo "Use this when no validated tuned package exists for the target GPU."
       echo "This package prioritizes compatibility and does not promise per-architecture optimal performance."
       ;;
@@ -408,6 +408,15 @@ release_notes="${STAGE}/RELEASE_NOTES.txt"
       echo "Production recommended tuned package for sm_86 / RTX 3080 Ti / RTX 3090 class GPUs."
       echo "Compile-time profile: ARCH=sm_86 GROUPM=8 KSTAGES=3."
       echo "Runtime defaults: TC_PERSIST=0 and pool-mode auto-restart, unless explicitly overridden by the operator."
+      ;;
+    sm75)
+      echo "Turing / sm_75 (RTX 20 series) package. Ships the WMMA int8 kernel (tc_block),"
+      echo "NOT the Sm80 CUTLASS kernel: Turing has no cp.async and caps per-block shared memory"
+      echo "at 64KB, so the generic CUTLASS package (needs ~89KB) cannot launch on Turing. This"
+      echo "package uses the WMMA kernel (32KB static shared memory) and runs on RTX 20 / Titan RTX"
+      echo "/ Quadro RTX / T4 (all sm_75)."
+      echo "Compile-time profile: ARCH=sm_75 KERNEL=wmma (GROUPM/KSTAGES do not apply to the WMMA kernel)."
+      echo "Status: Candidate. Validated POSTCHECK ok=1 on RTX 2080 Ti; throughput is lower than Ampere+."
       ;;
     sm120-*)
       echo "Candidate tuned package for sm_120 / RTX 50 series / Blackwell GPUs."
@@ -494,10 +503,16 @@ NVIDIA driver. NO CUDA toolkit, NO CUTLASS, NO compiler needed on this machine.
 
 Package selection:
   kan-portable-linux-x64.tar.gz
-      Generic compatibility package for Ampere/Ada/Hopper plus experimental
-      Turing / sm_75 fallback. Volta / sm_70 (V100/V100S) is not covered.
-      Turing remains experimental until real POSTCHECK + pool accepted records exist.
+      Generic compatibility package for Ampere/Ada/Hopper plus Blackwell PTX fallback.
+      Volta / sm_70 (V100/V100S) is not covered. Turing / sm_75 uses the dedicated sm75
+      package below (the generic CUTLASS kernel cannot launch on Turing).
       Use it when no validated tuned package exists for the target GPU.
+
+  kan-portable-linux-x64-sm75.tar.gz
+      Turing / sm_75 (RTX 20 series / Titan RTX / Quadro RTX / T4) package.
+      Ships the WMMA int8 kernel (32KB static shared memory) because the Sm80 CUTLASS
+      kernel needs cp.async + ~89KB shared memory and cannot run on Turing.
+      Status: Candidate; POSTCHECK ok=1 on RTX 2080 Ti, lower throughput than Ampere+.
 
   kan-portable-linux-x64-sm86-g8.tar.gz
       Production tuned package for sm_86 / RTX 3080 Ti / RTX 3090 class GPUs.
@@ -537,11 +552,13 @@ Files:
   kan.logrotate       logrotate template used by install_service.sh
 
 GPU arch note:
-  CUDA 12.4 nvcc emits sm_75..sm_90 SASS + compute_90 PTX. Volta / sm_70
-  (V100/V100S) is not included in the production fatbin and is not a supported
-  production target. On Blackwell (RTX 50 series / sm_120) the driver can only
-  JIT the PTX fallback. For best Blackwell performance, use a future CUDA 13
-  native sm_120 package after it is validated and listed in GPU_PROFILES.md.
+  The generic fatbin emits sm_80..sm_90 SASS + compute_90 PTX. Volta / sm_70
+  (V100/V100S) is not a supported target. Turing / sm_75 (RTX 20 series) is NOT in
+  the generic fatbin (the CUTLASS kernel cannot launch on Turing) - use the dedicated
+  kan-portable-linux-x64-sm75.tar.gz WMMA package instead. On Blackwell (RTX 50
+  series / sm_120) the driver can only JIT the PTX fallback. For best Blackwell
+  performance, use a future CUDA 13 native sm_120 package after it is validated and
+  listed in GPU_PROFILES.md.
 
 Verify it's truly portable (should list only glibc + libcuda as external):
   ldd ./kan

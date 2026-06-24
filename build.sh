@@ -14,7 +14,7 @@
 # CUDA code COMPILES without a GPU present (only *running* kernels needs one), so
 # this build NEVER depends on nvidia-smi. Arch selection order:
 #   ARCH env override  >  nvidia-smi detection (only if a GPU is present)  >
-#   portable multi-arch fatbin (Turing..Hopper SASS + Hopper PTX for Blackwell JIT).
+#   portable multi-arch fatbin (Ampere..Hopper SASS + Hopper PTX for Blackwell JIT).
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
@@ -48,11 +48,12 @@ elif [ -z "${PORTABLE:-}" ] && command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 if [ -z "${GENCODE}" ]; then
-  # Portable fatbin: real SASS for Turing..Hopper + compute_90 PTX so the driver
+  # Portable fatbin: real SASS for Ampere..Hopper + compute_90 PTX so the driver
   # JITs to newer arches (e.g. Blackwell sm_120) at runtime. CUDA 12.4 nvcc tops
-  # out at sm_90, so sm_120 SASS is intentionally NOT emitted here.
-  GENCODE="-gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90,code=compute_90"
-  echo "arch: no GPU/override -> portable multi-arch fatbin (sm_75..sm_90 + PTX)"
+  # out at sm_90, so sm_120 SASS is intentionally NOT emitted here. Turing/sm_75
+  # is not shipped: current kernel needs more dynamic shared memory than Turing allows.
+  GENCODE="-gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90,code=compute_90"
+  echo "arch: no GPU/override -> portable multi-arch fatbin (sm_80..sm_90 + PTX)"
 fi
 
 BUILD="${ROOT}/build"; mkdir -p "${BUILD}"; cd "${BUILD}"
@@ -139,7 +140,30 @@ EXTRA_FLAGS=""
 # Arbitrary extra nvcc flags passthrough (A/B benchmarking + profiling switches),
 # e.g. NVCC_EXTRA="-DFOLD_RMW_ALWAYS" or "-DPROFILE_NOFOLD". Empty in production.
 EXTRA_FLAGS="${EXTRA_FLAGS} ${NVCC_EXTRA:-}"
-if [ -d "${CUTLASS_HOME}/include/cutlass" ]; then
+# Kernel selection. The production CUTLASS kernel (tc_cutlass_v2) is an Sm80 path:
+# it needs cp.async (sm_80+) and ~89 KB dynamic shared memory, so it CANNOT target
+# Turing/Volta — sm_75/sm_70 cap dynamic smem at 64 KB and have no cp.async. The
+# WMMA kernel (tc_block.cu: int8 16x16x16, 32 KB *static* smem, and
+# __pipeline_memcpy_async that degrades to a synchronous copy pre-sm_80) DOES run
+# on Turing sm_75. KERNEL picks the path:
+#   auto (default): pre-Ampere ARCH (sm_70/72/75) -> wmma;
+#                   else cutlass if headers present, else wmma fallback
+#   wmma          : force tc_block (the only Turing/sm_75-capable int8 path)
+#   cutlass       : force tc_cutlass_v2 (auto-downgrades to wmma if headers absent)
+KERNEL="${KERNEL:-auto}"
+if [ "${KERNEL}" = "auto" ]; then
+  case "${ARCH:-}" in
+    sm_70|sm_72|sm_75) KERNEL=wmma ;;
+    *) if [ -d "${CUTLASS_HOME}/include/cutlass" ]; then KERNEL=cutlass; else KERNEL=wmma; fi ;;
+  esac
+fi
+if [ "${KERNEL}" = "cutlass" ] && [ ! -d "${CUTLASS_HOME}/include/cutlass" ]; then
+  echo "  WARNING: KERNEL=cutlass but CUTLASS headers not at ${CUTLASS_HOME} -> wmma fallback"
+  KERNEL=wmma
+fi
+echo "${KERNEL}" > "${BUILD}/BUILD_KERNEL"   # packaging reads this for BUILD_INFO
+
+if [ "${KERNEL}" = "cutlass" ]; then
   echo "  CUTLASS at ${CUTLASS_HOME} -> tc_cutlass_v2 (GROUPM=${GROUPM} KSTAGES=${KSTAGES}${SMALL_TILE:+ SMALL_TILE}) + gpu_prep [LIVE 102+ TH/s]"
   echo "  (persistent grid is the DEFAULT now; disable at runtime with TC_PERSIST=0 ./build/kan ...)"
   # shellcheck disable=SC2086
@@ -148,9 +172,15 @@ if [ -d "${CUTLASS_HOME}/include/cutlass" ]; then
   nvcc -O3 ${GENCODE} -std=c++17 -c "${ROOT}/src/gpu_prep.cu"
   TC_OBJ="tc_kernel.o gpu_prep.o"
 else
-  echo "  WARNING: CUTLASS not found (set CUTLASS_HOME or clone to ~/cutlass:"
-  echo "           git clone --depth 1 -b v3.5.1 https://github.com/NVIDIA/cutlass ~/cutlass)"
-  echo "           -> falling back to tc_block (WMMA, ~30 TH/s, CPU draw pipeline)"
+  # WMMA path: the Turing/sm_75-capable int8 kernel. Also the fallback when CUTLASS
+  # headers are missing on any arch. No gpu_prep -> CPU draw pipeline (weak-ref
+  # fallback in plainproof_gen). ~30 TH/s on Ampere; Turing is lower but RUNS.
+  if [ ! -d "${CUTLASS_HOME}/include/cutlass" ] && [ -z "${ARCH:-}" ]; then
+    echo "  WARNING: CUTLASS not found (set CUTLASS_HOME or clone to ~/cutlass:"
+    echo "           git clone --depth 1 -b v3.5.1 https://github.com/NVIDIA/cutlass ~/cutlass)"
+  fi
+  echo "  WMMA kernel -> tc_block.cu (int8 16x16x16, 32 KB static smem, CPU draw pipeline)"
+  echo "  (this is the Turing/sm_75-capable path; the CUTLASS Sm80 kernel cannot run on sm_75)"
   # shellcheck disable=SC2086
   nvcc -O3 ${GENCODE} -std=c++17 -c "${ROOT}/src/tc_block.cu" -o tc_kernel.o
   TC_OBJ="tc_kernel.o"

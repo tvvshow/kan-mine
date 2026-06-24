@@ -5,7 +5,7 @@
 #   main / push      -> FREE GPU-less runner. CUDA compiles without a GPU and the
 #                       solver's reference path runs on CPU, so every commit is fully
 #                       built AND correctness-verified at zero GPU cost:
-#                         build      -> portable multi-arch fatbin (sm_75 experimental fallback, sm_80..sm_90 SASS + PTX)
+#                         build      -> portable multi-arch fatbin (sm_80..sm_90 SASS + PTX)
 #                         cpu-verify -> reference jackpot search -> oracle-shaped PlainProof
 #
 #   <tag> / tag_push -> build the "download & run" portable packages and publish
@@ -106,7 +106,7 @@ $:
           # versioned dist/kan-portable-linux-x64-<tag>.tar.gz. Static cudart +
           # bundled libs + multi-arch fatbin. WITH_AB=0 ships a clean miner
           # (no RMW A/B baseline binary). This is the compatibility-first
-          # package for Ampere/Ada/Hopper plus experimental Turing fallback; it does not
+          # package for Ampere/Ada/Hopper plus Blackwell PTX fallback; it does not
           # promise per-architecture optimal performance.
           script: WITH_AB=0 bash package_portable.sh
         - name: package-sm86-ampere
@@ -114,8 +114,15 @@ $:
           # (RTX 3080Ti/3090 class). Keep this as the only sm_86 default release
           # package unless GPU_PROFILES.md is updated with new verified data.
           script: WITH_AB=0 ARCH=sm_86 GROUPM=8 KSTAGES=3 PACKAGE_FLAVOR=sm86-g8 bash package_portable.sh
+        - name: package-sm75-turing
+          # Turing / sm_75 (RTX 20 series) package. The generic CUTLASS kernel cannot
+          # run on Turing (no cp.async; per-block shared memory caps at 64KB while the
+          # CUTLASS kernel needs ~89KB), so this flavor forces the WMMA kernel
+          # (tc_block.cu, 32KB static shared memory) via KERNEL=wmma. Validated
+          # POSTCHECK ok=1 on RTX 2080 Ti. Status: Candidate.
+          script: WITH_AB=0 ARCH=sm_75 KERNEL=wmma PACKAGE_FLAVOR=sm75 bash package_portable.sh
         - name: checksums
-          script: cp install_kan.sh dist/install_kan.sh && (cd dist && sha256sum kan-portable-linux-x64.tar.gz kan-portable-linux-x64-sm86-g8.tar.gz install_kan.sh > SHA256SUMS)
+          script: cp install_kan.sh dist/install_kan.sh && (cd dist && sha256sum kan-portable-linux-x64.tar.gz kan-portable-linux-x64-sm75.tar.gz kan-portable-linux-x64-sm86-g8.tar.gz install_kan.sh > SHA256SUMS)
         - name: create-release
           # built-in task; title defaults to the tag name, tag auto-taken from tag_push.
           type: git:release
@@ -127,6 +134,7 @@ $:
           settings:
             attachments:
               - dist/kan-portable-linux-x64.tar.gz
+              - dist/kan-portable-linux-x64-sm75.tar.gz
               - dist/kan-portable-linux-x64-sm86-g8.tar.gz
               - dist/SHA256SUMS
               - install_kan.sh

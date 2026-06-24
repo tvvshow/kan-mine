@@ -37,7 +37,7 @@
 
 | 项目 | 要求 |
 |------|------|
-| **GPU** | NVIDIA Ampere / RTX 30 系及以上为当前 production 推荐；Turing / RTX 20 系 (`sm_75`) 仅保留 generic experimental fallback，需实机验证 |
+| **GPU** | NVIDIA Ampere / RTX 30 系及以上为主力 production 支持范围；Turing / RTX 20 系 (`sm_75`) 通过专用 WMMA 便携包支持（实测 POSTCHECK ok=1，算力低于 Ampere+） |
 | **显存** | ≥ 4 GB（实配使用约 2 GB） |
 | **CUDA** | 12.x（已在 12.8 上测试通过） |
 | **系统** | Linux x86_64（已在 Ubuntu 22.04 上测试通过） |
@@ -51,7 +51,7 @@
 | GPU / 架构 | 当前 release 定位 | 推荐包 |
 |-----|------|------|
 | V100 / V100S / `sm_70` | **不属于当前 production 支持范围**；portable 包不含 `sm_70` SASS/PTX | 不推荐 / 不支持 |
-| RTX 20 系 / `sm_75` | **experimental fallback**；generic fatbin 含 `sm_75`，但当前没有 production accepted 记录，部分 Turing 机器可能因 shared-memory 限制失败 | 可尝试 `kan-portable-linux-x64.tar.gz`，失败则视为暂不支持 |
+| RTX 20 系 / `sm_75` | **专用 WMMA 包支持**（generic CUTLASS 包无法在 Turing 启动：需 cp.async + ~89KB 共享内存）；RTX 2080 Ti 实测 POSTCHECK ok=1，Candidate | `kan-portable-linux-x64-sm75.tar.gz` |
 | A100 / `sm_80` | generic 兼容目标；tuned profile 待测 | `kan-portable-linux-x64.tar.gz` |
 | RTX 3080 Ti / RTX 3090 / `sm_86` | 已实测 production tuned profile | `kan-portable-linux-x64-sm86-g8.tar.gz` |
 | RTX 4090 / L40 / `sm_89` | generic 兼容；历史数据待整理成正式 profile | `kan-portable-linux-x64.tar.gz` |
@@ -104,8 +104,13 @@ export CUTLASS_HOME=~/cutlass
 ```text
 kan-portable-linux-x64.tar.gz
   generic compatibility package
-  面向 NVIDIA Ampere / Ada / Hopper 以及部分 Turing fallback；
-  能运行优先，不承诺单架构最优性能，`sm_75` 当前为 experimental。
+  面向 NVIDIA Ampere / Ada / Hopper 以及 Blackwell PTX fallback；
+  能运行优先，不承诺单架构最优性能，不包含 `sm_75`。
+
+kan-portable-linux-x64-sm75.tar.gz
+  Turing / sm_75（RTX 20 系 / Titan RTX / Quadro RTX / T4）专用包
+  使用 WMMA int8 内核（32KB 静态共享内存），因为 Sm80 CUTLASS 内核需要
+  cp.async + ~89KB 共享内存，无法在 Turing 启动；Candidate，算力低于 Ampere+。
 
 kan-portable-linux-x64-sm86-g8.tar.gz
   tuned production package

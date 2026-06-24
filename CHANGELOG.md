@@ -6,6 +6,33 @@ pool accepted 的实验不标记为 production recommended。
 
 ---
 
+## v1.2.20 — Turing / sm_75 support via WMMA flavor
+
+状态：待 Linux/CUDA release workflow 构建与 Turing 实机 pool 验证后发布。
+
+### GPU support
+
+- **新增 Turing / `sm_75`（RTX 20 系）支持**：通过专用便携包
+  `kan-portable-linux-x64-sm75.tar.gz`。generic（CUTLASS）包仍无法在 Turing 启动
+  —— Sm80 内核需要 cp.async（sm_80+）和 ~89KB dynamic shared memory，而 Turing
+  每 block 上限 64KB 且没有 cp.async。sm75 包改用 WMMA 内核 `tc_block.cu`
+  （int8 16x16x16，32KB **静态** shared memory，`__pipeline_memcpy_async` 在
+  sm_75 上自动降级为同步拷贝），可在 RTX 20 / Titan RTX / Quadro RTX / T4 运行。
+- `build.sh` 新增 `KERNEL` 开关（auto/wmma/cutlass）：`ARCH=sm_75` 自动选 WMMA；
+  `KERNEL=wmma` 即使存在 CUTLASS 头也强制 tc_block。构建写出 `build/BUILD_KERNEL`，
+  打包记入 `BUILD_INFO.txt` 的 `kernel:` 字段。
+- `install_kan.sh` 选包：`sm_75 -> kan-portable-linux-x64-sm75.tar.gz`，新增
+  `--force-sm75`。`.cnb.yml` release matrix 增加 `package-sm75-turing` 构建阶段与
+  附件、SHA256SUMS。
+- 状态：**Candidate**。RTX 2080 Ti 实测 `ARCH=sm_75 KERNEL=wmma` 构建 +
+  `run_test.sh` real-cfg POSTCHECK ok=1、emitted proof（与 Ampere 同尺寸）；
+  内核约 20 TH/s，明显低于 Ampere+，属预期。live pool accepted / 多卡长稳 / 正式
+  `bench/results` 记录待补。
+- GTX 10 系 / Pascal（`sm_60`/`sm_61`）无 int8 Tensor Core，需要 DP4A 路径，列入
+  后续优化，本版本不含。
+
+---
+
 ## v1.2.19 — operator polish / checksum / service candidate
 
 状态：待 Linux/CUDA release workflow 构建与 GPU L2 验证后发布。
@@ -25,9 +52,9 @@ pool accepted 的实验不标记为 production recommended。
 
 ### GPU support wording
 
-- 将 `sm_75` / Turing 从“production compatibility”降级为
-  **experimental fallback**：generic fatbin 仍包含 `sm_75`，但在缺少
-  POSTCHECK + pool accepted 实机记录前，不再承诺 production 支持。
+- 将 `sm_75` / Turing 从“production compatibility”改为
+  **unsupported in current production package**：RTX 2080 Ti 实测当前内核因
+  shared-memory 要求 kernel launch 失败；generic fatbin 不再包含 `sm_75`。
 
 ---
 
@@ -81,9 +108,8 @@ pool accepted 的实验不标记为 production recommended。
   - generic compatibility package；
   - `sm86-g8` production tuned package；
   - RTX 5090 / `sm_120` CUDA 12 generic PTX fallback baseline。
-- 文档按实际 fatbin/kernel 修正硬件范围：Volta / `sm_70` 不属于当前支持范围；
-  `sm_75` / Turing 仅作为 generic experimental fallback，正式 production 推荐从
-  已验证的 `sm_86` tuned package 起。
+- 文档按实际 fatbin/kernel 修正硬件范围：Volta / `sm_70` 与 Turing / `sm_75`
+  不属于当前支持范围；正式 production 推荐从已验证的 `sm_86` tuned package 起。
 - RTX 5090 / `sm_120` 不自动选择 tuned 包；CUDA 13 native `sm_120` package
   只有在完成 POSTCHECK、controlled benchmark、live pool accepted 和稳定性验证后
   才能升级为 production recommended。

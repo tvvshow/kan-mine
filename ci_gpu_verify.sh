@@ -53,8 +53,17 @@ SM="sm_${CAP}"
 echo "Detected GPU: ${GPU_NAME:-unknown} / ${SM}"
 
 case "${SM}" in
-  sm_75|sm_80|sm_86|sm_89|sm_90)
+  sm_80|sm_86|sm_89|sm_90)
     echo "GPU is within CUDA 12 production fatbin coverage."
+    ;;
+  sm_75)
+    # The generic CUTLASS production package this script verifies does NOT cover
+    # Turing: the Sm80 kernel needs cp.async and ~89 KB dynamic shared memory, and
+    # build.sh's auto path would select CUTLASS here and fail to compile/launch on
+    # sm_75. Turing IS supported, but via the SEPARATE WMMA "sm75" flavor package
+    # (ARCH=sm_75 KERNEL=wmma PACKAGE_FLAVOR=sm75), validated independently on
+    # 2x RTX 2080 Ti. This generic GPU-verify path therefore does not apply to Turing.
+    fail "sm_75 / Turing: build+verify the dedicated WMMA sm75 flavor package instead; the generic CUTLASS verify does not run on Turing"
     ;;
   sm_120)
     echo "GPU is sm_120; CUDA 12 package will validate compute_90 PTX JIT fallback only."

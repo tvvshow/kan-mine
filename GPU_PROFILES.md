@@ -10,14 +10,17 @@
 
 本文件定义 `peral/` 正式生产版本的 GPU profile 体系。
 
-正式目标是逐步覆盖 NVIDIA Ampere / Ada / Hopper / Blackwell 以及经验证的 Turing
-fallback，而不是只支持 RTX 3080 Ti。当前 production 推荐从 `sm_86` 开始；`sm_75`
-(Turing / RTX 20 系) 保留在 generic fatbin 中用于兼容性试跑，但在缺少实机
-POSTCHECK + pool accepted 记录前只能标为 experimental fallback。
+正式目标是逐步覆盖 NVIDIA Ampere / Ada / Hopper / Blackwell，而不是只支持
+RTX 3080 Ti。当前 generic（CUTLASS）production 支持从 `sm_80` fatbin / `sm_86`
+tuned profile 起。`sm_75`（Turing / RTX 20 系）的 generic CUTLASS 内核因需要
+cp.async + ~89KB shared-memory（Turing 每 block 上限 64KB）无法启动，但通过
+**专用 WMMA 便携包** `kan-portable-linux-x64-sm75.tar.gz` 支持（tc_block，32KB
+静态 shared memory，RTX 2080 Ti 实测 POSTCHECK ok=1，Candidate，算力低于 Ampere+）。
 
-当前 production release 的实际 CUDA fatbin 从 `sm_75` 开始。Volta / `sm_70`
-（V100/V100S）不在当前 production 支持范围内；不要把“有 Tensor Core”误解为
-可以运行本项目的 Sm80 风格 int8 CUTLASS 生产内核。
+generic（CUTLASS）fatbin 的实际 SASS 从 `sm_80` 开始。Volta / `sm_70`
+（V100/V100S）没有 int8 Tensor-Core 路径，不在当前支持范围内；不要把“有 Tensor
+Core”误解为可以运行本项目的 Sm80 风格 int8 CUTLASS 生产内核。Turing / `sm_75`
+有 int8 Tensor Core，用上面的 WMMA 专用包，而不是 generic 包。
 
 生产发布必须同时区分：
 
@@ -150,16 +153,15 @@ kan-portable-linux-x64.tar.gz
 定位：
 
 ```text
-NVIDIA Ampere / Ada / Hopper 以及部分 Turing fallback 的兼容包；
+NVIDIA Ampere / Ada / Hopper 以及 Blackwell PTX fallback 的兼容包；
 能运行优先；
 不承诺最优性能；
-`sm_75` 在获得正式实机记录前属于 experimental fallback。
+不包含 `sm_75` / Turing。
 ```
 
 当前 generic 覆盖目标：
 
 ```text
-sm_75
 sm_80
 sm_86
 sm_89
@@ -229,8 +231,8 @@ Not recommended for production
 | Arch | 代表 GPU | 推荐 package | 编译 ARCH | GROUPM | KSTAGES | 默认 TC_PERSIST | 状态 | 备注 |
 |---|---|---|---|---:|---:|---:|---|---|
 | `sm_70` | V100 / V100S / Volta | 不支持当前 release | N/A | N/A | N/A | N/A | 不支持 | portable fatbin 不含 `sm_70`；生产内核不是 Volta 路径 |
-| `generic` | Ampere/Ada/Hopper + Turing experimental fallback | `kan-portable-linux-x64.tar.gz` | multi-arch fatbin | build default / generic | 3 | package default | 生产兼容包；sm75 experimental | 能跑优先，不承诺最优 |
-| `sm_75` | RTX 20 系 / Turing | generic experimental fallback；tuned TBD | `sm_75` | TBD | 3 | TBD | **未验证 / 可能不支持** | 需要兼容性、正确性、pool accepted 验证；若 shared-memory 超限则视为 unsupported |
+| `generic` | Ampere/Ada/Hopper + Blackwell PTX fallback | `kan-portable-linux-x64.tar.gz` | multi-arch fatbin | build default / generic | 3 | package default | 生产兼容包 | 能跑优先，不承诺最优 |
+| `sm_75` | RTX 20 系 / Turing | `kan-portable-linux-x64-sm75.tar.gz` | `sm_75` | N/A (WMMA) | N/A (WMMA) | N/A | Candidate | WMMA int8 内核专用包；generic CUTLASS 包因 cp.async + ~89KB shared memory 无法在 Turing 启动；RTX 2080 Ti 实测 POSTCHECK ok=1 |
 | `sm_80` | A100 / Ampere datacenter | generic；tuned TBD | `sm_80` | TBD | 3 | TBD | 待测 | 不可直接套用 sm_86 参数 |
 | `sm_86` | RTX 30 系 / RTX 3080 Ti / RTX 3090 | `kan-portable-linux-x64-sm86-g8.tar.gz` | `sm_86` | 8 | 3 | 0 | 已实测；生产推荐 | 当前唯一明确 production tuned profile |
 | `sm_89` | RTX 40 系 / RTX 4090 / L40 / Ada | generic；tuned TBD | `sm_89` | TBD | 3 | TBD | 需整理历史数据 | 4090 kernel 强但 wall gap 明显；L40 persistent 可能有正收益 |
@@ -371,29 +373,44 @@ official verifier / pool accepted 和长时间稳定性验证。
 当前定位：
 
 ```text
-generic 兼容目标；
-tuned profile 未完成。
+专用 WMMA 便携包支持；状态 Candidate。
+推荐包：kan-portable-linux-x64-sm75.tar.gz
 ```
 
-推荐当前部署：
+为什么不能用 generic 包：
 
 ```text
-优先使用 kan-portable-linux-x64.tar.gz；
-不要发布 production tuned 包，直到 benchmark / correctness / pool accepted 完成。
+generic 包的 tc_cutlass_v2 是 Sm80 路径，需要 cp.async（sm_80+）和
+~89KB 动态 shared memory；Turing 每 block 上限 64KB 且没有 cp.async，
+所以 generic CUTLASS 内核在 Turing 上 kernel launch 失败。
 ```
 
-需验证：
+WMMA 包如何工作：
 
 ```text
-1. CUTLASS path 是否稳定；
-2. real cfg 显存是否足够；
-3. POSTCHECK ok=1；
-4. pool accepted；
-5. rejected 是否异常；
-6. GROUPM 最优值；
-7. KSTAGES=3 是否稳定；
-8. TC_PERSIST 默认值；
-9. 长时间运行稳定性。
+ARCH=sm_75 KERNEL=wmma 强制链接 tc_block.cu（WMMA int8 16x16x16）：
+- WMMA int8 16x16x16 是 Turing 原生支持；
+- __pipeline_memcpy_async 在 sm_75 上自动降级为同步拷贝；
+- 仅用 32KB 静态 shared memory，无需 dynamic-smem opt-in。
+GROUPM / KSTAGES 不作用于 WMMA 内核。
+```
+
+已验证（2026-06-24，2x RTX 2080 Ti）：
+
+```text
+build OK, BUILD_KERNEL=wmma;
+tc(block) 约 20 TH/s 内核；
+MINE WIN draw=1, POSTCHECK ok=1, proof 与 Ampere 同尺寸；
+run_test.sh SMOKE PASS。
+```
+
+仍需补齐：
+
+```text
+1. live pool accepted（Turing 实机）；
+2. 2 卡 fanout 长时间稳定性；
+3. bench/results 正式记录；
+4. 与 Ampere 的算力对比说明（Turing 明显更低，属预期）。
 ```
 
 ### 6.2 `sm_80` / A100 / Ampere datacenter
@@ -565,7 +582,11 @@ case "$SM" in
     # tuned profile 未正式发布前必须 fallback generic
     pkg="kan-portable-linux-x64.tar.gz"
     ;;
-  sm_75|sm_80|sm_90)
+  sm_75)
+    # Turing uses the dedicated WMMA package (generic CUTLASS cannot launch on Turing).
+    pkg="kan-portable-linux-x64-sm75.tar.gz"
+    ;;
+  sm_80|sm_90)
     pkg="kan-portable-linux-x64.tar.gz"
     ;;
   sm_120)
@@ -720,7 +741,7 @@ RELEASE_NOTES 明确适用 GPU 与限制
 ```text
 generic: Generic compatible
 sm_86 / sm86-g8: Production recommended
-sm_75: TBD
+sm_75 / sm75: Candidate (WMMA package kan-portable-linux-x64-sm75.tar.gz)
 sm_80: TBD
 sm_89: TBD / historical data needs consolidation
 sm_90: TBD

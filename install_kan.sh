@@ -42,6 +42,7 @@ Options:
   --repo-url URL            CNB repository URL
   --force-generic           Install kan-portable-linux-x64.tar.gz
   --force-sm86-g8           Install kan-portable-linux-x64-sm86-g8.tar.gz
+  --force-sm75              Install kan-portable-linux-x64-sm75.tar.gz (Turing WMMA)
   --force-package FILE      Install an explicit package file from the release
   --gpu-sm sm_86            Override GPU compute capability detection
   --dry-run                 Print selection only; do not download/install
@@ -65,6 +66,7 @@ while [ "$#" -gt 0 ]; do
     --repo-url=*) REPO_URL="${1#*=}"; shift ;;
     --force-generic) FORCE_PKG="kan-portable-linux-x64.tar.gz"; shift ;;
     --force-sm86-g8) FORCE_PKG="kan-portable-linux-x64-sm86-g8.tar.gz"; shift ;;
+    --force-sm75) FORCE_PKG="kan-portable-linux-x64-sm75.tar.gz"; shift ;;
     --force-package) FORCE_PKG="$2"; shift 2 ;;
     --force-package=*) FORCE_PKG="${1#*=}"; shift ;;
     --gpu-sm) GPU_SM_OVERRIDE="$2"; shift 2 ;;
@@ -159,8 +161,14 @@ select_pkg() {
     sm_86)
       echo "kan-portable-linux-x64-sm86-g8.tar.gz"
       ;;
-    sm_75|sm_80|sm_89|sm_90|sm_120)
+    sm_75)
+      echo "kan-portable-linux-x64-sm75.tar.gz"
+      ;;
+    sm_80|sm_89|sm_90|sm_120)
       echo "kan-portable-linux-x64.tar.gz"
+      ;;
+    sm_70)
+      echo "unsupported"
       ;;
     *)
       echo "kan-portable-linux-x64.tar.gz"
@@ -219,15 +227,24 @@ main() {
     sm_70)
       echo
       echo "WARNING: sm_70 / Volta (V100/V100S) is not supported by current production packages." >&2
-      echo "         The portable fatbin starts at sm_75; generic fallback is not expected to run." >&2
+      echo "         Use --force-package only for manual experiments." >&2
       ;;
     sm_75)
       echo
-      echo "WARNING: sm_75 / Turing is treated as experimental until a real GPU L3 record exists." >&2
-      echo "         If the generic package fails on this GPU, report it as unsupported for now." >&2
+      echo "NOTE: sm_75 / Turing (RTX 20) uses the dedicated WMMA package" >&2
+      echo "      kan-portable-linux-x64-sm75.tar.gz. The generic CUTLASS package cannot run on" >&2
+      echo "      Turing (needs cp.async + ~89KB shared memory); the sm75 package ships the WMMA" >&2
+      echo "      kernel instead (32KB static shared memory). Validated POSTCHECK ok=1 on RTX" >&2
+      echo "      2080 Ti; throughput is lower than Ampere+. Status: Candidate." >&2
       ;;
   esac
   echo
+
+  if [ "${pkg}" = "unsupported" ]; then
+    echo "ERROR: ${sm:-unknown} is unsupported by the current production packages." >&2
+    echo "       Override with --force-package only if you are intentionally testing." >&2
+    exit 3
+  fi
 
   if [ "${DRY_RUN}" = "1" ]; then
     echo "DRY_RUN=1: selection complete; not downloading or installing."

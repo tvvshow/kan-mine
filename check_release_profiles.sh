@@ -35,6 +35,7 @@ assert_release_attachments_exact() {
   local expected actual
   expected="$(cat <<'EOF'
 dist/SHA256SUMS
+dist/kan-portable-linux-x64-sm75.tar.gz
 dist/kan-portable-linux-x64-sm86-g8.tar.gz
 dist/kan-portable-linux-x64.tar.gz
 install_kan.sh
@@ -70,7 +71,7 @@ EOF
 dry_pkg() {
   local sm="$1"
   DRY_RUN=1 GPU_SM_OVERRIDE="$sm" VERSION=vCHECK bash ./install_kan.sh \
-    2>/dev/null | awk -F':  +' '/^package:/ {print $2; exit}'
+    2>/dev/null | awk -F':  +' '/^package:/ {print $2; exit}' || true
 }
 
 echo "=== release profile static checks ==="
@@ -99,7 +100,10 @@ bash -n install_service.sh
 
 echo "[2/6] release matrix assets"
 expect_contains ".cnb.yml" "dist/kan-portable-linux-x64.tar.gz"
+expect_contains ".cnb.yml" "dist/kan-portable-linux-x64-sm75.tar.gz"
 expect_contains ".cnb.yml" "dist/kan-portable-linux-x64-sm86-g8.tar.gz"
+expect_contains ".cnb.yml" "package-sm75-turing"
+expect_contains ".cnb.yml" "ARCH=sm_75 KERNEL=wmma PACKAGE_FLAVOR=sm75"
 expect_contains ".cnb.yml" "dist/SHA256SUMS"
 expect_contains ".cnb.yml" "cd dist && sha256sum kan-portable-linux-x64.tar.gz"
 expect_contains ".cnb.yml" "install_kan.sh > SHA256SUMS"
@@ -130,10 +134,16 @@ expect_contains "README.md" "sm_70"
 expect_contains "GPU_PROFILES.md" "async share submit"
 expect_contains "GPU_PROFILES.md" "stale proof early-abort"
 expect_contains "README.md" "sm_75"
-expect_contains "README.md" "experimental fallback"
-expect_contains "GPU_PROFILES.md" "sm75 experimental"
-expect_contains "PRODUCTION_GPU_SUPPORT_PLAN.md" "experimental fallback"
-expect_contains "PRODUCTION_GPU_SUPPORT_PLAN.md" "不承诺 production 支持"
+expect_contains "README.md" "不支持"
+expect_contains "GPU_PROFILES.md" "sm_75"
+# sm_70 / Volta stays unsupported; sm_75 / Turing is now a supported WMMA flavor.
+expect_contains "GPU_PROFILES.md" "不支持当前 release"
+expect_contains "GPU_PROFILES.md" "kan-portable-linux-x64-sm75.tar.gz"
+expect_contains "install_kan.sh" "kan-portable-linux-x64-sm75.tar.gz"
+expect_contains "package_portable.sh" "kan-portable-linux-x64-sm75.tar.gz"
+expect_contains "build.sh" "KERNEL"
+expect_contains "PRODUCTION_GPU_SUPPORT_PLAN.md" "不支持当前 release"
+expect_contains "PRODUCTION_GPU_SUPPORT_PLAN.md" "shared-memory"
 expect_contains "GPU_PROFILES.md" "shared-memory"
 expect_contains "GPU_PROFILES.md" 'Volta / `sm_70`'
 expect_contains ".cnb.yml" "web_trigger_gpu_verify"
@@ -144,8 +154,8 @@ expect_not_contains "src/miner_main.cpp" "prl1patz"
 expect_not_contains "package_portable.sh" "prl1patz"
 
 echo "[4/6] install_kan selection matrix"
-[ "$(dry_pkg sm_75)" = "kan-portable-linux-x64.tar.gz" ] || fail "sm_75 should fallback generic"
-[ "$(dry_pkg sm_70)" = "kan-portable-linux-x64.tar.gz" ] || fail "sm_70 should select generic but remain unsupported"
+[ "$(dry_pkg sm_75)" = "kan-portable-linux-x64-sm75.tar.gz" ] || fail "sm_75 should select the sm75 WMMA package"
+[ "$(dry_pkg sm_70)" = "unsupported" ] || fail "sm_70 should be unsupported"
 [ "$(dry_pkg sm_80)" = "kan-portable-linux-x64.tar.gz" ] || fail "sm_80 should fallback generic"
 [ "$(dry_pkg sm_86)" = "kan-portable-linux-x64-sm86-g8.tar.gz" ] || fail "sm_86 should select sm86-g8"
 [ "$(dry_pkg sm_89)" = "kan-portable-linux-x64.tar.gz" ] || fail "sm_89 should fallback generic"
