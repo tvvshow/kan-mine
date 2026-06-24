@@ -11,7 +11,6 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
-#include <dlfcn.h>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -19,18 +18,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-#include <fcntl.h>
-#include <termios.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <dirent.h>
-#include <sys/stat.h>
+#include "platform.h"   // cross-platform shim (POSIX headers / Win32 winsock + shims)
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <cuda_runtime.h>
@@ -66,7 +54,7 @@ static void log_linef(const char* cat, const char* fmt, ...) {
 // NVML (via dlopen for optional HW monitoring)
 // ===========================================================================
 struct NVML {
-  void* lib = nullptr;
+  kan_dl_t lib = nullptr;
   int (*Init)() = nullptr;
   int (*DeviceGetCount)(unsigned*) = nullptr;
   int (*DeviceGetHandleByIndex)(unsigned, void**) = nullptr;
@@ -79,9 +67,9 @@ struct NVML {
   int (*DeviceGetPciInfo)(void*, void*) = nullptr;
   bool ok = false;
   bool init() {
-    lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+    lib = kan_dlopen_nvml();
     if (!lib) return false;
-#define LD(name) name = (decltype(name))dlsym(lib, "nvml" #name)
+#define LD(name) name = (decltype(name))kan_dlsym(lib, "nvml" #name)
     LD(Init); LD(DeviceGetCount); LD(DeviceGetHandleByIndex); LD(DeviceGetName);
     LD(DeviceGetMemoryInfo); LD(DeviceGetTemperature); LD(DeviceGetFanSpeed);
     LD(DeviceGetPowerUsage); LD(DeviceGetCudaComputeCapability); LD(DeviceGetPciInfo);
@@ -1319,6 +1307,7 @@ static int run_pool_parent_multigpu(char** argv, const PoolOpts& base,
 }
 
 int main(int argc, char** argv) {
+  kan_net_init();   // Winsock startup on Windows; no-op on POSIX
   normalize_cuda_device_order();
   if (argc < 2) { usage(); return 2; }
   bool pool = false, solo = false;
