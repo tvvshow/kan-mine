@@ -7,3 +7,8 @@ __pycache__/
 *.pyc
 *.b64
 *.log
+
+# Windows build artifacts
+*.obj
+*.exe
+build_windows.ps1

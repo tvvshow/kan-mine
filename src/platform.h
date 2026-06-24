@@ -67,6 +67,50 @@ typedef long long ssize_t;
 #define getpid _getpid
 #endif
 
+// MSVC setsockopt takes `const char*` for optval; the miner passes `int*`
+// (TCP_NODELAY / SO_REUSEADDR). Wrap it so the int-based call sites compile
+// unchanged on both platforms.
+#define setsockopt(s, lvl, opt, val, len) \
+  setsockopt((s), (lvl), (opt), (const char*)(val), (len))
+
+// Minimal POSIX dirent shim over the Win32 FindFirstFile API. The miner only
+// enumerates one flat directory (the per-lane API dir) reading file names, so a
+// thin wrapper covering opendir/readdir/closedir + d_name is enough. On Windows
+// v1 (single-GPU) this dir holds at most one gpu*.json, but the code path must
+// still compile and behave correctly.
+#include <string>
+struct dirent { char d_name[260]; };
+struct DIR {
+  HANDLE h = INVALID_HANDLE_VALUE;
+  WIN32_FIND_DATAA fd{};
+  bool first = true;
+  dirent ent{};
+};
+static inline DIR* opendir(const char* path) {
+  std::string pat = std::string(path) + "\\*";
+  DIR* d = new DIR();
+  d->h = FindFirstFileA(pat.c_str(), &d->fd);
+  if (d->h == INVALID_HANDLE_VALUE) { delete d; return nullptr; }
+  return d;
+}
+static inline struct dirent* readdir(DIR* d) {
+  if (!d) return nullptr;
+  if (!d->first) {
+    if (!FindNextFileA(d->h, &d->fd)) return nullptr;
+  }
+  d->first = false;
+  size_t n = sizeof(d->ent.d_name) - 1;
+  strncpy(d->ent.d_name, d->fd.cFileName, n);
+  d->ent.d_name[n] = 0;
+  return &d->ent;
+}
+static inline int closedir(DIR* d) {
+  if (!d) return -1;
+  if (d->h != INVALID_HANDLE_VALUE) FindClose(d->h);
+  delete d;
+  return 0;
+}
+
 // The NVML loader uses dlopen/dlsym on POSIX; map to LoadLibrary/GetProcAddress.
 typedef HMODULE kan_dl_t;
 static inline kan_dl_t kan_dlopen_nvml(void) {

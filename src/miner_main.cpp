@@ -1176,6 +1176,11 @@ static void select_single_visible_gpu(unsigned physical_gpu) {
 // across devices.  Per-GPU lane processes keep those globals isolated.
 // A single parent-multiplexed stratum session with unified stats is a future
 // item and is intentionally NOT implemented here.
+#ifndef _WIN32
+// POSIX-only: the multi-GPU supervisor forks one lane process per GPU and reaps
+// them with wait()/sigaction. Windows v1 ships single-GPU (no CreateProcess
+// rewrite yet), so the whole supervisor is compiled out there and main()
+// dispatches a single lane instead (see the _WIN32 branch below).
 static int run_pool_parent_multigpu(char** argv, const PoolOpts& base,
                                     const std::vector<unsigned>& gpu_indices) {
   unsigned gpu_count = (unsigned)gpu_indices.size();
@@ -1305,6 +1310,7 @@ static int run_pool_parent_multigpu(char** argv, const PoolOpts& base,
   }
   return rc_final;
 }
+#endif  // !_WIN32
 
 int main(int argc, char** argv) {
   kan_net_init();   // Winsock startup on Windows; no-op on POSIX
@@ -1551,12 +1557,24 @@ int main(int argc, char** argv) {
                 "(single lane on CUDA ordinal 0)",
                 cvd);
     } else if (po.gpu_count > 1) {
+#ifdef _WIN32
+      // Windows v1 is single-GPU: the fork()+execvp() supervisor has no Win32
+      // equivalent yet. Run lane 0 only and tell the user how to pick a GPU.
+      log_linef("multigpu",
+                "%u GPUs detected, but Windows builds run a SINGLE GPU (v1); "
+                "mining on GPU 0 only. Set CUDA_VISIBLE_DEVICES=N to choose a "
+                "different card, or run one kan.exe per GPU.",
+                po.gpu_count);
+      select_single_visible_gpu((unsigned)po.physical_gpu_index);
+      po.gpu_count = 1;
+#else
       std::vector<unsigned> indices;
       for (const auto& gi : g_gpus) indices.push_back(gi.index);
       log_linef("multigpu", "%s%u GPUs -> auto fanout (one isolated lane per GPU, shared worker=%s)",
                 requested_devices.empty() ? "auto-detected " : "selected ",
                 (unsigned)indices.size(), po.worker.c_str());
       return run_pool_parent_multigpu(argv, po, indices);
+#endif
     } else {
       select_single_visible_gpu((unsigned)po.physical_gpu_index);
       log_linef("multigpu", "single GPU #%d -> one lane (no fanout)%s",

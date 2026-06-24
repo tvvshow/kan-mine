@@ -1,0 +1,60 @@
+name: Windows CI Build
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  # GitHub Actions windows-2022 runners have VCPKG_ROOT pre-set to C:\vcpkg
+  VCPKG_DEFAULT_TRIPLET: x64-windows
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup CUDA
+        id: cuda
+        uses: Jimver/cuda-toolkit@v0.2.16
+        with:
+          cuda: "12.5.0"
+          method: "network"
+          use-github-cache: true
+
+      - name: Install OpenSSL via vcpkg
+        shell: pwsh
+        run: |
+          vcpkg install openssl:x64-windows
+          Write-Host "OpenSSL installed"
+
+      - name: Validate toolchain
+        shell: pwsh
+        run: |
+          Write-Host "=== cl.exe ==="
+          & (Get-Command cl.exe).Source 2>&1 | Select-Object -First 1
+          Write-Host "=== nvcc ==="
+          nvcc --version 2>&1 | Select-Object -Last 2
+          Write-Host "=== CUDA_PATH ==="
+          Write-Host "$env:CUDA_PATH"
+          Write-Host "=== VCPKG_ROOT ==="
+          Write-Host "$env:VCPKG_ROOT"
+
+      - name: Build Windows binaries
+        shell: pwsh
+        run: |
+          .\build_windows.ps1
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kan-windows-${{ github.sha }}
+          path: |
+            build/kan.exe
+            build/plainproof_gen.exe
+            build/pearl-miner.exe
+          if-no-files-found: error
