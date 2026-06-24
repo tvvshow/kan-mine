@@ -28,6 +28,9 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <cuda_runtime.h>
@@ -331,6 +334,7 @@ struct PoolOpts {
   bool real_cfg = true;
   bool use_tc = true;
   bool breakdown = false;
+  int api_port = 0;            // >0 enables the HTTP/JSON monitoring API.
   int gpu_index = 0;           // CUDA device index visible in this process.
   int physical_gpu_index = 0;  // Original machine GPU index for logs/workers.
   int gpu_count = 1;           // Total GPUs managed by the parent process.
@@ -420,6 +424,125 @@ static void pool_reader(int fd, SSL* ssl, PoolState* st) {
   }
   st->cv.notify_all();
 }
+// ===========================================================================
+// monitoring API (HTTP/JSON) — rig-manager friendly (HiveOS / mmpOS / curl)
+// ===========================================================================
+// The miner is multi-process (one lane per GPU). execvp wipes shared mmap, so
+// lanes publish their stats as per-lane JSON files in KAN_API_DIR and the HTTP
+// server (run by the multi-GPU parent, or by a single-GPU process for itself)
+// reads + aggregates them on each request. Enabled with --api-port N.
+static std::string json_escape(const std::string& s) {
+  std::string o; o.reserve(s.size() + 8);
+  for (char c : s) {
+    if (c == '"' || c == '\\') { o.push_back('\\'); o.push_back(c); }
+    else if ((unsigned char)c >= 0x20) o.push_back(c);
+  }
+  return o;
+}
+// One lane's stats, taken from THIS process's globals.
+static std::string api_lane_json() {
+  double up_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+  uint64_t acc = g_accepted.load(), rej = g_rejected.load();
+  double ths = window_ths(60.0);
+  unsigned idx = g_gpus.empty() ? 0 : g_gpus[0].index;
+  const char* name = g_gpus.empty() ? "GPU" : g_gpus[0].name;
+  unsigned temp = 0, fan = 0, pmw = 0;
+  if (g_nvml.ok && !g_gpus.empty() && g_gpus[0].handle) {
+    g_nvml.DeviceGetTemperature(g_gpus[0].handle, 0, &temp);
+    g_nvml.DeviceGetFanSpeed(g_gpus[0].handle, &fan);
+    g_nvml.DeviceGetPowerUsage(g_gpus[0].handle, &pmw);
+  }
+  char buf[640];
+  snprintf(buf, sizeof(buf),
+    "{\"id\":%u,\"name\":\"%s\",\"hashrate_ths\":%.2f,\"temp\":%u,\"fan\":%u,"
+    "\"power_w\":%.1f,\"accepted\":%llu,\"rejected\":%llu,\"uptime\":%.0f}",
+    idx, json_escape(name).c_str(), ths, temp, fan, (double)pmw / 1000.0,
+    (unsigned long long)acc, (unsigned long long)rej, up_s);
+  return std::string(buf);
+}
+static void api_write_file(const std::string& dir, int physical_gpu) {
+  std::string path = dir + "/gpu" + std::to_string(physical_gpu) + ".json";
+  std::string tmp = path + ".tmp";
+  FILE* f = fopen(tmp.c_str(), "w");
+  if (!f) return;
+  std::string j = api_lane_json();
+  fwrite(j.data(), 1, j.size(), f);
+  fclose(f);
+  rename(tmp.c_str(), path.c_str());   // atomic publish
+}
+// Read every gpu*.json in dir and build the aggregated machine response.
+static std::string api_aggregate_json(const std::string& dir, const std::string& pool,
+                                      const std::string& wallet) {
+  std::string gpus = "[";
+  double tot_ths = 0; unsigned long long tot_acc = 0, tot_rej = 0;
+  double up = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+  bool first = true;
+  DIR* d = opendir(dir.c_str());
+  if (d) {
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+      const char* nm = e->d_name;
+      size_t L = strlen(nm);
+      if (L < 8 || strncmp(nm, "gpu", 3) != 0 || strcmp(nm + L - 5, ".json") != 0) continue;
+      FILE* f = fopen((dir + "/" + nm).c_str(), "r");
+      if (!f) continue;
+      char buf[1024];
+      size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+      fclose(f);
+      if (n == 0) continue;
+      buf[n] = 0;
+      if (!first) gpus += ",";
+      first = false;
+      gpus += buf;
+      const char* p;
+      if ((p = strstr(buf, "\"hashrate_ths\":")) != nullptr) tot_ths += atof(p + 15);
+      if ((p = strstr(buf, "\"accepted\":"))     != nullptr) tot_acc += strtoull(p + 11, nullptr, 10);
+      if ((p = strstr(buf, "\"rejected\":"))     != nullptr) tot_rej += strtoull(p + 11, nullptr, 10);
+    }
+    closedir(d);
+  }
+  gpus += "]";
+  char head[1024];
+  snprintf(head, sizeof(head),
+    "{\"miner\":\"kan\",\"version\":\"%s\",\"algo\":\"pearl\",\"uptime\":%.0f,"
+    "\"pool\":\"%s\",\"wallet\":\"%s\",\"total\":{\"hashrate_ths\":%.2f,"
+    "\"accepted\":%llu,\"rejected\":%llu},\"gpus\":",
+    KAN_VERSION, up, json_escape(pool).c_str(), json_escape(wallet).c_str(),
+    tot_ths, tot_acc, tot_rej);
+  return std::string(head) + gpus + "}";
+}
+// Minimal HTTP/1.1 server: one short-lived JSON response per request. Runs on a
+// dedicated thread; select() with a 1s timeout lets it observe *stop.
+static void api_serve(int port, std::string dir, std::string pool, std::string wallet,
+                      std::atomic<bool>* stop) {
+  int ls = socket(AF_INET, SOCK_STREAM, 0);
+  if (ls < 0) { log_line("api", "socket failed"); return; }
+  int one = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in a{};
+  a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_ANY); a.sin_port = htons((uint16_t)port);
+  if (bind(ls, (sockaddr*)&a, sizeof(a)) != 0) { log_linef("api", "bind :%d failed (port in use?)", port); close(ls); return; }
+  if (listen(ls, 8) != 0) { log_line("api", "listen failed"); close(ls); return; }
+  log_linef("api", "monitoring JSON on http://0.0.0.0:%d", port);
+  while (!stop->load()) {
+    fd_set rf; FD_ZERO(&rf); FD_SET(ls, &rf);
+    timeval tv{1, 0};
+    if (select(ls + 1, &rf, nullptr, nullptr, &tv) <= 0) continue;
+    int c = accept(ls, nullptr, nullptr);
+    if (c < 0) continue;
+    char req[1024]; recv(c, req, sizeof(req), 0);    // read+discard request line
+    std::string body = api_aggregate_json(dir, pool, wallet);
+    char hdr[256];
+    int hl = snprintf(hdr, sizeof(hdr),
+      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+      "Access-Control-Allow-Origin: *\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+      body.size());
+    send(c, hdr, hl, 0);
+    send(c, body.data(), body.size(), 0);
+    close(c);
+  }
+  close(ls);
+}
+
 static int run_pool(const PoolOpts& o) {
   SSL_library_init();
   char gpu_cat[32];
@@ -518,6 +641,43 @@ static int run_pool(const PoolOpts& o) {
     }
   }
   if (!connected) { log_line("stratum", "all pool endpoints failed"); return 3; }
+
+  // ---- monitoring API: publish THIS lane's stats; a standalone single-GPU
+  // process also serves the aggregate. In multi-GPU the parent runs the server
+  // and children here just write their gpuN.json into the inherited KAN_API_DIR.
+  std::atomic<bool> api_stop{false};
+  std::thread api_writer, api_server;
+  std::string api_dir;
+  {
+    const char* ed = getenv("KAN_API_DIR");
+    bool is_child = getenv("KAN_GPU_CHILD") && *getenv("KAN_GPU_CHILD");
+    if (ed && *ed) api_dir = ed;
+    else if (!is_child && o.api_port > 0) {
+      api_dir = "/tmp/kan-api-" + std::to_string((long)getpid());
+      mkdir(api_dir.c_str(), 0755);
+      setenv("KAN_API_DIR", api_dir.c_str(), 1);
+    }
+    if (!api_dir.empty()) {
+      int pg = o.physical_gpu_index;
+      std::string d = api_dir;
+      api_writer = std::thread([d, pg, &api_stop]() {
+        while (!api_stop.load()) {
+          api_write_file(d, pg);
+          for (int i = 0; i < 30 && !api_stop.load(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+      });
+    }
+    if (!is_child && o.api_port > 0 && !api_dir.empty()) {
+      api_server = std::thread(api_serve, o.api_port, api_dir,
+                               proto + cur_host + ":" + std::to_string(cur_port),
+                               o.wallet, &api_stop);
+    }
+  }
+  struct ApiGuard {
+    std::atomic<bool>* s; std::thread* w; std::thread* v;
+    ~ApiGuard() { s->store(true); if (w->joinable()) w->join(); if (v->joinable()) v->join(); }
+  } api_guard{&api_stop, &api_writer, &api_server};
   long long submit_id = 100;
   uint64_t attempt_id = 0;
   std::atomic<bool> stop_attempt{false};
@@ -927,6 +1087,7 @@ static void usage() {
     "                   external scheduler).\n\n"
     "options:   --worker NAME   pool worker name (default pm)\n"
     "           --batch N       max draws per attempt before re-checking job\n"
+    "           --api-port N    serve HTTP/JSON stats on port N (HiveOS/mmpOS)\n"
     "           --breakdown     per-draw timing\n"
     "commands:  s (stats now), q (quit); table prints every 120s\n");
 }
@@ -1048,6 +1209,23 @@ static int run_pool_parent_multigpu(char** argv, const PoolOpts& base,
 
   std::vector<pid_t> pids;
   pids.reserve(gpu_count);
+
+  // monitoring API: the parent owns the HTTP server; children inherit KAN_API_DIR
+  // (set BEFORE fork) and publish their per-lane JSON there for aggregation.
+  std::atomic<bool> api_stop{false};
+  std::thread api_server;
+  if (base.api_port > 0) {
+    std::string api_dir = "/tmp/kan-api-" + std::to_string((long)getpid());
+    mkdir(api_dir.c_str(), 0755);
+    setenv("KAN_API_DIR", api_dir.c_str(), 1);
+    std::string pool = std::string(base.use_tls ? "stratum+tls://" : "stratum+tcp://") +
+                       base.host + ":" + std::to_string(base.port);
+    api_server = std::thread(api_serve, base.api_port, api_dir, pool, base.wallet, &api_stop);
+  }
+  struct PApiGuard {
+    std::atomic<bool>* s; std::thread* v;
+    ~PApiGuard() { s->store(true); if (v->joinable()) v->join(); }
+  } papi_guard{&api_stop, &api_server};
 
   struct sigaction sa{};
   sa.sa_handler = parent_signal_handler;
@@ -1180,6 +1358,7 @@ int main(int argc, char** argv) {
     else if (a == "--batch") po.batch = so.batch = strtoull(next("1000").c_str(), nullptr, 10);
     else if (a == "--cfg") { std::string c = next("real"); po.real_cfg = so.real_cfg = (c == "real"); }
     else if (a == "--tc") po.use_tc = so.use_tc = true;
+    else if (a == "--api-port") po.api_port = atoi(next("0").c_str());
     else if (a == "--breakdown") po.breakdown = so.breakdown = true;
     else if (a == "--solo") solo = true;
     else if (a == "--node") {
