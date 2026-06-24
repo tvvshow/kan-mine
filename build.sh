@@ -173,17 +173,24 @@ if [ "${KERNEL}" = "cutlass" ]; then
   TC_OBJ="tc_kernel.o gpu_prep.o"
 else
   # WMMA path: the Turing/sm_75-capable int8 kernel. Also the fallback when CUTLASS
-  # headers are missing on any arch. No gpu_prep -> CPU draw pipeline (weak-ref
-  # fallback in plainproof_gen). ~30 TH/s on Ampere; Turing is lower but RUNS.
+  # headers are missing on any arch. Links gpu_prep.cu too -> GPU-resident draw
+  # pipeline (RNG+hash+noise on the GPU, no per-draw CPU prep). ~30 TH/s on Ampere;
+  # Turing is lower but RUNS.
   if [ ! -d "${CUTLASS_HOME}/include/cutlass" ] && [ -z "${ARCH:-}" ]; then
     echo "  WARNING: CUTLASS not found (set CUTLASS_HOME or clone to ~/cutlass:"
     echo "           git clone --depth 1 -b v3.5.1 https://github.com/NVIDIA/cutlass ~/cutlass)"
   fi
-  echo "  WMMA kernel -> tc_block.cu (int8 16x16x16, 32 KB static smem, CPU draw pipeline)"
+  echo "  WMMA kernel -> tc_block.cu (int8 16x16x16, 32 KB static smem) + gpu_prep (GPU draw pipeline)"
   echo "  (this is the Turing/sm_75-capable path; the CUTLASS Sm80 kernel cannot run on sm_75)"
   # shellcheck disable=SC2086
   nvcc -O3 ${GENCODE} -std=c++17 -c "${ROOT}/src/tc_block.cu" -o tc_kernel.o
-  TC_OBJ="tc_kernel.o"
+  # gpu_prep.cu is plain CUDA (no cp.async / no tensor cores) so it runs on Turing
+  # too. Linking it lets plainproof_gen take the GPU-resident RNG+hash+noise path
+  # (tc_alloc_bufs is defined in tc_block.cu), killing the ~2.7 s/draw CPU prep that
+  # otherwise serializes multi-GPU rigs sharing one host CPU.
+  # shellcheck disable=SC2086
+  nvcc -O3 ${GENCODE} -std=c++17 -c "${ROOT}/src/gpu_prep.cu"
+  TC_OBJ="tc_kernel.o gpu_prep.o"
 fi
 
 echo "=== link: plainproof_gen (CLI) ==="

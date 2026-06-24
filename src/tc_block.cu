@@ -252,6 +252,18 @@ static bool ensure_dev_bufs(int m, int n, int k, int h, int w, int nrow_off, int
   return true;
 }
 
+// Persistent-buffer accessor so the GPU-resident draw pipeline (gpu_prep.cu) can
+// write the noised matrices straight into THIS kernel's dA/dBt and then call
+// tc_jackpot_search(NULL,NULL,...) — the same drop-in contract tc_cutlass_v2
+// exposes. Without this symbol linked, plainproof_gen keeps the CPU producer path.
+extern "C" int tc_alloc_bufs(int m,int n,int k,int h,int w,int nrow_off,int ncol_off,
+                             signed char** dA, signed char** dBt)
+{
+  if (!ensure_dev_bufs(m,n,k,h,w,nrow_off,ncol_off)) return -1;
+  *dA = g_bufs.dA; *dBt = g_bufs.dBt;
+  return 0;
+}
+
 extern "C" int tc_jackpot_search(
     const signed char* a_noised, const signed char* b_noised_t,
     int m,int n,int k,int rank,
@@ -270,8 +282,10 @@ extern "C" int tc_jackpot_search(
   DevBufs& B = g_bufs;
 
   size_t ntiles = (size_t)nrow_off * ncol_off;
-  cudaMemcpy(B.dA,a_noised,(size_t)m*k,cudaMemcpyHostToDevice);
-  cudaMemcpy(B.dBt,b_noised_t,(size_t)n*k,cudaMemcpyHostToDevice);
+  // a_noised==NULL => the noised matrices were produced GPU-side directly in
+  // B.dA/B.dBt by gpu_prep (the GPU-resident draw pipeline), so skip the H2D.
+  if (a_noised)   cudaMemcpy(B.dA,a_noised,(size_t)m*k,cudaMemcpyHostToDevice);
+  if (b_noised_t) cudaMemcpy(B.dBt,b_noised_t,(size_t)n*k,cudaMemcpyHostToDevice);
 
   cudaMemcpy(B.dpr,pat_rows,h*4,cudaMemcpyHostToDevice);
   cudaMemcpy(B.dpc,pat_cols,w*4,cudaMemcpyHostToDevice);

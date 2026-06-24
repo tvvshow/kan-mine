@@ -24,10 +24,16 @@ pool accepted 的实验不标记为 production recommended。
 - `install_kan.sh` 选包：`sm_75 -> kan-portable-linux-x64-sm75.tar.gz`，新增
   `--force-sm75`。`.cnb.yml` release matrix 增加 `package-sm75-turing` 构建阶段与
   附件、SHA256SUMS。
+- **GPU-resident draw pipeline 接入 WMMA 路径**：`gpu_prep.cu`（GPU 侧 RNG + BLAKE3
+  tree + noise，纯 CUDA、无 cp.async/Tensor Core，Turing 可跑）原先只链入 CUTLASS
+  路径，现在 WMMA 路径也编链它；`tc_block.cu` 暴露 `tc_alloc_bufs` 并在 `a_noised=NULL`
+  时跳过 H2D。每 draw 的 prep 从 ~2730ms（CPU）降到 ~18ms（GPU），消除多卡共享主机
+  CPU 时的 prep 争抢。
 - 状态：**Candidate**。RTX 2080 Ti 实测 `ARCH=sm_75 KERNEL=wmma` 构建 +
-  `run_test.sh` real-cfg POSTCHECK ok=1、emitted proof（与 Ampere 同尺寸）；
-  内核约 20 TH/s，明显低于 Ampere+，属预期。live pool accepted / 多卡长稳 / 正式
-  `bench/results` 记录待补。
+  real-cfg POSTCHECK ok=1、emitted proof（与 Ampere 同尺寸）。内核约 20 TH/s；
+  GPU-resident pipeline 使单卡 wall 16.1→19.4 TH/s、**双卡聚合 26.1→37.2 TH/s
+  （缩放 1.65×→1.92×，近线性，util 100%）**，明显低于 Ampere+ 属预期。live pool
+  accepted / 正式 `bench/results` 记录待补。
 - GTX 10 系 / Pascal（`sm_60`/`sm_61`）无 int8 Tensor Core，需要 DP4A 路径，列入
   后续优化，本版本不含。
 
