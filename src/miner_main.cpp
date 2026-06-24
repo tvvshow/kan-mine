@@ -311,10 +311,19 @@ static int tcp_connect(const std::string& host, int port) {
 // ===========================================================================
 // POOL MODE
 // ===========================================================================
+struct PoolEndpoint {
+  std::string host;
+  int port = 0;
+  bool use_tls = false;
+};
 struct PoolOpts {
   std::string host = "prl.kryptex.network";
   int port = 7048;
   bool use_tls = false;
+  // Primary first, then failover backups (filled from one or more --pool URLs).
+  // run_pool tries them in order and mines the first that connects+authorizes;
+  // host/port/use_tls above mirror endpoints[0] for the banner / backward compat.
+  std::vector<PoolEndpoint> endpoints;
   std::string wallet;
   std::string worker = "pm";
   std::string agent = std::string("Kan/") + KAN_VERSION;
@@ -432,50 +441,83 @@ static int run_pool(const PoolOpts& o) {
   log_linef(gpu_cat, "selected CUDA device %d (physical GPU #%d of %d) worker=%s",
             o.gpu_index, o.physical_gpu_index, o.gpu_count, worker.c_str());
 
-  int fd = tcp_connect(o.host, o.port);
-  if (fd < 0) { log_line("stratum", "connect failed"); return 2; }
+  // Build the endpoint list: primary first, then any failover backups. (Started
+  // with a single --pool => one entry; the {host,port,use_tls} fallback keeps any
+  // older call path working.)
+  std::vector<PoolEndpoint> eps = o.endpoints;
+  if (eps.empty()) eps.push_back({o.host, o.port, o.use_tls});
+
+  int fd = -1;
   SSL_CTX* ctx = nullptr;
   SSL* ssl = nullptr;
-  if (o.use_tls) {
-    ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) { close(fd); return 2; }
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
-    ssl = SSL_new(ctx);
-    SSL_set_fd(ssl, fd);
-    SSL_set_tlsext_host_name(ssl, o.host.c_str());
-    if (SSL_connect(ssl) != 1) {
-      log_line("stratum", "TLS handshake failed");
-      SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return 2;
-    }
-  }
-  std::string proto = o.use_tls ? "stratum+tls://" : "stratum+tcp://";
-  // NOTE: each GPU lane opens its OWN stratum connection. When gpu_count>1 the
-  // parent has forked one lane per GPU and every lane authorizes under the same
-  // worker name, so the pool aggregates the whole box under one worker — but
-  // these are independent stratum connections, NOT a single shared session.
-  log_linef("stratum", "connecting to %s%s:%d as %s.%s (GPU %d/%d, per-GPU connection)",
-            proto.c_str(), o.host.c_str(), o.port, o.wallet.c_str(),
-            worker.c_str(), o.physical_gpu_index, o.gpu_count);
   PoolState st;
-  std::thread rd(pool_reader, fd, ssl, &st);
+  std::thread rd;
+  std::string proto, cur_host;
+  int cur_port = 0;
   std::string auth = "{\"id\":1,\"method\":\"mining.authorize\",\"params\":{\"wallet\":\"" +
                      o.wallet + "." + worker + "\",\"worker\":\"" + worker +
                      "\",\"agent\":\"" + o.agent + "\"}}";
-  pool_send(fd, ssl, auth);
-  double t0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-  while (std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - t0 < 25) {
-    { std::lock_guard<std::mutex> lk(st.mu); if (st.have_job) break; }
-    if (st.stop.load()) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  // Try each endpoint in order; mine the first that connects AND delivers a job
+  // (= authorize accepted). On a clean failure advance to the next backup. If ALL
+  // fail we return so the outer supervisor restarts the lane, which scans again
+  // from the primary (natural primary-preference once the primary recovers).
+  bool connected = false;
+  for (size_t ei = 0; ei < eps.size() && !connected; ei++) {
+    const PoolEndpoint& ep = eps[ei];
+    proto = ep.use_tls ? "stratum+tls://" : "stratum+tcp://";
+    if (eps.size() > 1)
+      log_linef("stratum", "endpoint %zu/%zu: %s%s:%d",
+                ei + 1, eps.size(), proto.c_str(), ep.host.c_str(), ep.port);
+
+    fd = tcp_connect(ep.host, ep.port);
+    if (fd < 0) { log_linef("stratum", "connect failed (%s:%d)", ep.host.c_str(), ep.port); continue; }
+
+    ctx = nullptr; ssl = nullptr;
+    if (ep.use_tls) {
+      ctx = SSL_CTX_new(TLS_client_method());
+      if (!ctx) { close(fd); fd = -1; continue; }
+      SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+      ssl = SSL_new(ctx);
+      SSL_set_fd(ssl, fd);
+      SSL_set_tlsext_host_name(ssl, ep.host.c_str());
+      if (SSL_connect(ssl) != 1) {
+        log_linef("stratum", "TLS handshake failed (%s:%d)", ep.host.c_str(), ep.port);
+        SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+        fd = -1; ssl = nullptr; ctx = nullptr; continue;
+      }
+    }
+
+    log_linef("stratum", "connecting to %s%s:%d as %s.%s (GPU %d/%d, per-GPU connection)",
+              proto.c_str(), ep.host.c_str(), ep.port, o.wallet.c_str(),
+              worker.c_str(), o.physical_gpu_index, o.gpu_count);
+    st.stop = false;
+    { std::lock_guard<std::mutex> lk(st.mu); st.have_job = false; }
+    rd = std::thread(pool_reader, fd, ssl, &st);
+    pool_send(fd, ssl, auth);
+    double t0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - t0 < 25) {
+      { std::lock_guard<std::mutex> lk(st.mu); if (st.have_job) break; }
+      if (st.stop.load()) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    bool got_job;
+    { std::lock_guard<std::mutex> lk(st.mu); got_job = st.have_job; }
+    if (got_job) {
+      log_linef("stratum", "authorize: ok wallet=%s.%s agent=%s",
+                o.wallet.c_str(), worker.c_str(), o.agent.c_str());
+      cur_host = ep.host; cur_port = ep.port;
+      connected = true;
+    } else {
+      log_linef("stratum", "no job within 25s (%s:%d)", ep.host.c_str(), ep.port);
+      st.stop = true;
+      if (rd.joinable()) rd.join();
+      if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); ssl = nullptr; }
+      if (ctx) { SSL_CTX_free(ctx); ctx = nullptr; }
+      close(fd); fd = -1;
+    }
   }
-  { std::lock_guard<std::mutex> lk(st.mu);
-    if (!st.have_job) { log_line("stratum", "no job within 25s"); st.stop = true; rd.join();
-      if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
-      if (ctx) SSL_CTX_free(ctx);
-      close(fd); return 3; }
-    log_linef("stratum", "authorize: ok wallet=%s.%s agent=%s",
-              o.wallet.c_str(), worker.c_str(), o.agent.c_str());
-  }
+  if (!connected) { log_line("stratum", "all pool endpoints failed"); return 3; }
   long long submit_id = 100;
   uint64_t attempt_id = 0;
   std::atomic<bool> stop_attempt{false};
@@ -575,7 +617,7 @@ static int run_pool(const PoolOpts& o) {
       double dt = std::chrono::duration<double>(now - last_print).count();
       sample_draws();
       if (stats_req.load() || (first_print && dt >= 15.0) || (!first_print && dt >= 120.0)) {
-        print_stats(o.wallet, proto + o.host + ":" + std::to_string(o.port));
+        print_stats(o.wallet, proto + cur_host + ":" + std::to_string(cur_port));
         last_print = now;
         first_print = false;
         stats_req.store(false);
@@ -870,7 +912,9 @@ static void usage() {
     "kan — Kan Pearl(PRL) PoUW miner\n\n"
     "  kan --algo pearl --pool URL --wallet ADDR[.WORKER]\n"
     "  kan --solo --node host:port --rpcuser U --rpcpass P --addr <p2tr>\n\n"
-    "pool URL:  stratum+ssl://host:port  or  stratum+tcp://host:port\n\n"
+    "pool URL:  stratum+ssl://host:port  or  stratum+tcp://host:port\n"
+    "           repeat --pool for failover backups (primary first; the miner\n"
+    "           advances to the next pool when one is unreachable).\n\n"
     "GPU selection (pool mode):\n"
     "  default          use ALL detected GPUs automatically (one isolated lane\n"
     "                   process per GPU; all lanes share the same worker name so\n"
@@ -1105,7 +1149,7 @@ int main(int argc, char** argv) {
   int child_phys_gpu = env_int("KAN_GPU_PHYSICAL_INDEX", 0);
   int child_gpu_count = env_int("KAN_GPU_COUNT", 1);
   std::vector<unsigned> requested_devices;
-  std::string pool_url;
+  std::vector<std::string> pool_urls;   // one or more --pool (primary + backups)
   std::string algo;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -1113,7 +1157,7 @@ int main(int argc, char** argv) {
       return (i + 1 < argc) ? std::string(argv[++i]) : std::string(def);
     };
     if (a == "--algo") algo = next("pearl");
-    else if (a == "--pool") { pool_url = next(); pool = true; }
+    else if (a == "--pool") { pool_urls.push_back(next()); pool = true; }
     else if (a == "--wallet") {
       std::string w = next();
       size_t dot = w.rfind('.');
@@ -1184,34 +1228,37 @@ int main(int argc, char** argv) {
       usage();
       return 2;
     }
-    if (!pool_url.empty()) {
-      if (pool_url.rfind("stratum+ssl://", 0) == 0) {
-        po.use_tls = true;
-        std::string hp = pool_url.substr(14);
-        size_t c = hp.rfind(':');
-        if (c != std::string::npos) {
-          po.host = hp.substr(0, c);
-          po.port = atoi(hp.substr(c+1).c_str());
-        } else {
-          po.host = hp;
-          po.port = 8048;
-        }
-      } else if (pool_url.rfind("stratum+tcp://", 0) == 0) {
-        po.use_tls = false;
-        std::string hp = pool_url.substr(14);
-        size_t c = hp.rfind(':');
-        if (c != std::string::npos) {
-          po.host = hp.substr(0, c);
-          po.port = atoi(hp.substr(c+1).c_str());
-        } else {
-          po.host = hp;
-          po.port = 7048;
-        }
+    for (const std::string& purl : pool_urls) {
+      PoolEndpoint ep;
+      std::string hp;
+      if (purl.rfind("stratum+ssl://", 0) == 0 || purl.rfind("stratum+tls://", 0) == 0) {
+        ep.use_tls = true; ep.port = 8048; hp = purl.substr(14);
+      } else if (purl.rfind("stratum+tcp://", 0) == 0) {
+        ep.use_tls = false; ep.port = 7048; hp = purl.substr(14);
+      } else {
+        fprintf(stderr, "unrecognized pool URL (need stratum+ssl:// or stratum+tcp://): %s\n", purl.c_str());
+        usage(); return 2;
       }
+      size_t c = hp.rfind(':');
+      if (c != std::string::npos) { ep.host = hp.substr(0, c); ep.port = atoi(hp.substr(c+1).c_str()); }
+      else { ep.host = hp; }
+      if (ep.host.empty()) { fprintf(stderr, "empty pool host in URL: %s\n", purl.c_str()); usage(); return 2; }
+      po.endpoints.push_back(ep);
+    }
+    if (!po.endpoints.empty()) {
+      po.host = po.endpoints[0].host;
+      po.port = po.endpoints[0].port;
+      po.use_tls = po.endpoints[0].use_tls;
     }
     banner();
     std::string proto = po.use_tls ? "stratum+tls://" : "stratum+tcp://";
     log_linef("pool", "%s%s:%d", proto.c_str(), po.host.c_str(), po.port);
+    for (size_t ei = 1; ei < po.endpoints.size(); ei++) {
+      const PoolEndpoint& bep = po.endpoints[ei];
+      log_linef("pool", "backup #%zu %s%s:%d", ei,
+                bep.use_tls ? "stratum+tls://" : "stratum+tcp://",
+                bep.host.c_str(), bep.port);
+    }
     log_linef("wallet", "%s.%s", po.wallet.c_str(), po.worker.c_str());
     log_linef("worker", "%s", po.worker.c_str());
     log_line("commands", "s (stats), q (quit); table every 120s");
