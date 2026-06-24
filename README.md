@@ -477,13 +477,14 @@ Solo 挖矿需要本地运行 pearld 节点，且需要 `zkprove` 工具将 Plai
 | 参数 | 说明 | 默认值 |
 |------|------|-------|
 | `--algo pearl` | 指定算法（仅支持 pearl） | 必填 |
-| `--pool URL` | 矿池地址，格式 `stratum+tcp://host:port` 或 `stratum+ssl://host:port` | 必填 |
+| `--pool URL` | 矿池地址，格式 `stratum+tcp://host:port` 或 `stratum+ssl://host:port`；可重复指定实现主/备故障转移（主池优先，不可达时自动切下一个） | 必填 |
 | `--wallet ADDR[.WORKER]` | PRL 钱包地址，可带矿工名 | 必填 |
 | `--worker NAME` | 矿工名（也可合并在 wallet 中用 `.` 分隔） | `pm` |
 | `--agent STRING` | 自定义 agent 标识 | `Kan/1.0.0` |
 | `--devices LIST` | 选择物理 GPU 子集（如 `0,1,3`）；不设置时自动使用所有 GPU。与 `CUDA_VISIBLE_DEVICES` 互斥 | 全部 GPU |
 | `--batch N` | 每轮最大 draw 数（新 job 前最多搜索 N 次） | `1000` |
 | `--breakdown` | 打印每 draw 的详细计时 | 关闭 |
+| `--api-port N` | 开启 HTTP/JSON 监控端口（每卡 + 聚合算力、accepted/rejected、NVML 温度/转速/功耗，对接 HiveOS/mmpOS/curl） | 关闭 |
 
 ### Solo 模式参数
 

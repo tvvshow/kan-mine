@@ -6,6 +6,29 @@ pool accepted 的实验不标记为 production recommended。
 
 ---
 
+## v1.2.21 — multi-pool failover + monitoring API
+
+状态：待 Linux/CUDA release workflow 构建。功能已在 2× RTX 2080 Ti 实测验证。
+
+### Pool / 可靠性
+
+- **多池故障转移**：`--pool` 现在可重复指定（主池优先，其余为备池）。每个 GPU lane
+  按顺序尝试端点，连接并授权成功的第一个就开挖；全部失败则交由 supervisor 重启整条
+  lane，再从主池重新扫起（主池恢复后自动回切）。挖矿/提交主体代码未改动，单池行为不变。
+  实测：死主池 `127.0.0.1:9999` + ssl 备池 → connect failed → endpoint 2/2 →
+  authorize ok → 开挖。
+
+### 监控
+
+- **HTTP/JSON 监控 API**：`--api-port N` 暴露每卡与聚合的算力、accepted/rejected，
+  以及 NVML 温度/转速/功耗，便于 HiveOS / mmpOS / curl 等矿场面板对接。多进程感知：
+  每个 lane 把自身 stats 写成 `KAN_API_DIR/gpuN.json`（execvp 会清空 mmap，故用文件
+  IPC 经环境变量传递），多卡由 parent、单卡由本进程跑一个轻量 HTTP server 聚合。
+  实测：`GET /` 返回 `{total, gpus[2]}`，total 34.98 = 19.43 + 15.55 TH/s，含实时
+  NVML 读数。
+
+---
+
 ## v1.2.20 — Turing / sm_75 support via WMMA flavor
 
 状态：待 Linux/CUDA release workflow 构建与 Turing 实机 pool 验证后发布。
