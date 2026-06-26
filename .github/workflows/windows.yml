@@ -18,6 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup MSVC dev environment (cl.exe / INCLUDE / LIB on PATH)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Setup CUDA
         id: cuda
         uses: Jimver/cuda-toolkit@v0.2.16
