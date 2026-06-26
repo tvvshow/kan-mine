@@ -66,6 +66,15 @@ typedef long long ssize_t;
 #ifndef getpid
 #define getpid _getpid
 #endif
+// MSVC spells the pipe-to-command helpers _popen/_pclose. run_capture() (solo
+// zkprove path) is compiled unconditionally, so map the POSIX names even though
+// Windows v1 rarely exercises them.
+#ifndef popen
+#define popen(cmd, mode) _popen((cmd), (mode))
+#endif
+#ifndef pclose
+#define pclose(p) _pclose((p))
+#endif
 
 // MSVC setsockopt takes `const char*` for optval; the miner passes `int*`
 // (TCP_NODELAY / SO_REUSEADDR). Wrap it so the int-based call sites compile
