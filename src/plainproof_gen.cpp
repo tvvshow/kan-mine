@@ -563,6 +563,7 @@ static U256 mul_u256_u64_saturate(const U256& a, uint64_t factor) {
         if (!av) continue;
         // multiply av (<=255) by factor (64-bit) -> up to ~72-bit; split into bytes
         // value = av * factor
+#if defined(__SIZEOF_INT128__)
         unsigned __int128 v = (unsigned __int128)av * (unsigned __int128)factor;
         int p = i;
         while (v && p < 48) {
@@ -570,6 +571,21 @@ static U256 mul_u256_u64_saturate(const U256& a, uint64_t factor) {
             v >>= 8;
             p++;
         }
+#else
+        // MSVC has no __int128: emulate the 128-bit product as hi:lo. av<=255 so
+        // each partial fits in 64 bits; combine into a 128-bit value and emit bytes.
+        uint64_t f_lo = factor & 0xFFFFFFFFull, f_hi = factor >> 32;
+        uint64_t p0 = av * f_lo, p1 = av * f_hi;
+        uint64_t v_lo = p0 + (p1 << 32);
+        uint64_t v_hi = (p1 >> 32) + (v_lo < p0 ? 1ull : 0ull);
+        int p = i;
+        while ((v_lo || v_hi) && p < 48) {
+            acc[p] += (uint64_t)(v_lo & 0xFF);
+            v_lo = (v_lo >> 8) | (v_hi << 56);
+            v_hi >>= 8;
+            p++;
+        }
+#endif
     }
     // normalize carries
     uint64_t carry2 = 0;
