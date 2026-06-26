@@ -11,4 +11,3 @@ __pycache__/
 # Windows build artifacts
 *.obj
 *.exe
-build_windows.ps1
