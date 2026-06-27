@@ -1,0 +1,95 @@
+name: Linux Portable Build
+
+# GitHub is the PRIMARY repo (cnb.cool is the backup mirror). This workflow
+# mirrors the cnb .cnb.yml Linux pipeline so the portable Linux packages are
+# built AND published as downloadable GitHub Release assets:
+#   * push / PR  -> compile + CPU correctness verify (GPU-less, free runner)
+#   * tag (v*)   -> build the 3 portable packages + SHA256SUMS and attach them
+#                   to the GitHub Release for that tag
+#
+# Runs inside the CUDA devel image so nvcc is present; NO GPU is needed (CUTLASS
+# compiles and the reference solver runs on CPU).
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: write   # needed for the tag -> Release asset upload
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    env:
+      CUTLASS_HOME: /opt/cutlass
+    steps:
+      - name: Install build deps
+        run: |
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            gcc g++ make git curl ca-certificates libssl-dev patchelf xz-utils
+
+      - uses: actions/checkout@v4
+
+      - name: Fetch CUTLASS (v3.5.1, header-only)
+        run: |
+          if [ ! -d "$CUTLASS_HOME/include/cutlass" ]; then
+            git clone --depth 1 https://github.com/NVIDIA/cutlass -b v3.5.1 "$CUTLASS_HOME"
+          fi
+
+      - name: Release profile check
+        run: bash check_release_profiles.sh
+
+      # ---- push / PR: compile + CPU-verify (no packaging) --------------------
+      - name: Build + CPU verify
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          bash build.sh
+          bash cpu_test.sh
+
+      # ---- tag: build the 3 portable packages + checksums --------------------
+      - name: Build portable packages (generic + sm86-g8 + sm75)
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          WITH_AB=0 bash package_portable.sh
+          WITH_AB=0 ARCH=sm_86 GROUPM=8 KSTAGES=3 PACKAGE_FLAVOR=sm86-g8 bash package_portable.sh
+          WITH_AB=0 ARCH=sm_75 KERNEL=wmma PACKAGE_FLAVOR=sm75 bash package_portable.sh
+
+      - name: Checksums
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          cp install_kan.sh dist/install_kan.sh
+          (cd dist && sha256sum \
+            kan-portable-linux-x64.tar.gz \
+            kan-portable-linux-x64-sm75.tar.gz \
+            kan-portable-linux-x64-sm86-g8.tar.gz \
+            install_kan.sh > SHA256SUMS)
+
+      - name: Upload build artifacts (every run)
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kan-portable-linux-x64
+          path: |
+            dist/kan-portable-linux-x64.tar.gz
+            dist/kan-portable-linux-x64-sm86-g8.tar.gz
+            dist/kan-portable-linux-x64-sm75.tar.gz
+            dist/SHA256SUMS
+            dist/install_kan.sh
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release (tags only)
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/kan-portable-linux-x64.tar.gz
+            dist/kan-portable-linux-x64-sm86-g8.tar.gz
+            dist/kan-portable-linux-x64-sm75.tar.gz
+            dist/SHA256SUMS
+            dist/install_kan.sh
