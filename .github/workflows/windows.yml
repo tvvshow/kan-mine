@@ -31,6 +31,26 @@ jobs:
           method: "network"
           use-github-cache: true
 
+      # msvc-dev-cmd repoints VCPKG_ROOT at the VS-bundled vcpkg, which (a) has no
+      # binary cache so openssl rebuilds from source every run (~6 min), and (b) is
+      # not the C:\vcpkg our build_windows.ps1 probe prefers. Pin it back to the
+      # GitHub-hosted vcpkg so the cache below hits.
+      - name: Pin VCPKG_ROOT to GitHub-hosted vcpkg
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=C:\vcpkg"
+          Write-Host "VCPKG_ROOT pinned to C:\vcpkg"
+
+      - name: Cache vcpkg OpenSSL
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\vcpkg\installed
+            ~\AppData\Local\vcpkg\archives
+          key: vcpkg-openssl-x64-windows-v1
+          restore-keys: |
+            vcpkg-openssl-x64-windows-
+
       - name: Install OpenSSL via vcpkg
         shell: pwsh
         run: |
