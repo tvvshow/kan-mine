@@ -237,7 +237,7 @@ ls -la "${BUILD}/pearl-miner"
 # zkprove at run time. Build it when cargo is present; otherwise warn and skip so
 # the pool-only build still succeeds on a Rust-less host (e.g. the cnb CUDA image).
 echo "=== zkprove (Rust solo helper) ==="
-if command -v cargo >/dev/null 2>&1; then
+if command -v cargo >/dev/null 2>&1 && [ -d "${ROOT}/zk-pow" ]; then
   ( cd "${ROOT}/zk-pow" && cargo build --release --bin zkprove )
   cp -f "${ROOT}/zk-pow/target/release/zkprove" "${BUILD}/zkprove" 2>/dev/null || \
     cp -f "${ROOT}/zk-pow/target/release/zkprove.exe" "${BUILD}/zkprove" 2>/dev/null || true

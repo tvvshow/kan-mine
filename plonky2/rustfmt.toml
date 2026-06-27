@@ -1,3 +1,0 @@
-# Stable rustfmt options only
-reorder_imports = true
-reorder_modules = true
