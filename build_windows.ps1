@@ -122,13 +122,14 @@ Write-Host "  miner driver: OK"
 # ---- CUDA kernel: tc_block.cu (WMMA) + gpu_prep.cu -------------------------
 Write-Host "=== CUDA kernels (WMMA) ==="
 Push-Location $BUILD
-$cuFlags = @(
-  "-O3", $GENCODE, "-std=c++17", "-DKAN_NO_ASYNC_SEARCH",
-  "-I$ROOT\src"
-)
-nvcc $cuFlags -c "$ROOT\src\tc_block.cu" -o tc_kernel.obj 2>&1 | Out-Host
+# IMPORTANT: build the nvcc arg list as a FLAT array (use + to concatenate, not
+# nesting $GENCODE inside @(...)) and pass via splat @. PowerShell otherwise
+# joins nested-array elements into one quoted token and nvcc rejects it with
+# "Unknown option '-gencode arch=... -gencode arch=...'".
+$cuFlags = @("-O3", "-std=c++17", "-DKAN_NO_ASYNC_SEARCH", "-I$ROOT\src") + $GENCODE
+nvcc @cuFlags -c "$ROOT\src\tc_block.cu" -o tc_kernel.obj 2>&1 | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "tc_block.cu failed" }
-nvcc $cuFlags -c "$ROOT\src\gpu_prep.cu" -o gpu_prep.obj 2>&1 | Out-Host
+nvcc @cuFlags -c "$ROOT\src\gpu_prep.cu" -o gpu_prep.obj 2>&1 | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "gpu_prep.cu failed" }
 Pop-Location
 Write-Host "  CUDA kernels: OK"
