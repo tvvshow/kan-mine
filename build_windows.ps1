@@ -141,11 +141,10 @@ $cudaLib = "$env:CUDA_PATH\lib\x64"
 $b3Obj = @(
   "$BUILD\blake3.obj", "$BUILD\blake3_dispatch.obj", "$BUILD\blake3_portable.obj"
 )
-$ppObj = @(
-  "$BUILD\plainproof_gen.obj", $b3Obj,
-  "$BUILD\tc_kernel.obj", "$BUILD\gpu_prep.obj"
-)
-link /OUT:"$BUILD\plainproof_gen.exe" $ppObj `
+# FLAT concatenation (+) + splat (@) — nesting $b3Obj inside @(...) makes
+# PowerShell join the obj paths into one token and link fails with LNK1104.
+$ppObj = @("$BUILD\plainproof_gen.obj", "$BUILD\tc_kernel.obj", "$BUILD\gpu_prep.obj") + $b3Obj
+link /OUT:"$BUILD\plainproof_gen.exe" @ppObj `
   cudart.lib ws2_32.lib `
   "/LIBPATH:$cudaLib" 2>&1 | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "plainproof_gen.exe link failed" }
@@ -153,11 +152,8 @@ Write-Host "  plainproof_gen.exe: OK ($((Get-Item "$BUILD\plainproof_gen.exe").L
 
 # ---- link: kan.exe ---------------------------------------------------------
 Write-Host "=== link: kan.exe ==="
-$kanObj = @(
-  "$BUILD\miner_main.obj", "$BUILD\prover_lib.obj", $b3Obj,
-  "$BUILD\tc_kernel.obj", "$BUILD\gpu_prep.obj"
-)
-link /OUT:"$BUILD\kan.exe" $kanObj `
+$kanObj = @("$BUILD\miner_main.obj", "$BUILD\prover_lib.obj", "$BUILD\tc_kernel.obj", "$BUILD\gpu_prep.obj") + $b3Obj
+link /OUT:"$BUILD\kan.exe" @kanObj `
   "libssl.lib" "libcrypto.lib" cudart.lib ws2_32.lib `
   "/LIBPATH:$vcpkgLib" "/LIBPATH:$cudaLib" 2>&1 | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "kan.exe link failed" }
