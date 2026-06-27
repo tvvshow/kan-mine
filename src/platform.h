@@ -76,6 +76,22 @@ typedef long long ssize_t;
 #define pclose(p) _pclose((p))
 #endif
 
+// NVML loader closes its handle with POSIX dlclose; map to FreeLibrary. (open/sym
+// go through kan_dlopen_nvml/kan_dlsym below, but the dtor calls dlclose directly.)
+#ifndef dlclose
+#define dlclose(h) FreeLibrary((HMODULE)(h))
+#endif
+
+// CPU count: POSIX sysconf(_SC_NPROCESSORS_ONLN) -> Win32 GetSystemInfo.
+#ifndef _SC_NPROCESSORS_ONLN
+#define _SC_NPROCESSORS_ONLN 1
+#endif
+static inline long sysconf(int name) {
+  (void)name;
+  SYSTEM_INFO si; GetSystemInfo(&si);
+  return (long)si.dwNumberOfProcessors;
+}
+
 // MSVC setsockopt takes `const char*` for optval; the miner passes `int*`
 // (TCP_NODELAY / SO_REUSEADDR). Wrap it so the int-based call sites compile
 // unchanged on both platforms.
