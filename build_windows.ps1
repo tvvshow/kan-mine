@@ -93,7 +93,8 @@ $b3Inc = "-I$ROOT\blake3"
 # ---- host: prover core (plainproof_gen + prover_lib) -----------------------
 Write-Host "=== host: prover core ==="
 $hostFlags = @(
-  "/O2", "/std:c++17", "/openmp", $srcInc, $b3Inc, $cuInclude, $vcpkgInclude, "/c"
+  "/O2", "/std:c++17", "/openmp", "/DKAN_NO_ASYNC_SEARCH",
+  $srcInc, $b3Inc, $cuInclude, $vcpkgInclude, "/c"
 )
 cl $hostFlags "$ROOT\src\plainproof_gen.cpp" "/Fo$BUILD\plainproof_gen.obj" 2>&1 | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "plainproof_gen.cpp (CLI) failed" }
