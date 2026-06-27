@@ -1309,8 +1309,8 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                         if (gpu_prep_draw(nd)) { tc_search_wait(&rt,&ct); return 2; }
                     }
                     ok = tc_search_wait(&rt, &ct);
-                } else {
-#else
+                } else
+#endif
                 {
                     ok = tc_jackpot_search(nullptr, nullptr,   // data already in dA/dBt
                                            (int)m,(int)n,(int)k,(int)rank,
@@ -1322,7 +1322,6 @@ int mine_plain_proof(const MineParams& P, MineResult& R, std::atomic<bool>* stop
                     uint64_t nd = draw + 1;
                     if (ok == 0 && nd < maxdraws && !stopping() && gpu_prep_draw(nd)) return 2;
                 }
-#endif
                 g_live_draw_count.fetch_add(1, std::memory_order_relaxed);
                 if (ok==1 && rt>=0 && ct>=0) {
                     // A newer pool job may have arrived while this draw was in

@@ -84,9 +84,20 @@ Move-Item *.obj $BUILD\ -Force
 Pop-Location
 Write-Host "  blake3: portable scalar OK"
 
+# ---- locate the vcpkg root that actually has OpenSSL -----------------------
+# msvc-dev-cmd repoints VCPKG_ROOT at the VS-bundled vcpkg, but the workflow
+# installs openssl into the GitHub-hosted vcpkg (VCPKG_INSTALLATION_ROOT, =C:\vcpkg).
+# Probe the known roots and pick whichever one actually contains openssl/err.h.
+$vcpkgRoot = $null
+foreach ($r in @($env:VCPKG_INSTALLATION_ROOT, $env:VCPKG_ROOT, "C:\vcpkg")) {
+  if ($r -and (Test-Path "$r\installed\x64-windows\include\openssl\err.h")) { $vcpkgRoot = $r; break }
+}
+if (-not $vcpkgRoot) { throw "vcpkg x64-windows OpenSSL not found (looked in VCPKG_INSTALLATION_ROOT, VCPKG_ROOT, C:\vcpkg)" }
+Write-Host "  vcpkg root:  $vcpkgRoot"
+
 # ---- include paths for MSVC ------------------------------------------------
 $cuInclude = "-I$env:CUDA_PATH\include"
-$vcpkgInclude = "-I$env:VCPKG_ROOT\installed\x64-windows\include"
+$vcpkgInclude = "-I$vcpkgRoot\installed\x64-windows\include"
 $srcInc = "-I$ROOT\src"
 $b3Inc = "-I$ROOT\blake3"
 
@@ -124,7 +135,7 @@ Write-Host "  CUDA kernels: OK"
 
 # ---- link: plainproof_gen.exe ----------------------------------------------
 Write-Host "=== link: plainproof_gen.exe ==="
-$vcpkgLib = "$env:VCPKG_ROOT\installed\x64-windows\lib"
+$vcpkgLib = "$vcpkgRoot\installed\x64-windows\lib"
 $cudaLib = "$env:CUDA_PATH\lib\x64"
 $b3Obj = @(
   "$BUILD\blake3.obj", "$BUILD\blake3_dispatch.obj", "$BUILD\blake3_portable.obj"
