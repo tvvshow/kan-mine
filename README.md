@@ -1,5 +1,7 @@
 # Kan — Pearl (PRL) PoUW 高性能 GPU 挖矿软件
 
+[中文](README.md) | **English**
+
 [![Release](https://img.shields.io/badge/release-v1.2.22-blue)](https://github.com/tvvshow/kan-mine/releases/tag/v1.2.22)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-green)](#下载与快速开始)
 [![License](https://img.shields.io/badge/license-NonCommercial%20%7C%20NoFee%20%7C%20Attribution-important)](LICENSE)
@@ -479,7 +481,8 @@ kan-mine/
 ├── GPU_PROFILES.md         # GPU profile 权威表
 ├── CHANGELOG.md            # 变更记录
 ├── LICENSE                 # 许可条款（必读）
-└── README.md               # 本文件
+├── README.md               # 本文件（中文）
+└── README.en.md            # 英文版 README（English）
 ```
 
 ---
